@@ -73,12 +73,46 @@ test("templates/.ai-ship.json includes distinct openrouter role models", () => {
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+test("loadRepoConfig prefers package.json verify script when present", () => {
+  const dir = makeTempRepo();
+  fs.writeFileSync(path.join(dir, "pnpm-lock.yaml"), "");
+  fs.writeFileSync(
+    path.join(dir, "package.json"),
+    JSON.stringify({
+      scripts: { verify: "pnpm typecheck && pnpm guard && pnpm test", typecheck: "tsc", test: "vitest" },
+    })
+  );
+  const cfg = loadRepoConfig(dir);
+  assert.equal(cfg.verify[0], "pnpm verify");
+  assert.ok(!cfg.verify.includes("pnpm typecheck"));
+  assert.equal(cfg.testCommand, "pnpm test");
+
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
 test("loadRepoConfig defaults to role-specific openrouter models when .ai-ship.json is absent", () => {
   const dir = makeTempRepo();
   const cfg = loadRepoConfig(dir);
   assert.deepEqual(cfg.implementerModel, { providerID: "openrouter", id: "anthropic/claude-sonnet-4" });
   assert.deepEqual(cfg.testerModel, { providerID: "openrouter", id: "openai/gpt-4.1" });
   assert.deepEqual(cfg.reviewerModel, { providerID: "openrouter", id: "google/gemini-2.5-pro" });
+
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("loadRepoConfig prefers package.json verify script when present", () => {
+  const dir = makeTempRepo();
+  fs.writeFileSync(path.join(dir, "pnpm-lock.yaml"), "");
+  fs.writeFileSync(
+    path.join(dir, "package.json"),
+    JSON.stringify({
+      scripts: { verify: "pnpm typecheck && pnpm guard && pnpm test", typecheck: "tsc", test: "vitest" },
+    })
+  );
+  const cfg = loadRepoConfig(dir);
+  assert.equal(cfg.verify[0], "pnpm verify");
+  assert.ok(!cfg.verify.includes("pnpm typecheck"));
+  assert.equal(cfg.testCommand, "pnpm test");
 
   fs.rmSync(dir, { recursive: true, force: true });
 });

@@ -89,8 +89,12 @@ export function loadRepoConfig(repoDir: string): RepoConfig {
       const pm = detectPackageManager(repoDir);
       const run = pm === "npm" ? "npm run" : pm;
       const scripts = pkg.scripts ?? {};
-      for (const name of ["typecheck", "lint", "build", "test"]) {
-        if (scripts[name]) verify.push(`${run} ${name}`);
+      if (scripts.verify) {
+        verify.push(`${run} verify`);
+      } else {
+        for (const name of ["typecheck", "lint", "build", "test"]) {
+          if (scripts[name]) verify.push(`${run} ${name}`);
+        }
       }
       if (!testCommand && scripts.test) testCommand = `${run} test`;
     } else if (fs.existsSync(path.join(repoDir, "Package.swift"))) {

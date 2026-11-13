@@ -26,7 +26,8 @@ export const AiShipPlugin: Plugin = createAiShipPlugin(tool);
 
 | Command | Example |
 |---|---|
-| `/ship <task>` | `/ship Add rate limiting to /api/login and open a PR` |
+| `/ship <task>` | `/ship Add rate limiting to /api/login --pr` |
+| `/ship noty://item/<id> --pr` | `/ship noty://item/D282FF5A-FCE0-4034-8DFF-5694B8A29F99 --pr` |
 | `/remember <note>` | `/remember Always pin target.pathname in gateway.ts` |
 | `/dream` | `/dream` |
 | `/cleanup` | `/cleanup` (lists worktrees/branches; ask to confirm deletion to remove them) |

@@ -11,7 +11,7 @@ import {
   readMemory,
   writeConsolidatedMemory,
 } from "../src/memory.ts";
-import { createAiShipPlugin, type ToolHelper } from "../plugin/index.ts";
+import { createAiShipPlugin, resolveShipTaskInput, type ToolHelper } from "../plugin/index.ts";
 
 function withTempMemoryDir(fn: (repoDir: string) => void | Promise<void>) {
   const prev = process.env.OPENCODE_MEMORY_DIR;
@@ -104,4 +104,28 @@ test("createAiShipPlugin registers commands, injects memory, and executes memory
     );
     assert.match(forgetMsg, /Removed 1 matching entry/);
   });
+});
+
+test("resolveShipTaskInput parses inline flags and resolves noty:// URIs", () => {
+  const prevNoty = process.env.NOTY_DIR;
+  const notyDir = fs.mkdtempSync(path.join(os.tmpdir(), "ai-ship-noty-plugin-"));
+  const id = "D282FF5A-FCE0-4034-8DFF-5694B8A29F99";
+  fs.writeFileSync(
+    path.join(notyDir, "task.md"),
+    `---\nid: ${id}\ntitle: H1 Host Escape\n---\nAdd test for host escape.\n`
+  );
+  process.env.NOTY_DIR = notyDir;
+  try {
+    const res = resolveShipTaskInput(`noty://item/${id} --pr --skip-review`);
+    assert.equal(res.openPr, true);
+    assert.equal(res.skipReview, true);
+    assert.equal(res.skipTests, false);
+    assert.equal(res.title, "H1 Host Escape");
+    assert.match(res.task, /H1 Host Escape/);
+    assert.match(res.task, /Add test for host escape/);
+  } finally {
+    if (prevNoty === undefined) delete process.env.NOTY_DIR;
+    else process.env.NOTY_DIR = prevNoty;
+    fs.rmSync(notyDir, { recursive: true, force: true });
+  }
 });

@@ -1,5 +1,6 @@
 import { listCleanupTargets, removeCleanupTargets } from "../src/git.ts";
 import { appendMemory, forgetMemory, readMemory } from "../src/memory.ts";
+import { parseNotyAddress, resolveNotyTask } from "../src/noty.ts";
 import { runDreamConsolidation, runPipeline } from "../src/pipeline.ts";
 import type { OpencodeClient } from "../src/runner.ts";
 
@@ -30,6 +31,35 @@ function notifyProgress(
   toolCtx.metadata?.({ title });
   const tui = (client as unknown as { tui?: { showToast?: (opts: any) => Promise<unknown> } }).tui;
   tui?.showToast?.({ body: { title: "ai-ship", message: title, variant } }).catch(() => undefined);
+}
+
+/** Parses inline CLI-style flags (`--pr`, `--skip-tests`, `--skip-review`) and resolves `noty://item/...` URIs. */
+export function resolveShipTaskInput(
+  rawTask: string,
+  opts: { openPr?: boolean; skipTests?: boolean; skipReview?: boolean } = {}
+): { task: string; openPr: boolean; skipTests: boolean; skipReview: boolean; title?: string } {
+  let openPr = Boolean(opts.openPr);
+  let skipTests = Boolean(opts.skipTests);
+  let skipReview = Boolean(opts.skipReview);
+
+  const tokens = rawTask.trim().split(/\s+/).filter(Boolean);
+  const kept: string[] = [];
+  for (const tok of tokens) {
+    if (tok === "--pr") openPr = true;
+    else if (tok === "--skip-tests") skipTests = true;
+    else if (tok === "--skip-review") skipReview = true;
+    else kept.push(tok);
+  }
+
+  let task = kept.join(" ").trim();
+  let title: string | undefined;
+  if (parseNotyAddress(task)) {
+    const note = resolveNotyTask(task);
+    task = note.task;
+    title = note.title || note.id;
+  }
+
+  return { task, openPr, skipTests, skipReview, title };
 }
 
 /**
@@ -109,18 +139,26 @@ export function createAiShipPlugin(tool: ToolHelper) {
           },
           async execute(args, toolCtx) {
             const targetRepo = toolCtx.worktree || toolCtx.directory || repoRoot;
+            const resolved = resolveShipTaskInput(args.task, {
+              openPr: args.openPr,
+              skipTests: args.skipTests,
+              skipReview: args.skipReview,
+            });
+            if (resolved.title) {
+              notifyProgress(ctx.client, toolCtx, `Resolved Noty: ${resolved.title}`);
+            }
             await runPipeline({
               repoDir: targetRepo,
-              task: args.task,
-              openPr: Boolean(args.openPr),
-              skipTests: Boolean(args.skipTests),
-              skipReview: Boolean(args.skipReview),
+              task: resolved.task,
+              openPr: resolved.openPr,
+              skipTests: resolved.skipTests,
+              skipReview: resolved.skipReview,
               model: args.model,
               client: ctx.client,
               onProgress: (stage) => notifyProgress(ctx.client, toolCtx, stage),
             });
-            notifyProgress(ctx.client, toolCtx, `Completed: ${args.task.slice(0, 50)}`, "success");
-            return `ai-ship pipeline completed for "${args.task}" in ${targetRepo}.`;
+            notifyProgress(ctx.client, toolCtx, `Completed: ${(resolved.title || resolved.task).slice(0, 50)}`, "success");
+            return `ai-ship pipeline completed for "${resolved.title || args.task}" in ${targetRepo}.`;
           },
         }),
 

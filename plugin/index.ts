@@ -55,6 +55,32 @@ export function createAiShipPlugin(tool: ToolHelper) {
           description: "Consolidate repo memory from recent OpenCode session transcripts",
           template: "Use the `dream_consolidate` tool to consolidate memory for the current repository.",
         };
+        cfg.command.remember = {
+          description: "Save a note directly to persistent repository memory",
+          template: "$ARGUMENTS",
+        };
+      },
+
+      async "command.execute.before"(
+        input: { command: string; sessionID: string; arguments: string },
+        output: { parts: Array<{ type: string; text?: string }> }
+      ) {
+        if (input.command !== "remember") return;
+        const text = input.arguments.trim();
+        const tui = (ctx.client as unknown as { tui?: { showToast?: (opts: any) => Promise<unknown> } }).tui;
+        if (!text) {
+          output.parts = [{ type: "text", text: "Ask the user what rule or fact they want to save to repo memory." }];
+          return;
+        }
+        const res = appendMemory(repoRoot, text, "note");
+        const msg = res.added ? `Saved to repo memory: ${text.slice(0, 60)}` : "Already in repo memory.";
+        tui?.showToast?.({ body: { title: "ai-ship", message: msg, variant: "success" } }).catch(() => undefined);
+        output.parts = [
+          {
+            type: "text",
+            text: `Reply in one short sentence confirming this was saved to repo memory (do not call memory_save): "${text}"`,
+          },
+        ];
       },
 
       async "experimental.chat.system.transform"(_input: unknown, output: { system: string[] }) {

@@ -76,6 +76,15 @@ test("createAiShipPlugin registers commands, injects memory, and executes memory
     await hooks.config(cfg);
     assert.ok(cfg.command.ship);
     assert.ok(cfg.command.dream);
+    assert.ok(cfg.command.remember);
+
+    const cmdOut = { parts: [] as Array<{ type: string; text?: string }> };
+    await hooks["command.execute.before"](
+      { command: "remember", sessionID: "s1", arguments: "Pin gateway pathname" },
+      cmdOut
+    );
+    assert.match(readMemory(repoDir), /Pin gateway pathname/);
+    assert.equal(cmdOut.parts.length, 1);
 
     const saveMsg = await hooks.tool.memory_save.execute(
       { entry: "Use gateway.ai.cloudflare.com", category: "infra" },

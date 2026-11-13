@@ -15,5 +15,6 @@ export const AiShipPlugin: Plugin = createAiShipPlugin(tool);
 
 ## Features
 - `/ship` (`ship_task` tool): Runs the 4-stage worktree pipeline using OpenCode's live client with stage progress updates.
-- `/dream` (`dream_consolidate` tool): Consolidates repo-scoped memory (`~/.local/share/opencode/memory/`) against recent session transcripts.
+- `/remember <text>`: Immediately saves a highlighted/copied note to repo memory (`~/.local/share/opencode/memory/`) across Desktop, Web, Mobile, and TUI.
+- `/dream` (`dream_consolidate` tool): Consolidates repo-scoped memory against recent session transcripts.
 - `memory_save` / `memory_forget` tools + automatic system prompt injection.

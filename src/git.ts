@@ -18,12 +18,16 @@ export function slugify(input: string): string {
     .slice(0, 40) || "task";
 }
 
+function inheritStdio(): "inherit" | ["ignore", number, number] {
+  return process.env.AI_SHIP_MCP === "1" ? ["ignore", 2, 2] : "inherit";
+}
+
 export type PnpmRunner = (args: string[], cwd: string, quiet: boolean) => number | null;
 
 function defaultPnpmRunner(args: string[], cwd: string, quiet: boolean): number | null {
   const res = spawnSync("pnpm", args, {
     cwd,
-    stdio: quiet ? "ignore" : "inherit",
+    stdio: quiet ? "ignore" : inheritStdio(),
   });
   return res.status;
 }
@@ -77,7 +81,7 @@ export function createWorktree(repoDir: string, baseBranch: string, task: string
   fs.mkdirSync(root, { recursive: true });
   execSync(`git worktree add -b "${branch}" "${worktreeDir}" "${startRef}"`, {
     cwd: repoDir,
-    stdio: "inherit",
+    stdio: inheritStdio(),
   });
 
   setupWorktreeDependencies(repoDir, worktreeDir);
@@ -134,7 +138,7 @@ export function commitAll(worktreeDir: string, message: string): boolean {
   const status = execSync("git status --porcelain", { cwd: worktreeDir, encoding: "utf8" }).trim();
   if (!status) return false;
   execSync("git add -A", { cwd: worktreeDir, stdio: "ignore" });
-  spawnSync("git", ["commit", "-m", message], { cwd: worktreeDir, stdio: "inherit" });
+  spawnSync("git", ["commit", "-m", message], { cwd: worktreeDir, stdio: inheritStdio() });
   return true;
 }
 
@@ -193,12 +197,12 @@ export function rebaseOntoBase(worktree: WorktreeHandle): RebaseResult {
 export function pushAndOpenPR(worktree: WorktreeHandle, title: string, body: string): void {
   execSync(`git push -u origin "${worktree.branch}"`, {
     cwd: worktree.worktreeDir,
-    stdio: "inherit",
+    stdio: inheritStdio(),
   });
   spawnSync(
     "gh",
     ["pr", "create", "--base", worktree.baseBranch, "--head", worktree.branch, "--title", title, "--body", body],
-    { cwd: worktree.worktreeDir, stdio: "inherit" }
+    { cwd: worktree.worktreeDir, stdio: inheritStdio() }
   );
 }
 

@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import readline from "node:readline/promises";
 import { listCleanupTargets, removeCleanupTargets } from "../src/git.ts";
+import { startMcpServer } from "../src/mcp.ts";
 import { parseNotyAddress, resolveNotyTask } from "../src/noty.ts";
 import { runDreamConsolidation, runPipeline } from "../src/pipeline.ts";
 import { normalizeProvider } from "../src/runner.ts";
@@ -18,6 +19,7 @@ Usage:
   ai-ship --init [--repo <dir>]
   ai-ship --cleanup [--repo <dir>] [--yes]
   ai-ship --cf <account_id> <gateway_id>
+  ai-ship --mcp
 
 Options:
   --repo <dir>       Target git repository (default: current directory)
@@ -139,6 +141,13 @@ async function cleanupRepo(repoDir, skipConfirm) {
 }
 
 const args = process.argv.slice(2);
+if (args.includes("--mcp")) {
+  startMcpServer();
+} else {
+  await runCli(args);
+}
+
+async function runCli(args) {
 if (args.length === 0 || args.includes("-h") || args.includes("--help")) {
   printHelp();
   process.exit(0);
@@ -243,3 +252,4 @@ if (!task) {
 }
 
 await runPipeline({ repoDir, task, openPr, skipTests, skipReview, provider, model, serverUrl });
+}

@@ -33,21 +33,25 @@ function notifyProgress(
   tui?.showToast?.({ body: { title: "ai-ship", message: title, variant } }).catch(() => undefined);
 }
 
-/** Parses inline CLI-style flags (`--pr`, `--skip-tests`, `--skip-review`) and resolves `noty://item/...` URIs. */
+/** Parses inline CLI-style flags (`--pr`, `--skip-tests`, `--skip-review`, `--provider`) and resolves `noty://item/...` URIs. */
 export function resolveShipTaskInput(
   rawTask: string,
-  opts: { openPr?: boolean; skipTests?: boolean; skipReview?: boolean } = {}
-): { task: string; openPr: boolean; skipTests: boolean; skipReview: boolean; title?: string } {
+  opts: { openPr?: boolean; skipTests?: boolean; skipReview?: boolean; provider?: string } = {}
+): { task: string; openPr: boolean; skipTests: boolean; skipReview: boolean; provider?: string; title?: string } {
   let openPr = Boolean(opts.openPr);
   let skipTests = Boolean(opts.skipTests);
   let skipReview = Boolean(opts.skipReview);
+  let provider = opts.provider;
 
   const tokens = rawTask.trim().split(/\s+/).filter(Boolean);
   const kept: string[] = [];
-  for (const tok of tokens) {
+  for (let i = 0; i < tokens.length; i++) {
+    const tok = tokens[i];
     if (tok === "--pr") openPr = true;
     else if (tok === "--skip-tests") skipTests = true;
     else if (tok === "--skip-review") skipReview = true;
+    else if (tok === "--provider" && tokens[i + 1]) provider = tokens[++i];
+    else if (tok.startsWith("--provider=")) provider = tok.slice("--provider=".length);
     else kept.push(tok);
   }
 
@@ -59,7 +63,7 @@ export function resolveShipTaskInput(
     title = note.title || note.id;
   }
 
-  return { task, openPr, skipTests, skipReview, title };
+  return { task, openPr, skipTests, skipReview, provider, title };
 }
 
 /**

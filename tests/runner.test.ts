@@ -34,17 +34,17 @@ test("parseOpencodeModel splits provider/model or defaults to openrouter", () =>
 test("buildClaudeArgs configures read-only tools for reviewer and resume for follow-ups", () => {
   assert.deepEqual(
     buildClaudeArgs({ model: DEFAULT_CLAUDE_MODEL, role: "implementer" }),
-    ["-p", "--output-format", "json", "--model", "sonnet-5-5", "--dangerously-skip-permissions"]
+    ["-p", "--output-format", "json", "--model", "sonnet", "--dangerously-skip-permissions"]
   );
 
   assert.deepEqual(
-    buildClaudeArgs({ model: "sonnet-5-5", role: "reviewer", resumeSessionId: "sess-123" }),
+    buildClaudeArgs({ model: "sonnet", role: "reviewer", resumeSessionId: "sess-123" }),
     [
       "-p",
       "--output-format",
       "json",
       "--model",
-      "sonnet-5-5",
+      "sonnet",
       "--dangerously-skip-permissions",
       "--tools",
       "Read,Glob,Grep",

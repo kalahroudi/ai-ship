@@ -1,4 +1,5 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import fs from "node:fs";
 import { createOpencode, createOpencodeClient } from "@opencode-ai/sdk";
 import type { RepoConfig } from "./config.ts";
 
@@ -7,7 +8,7 @@ export type OpencodeClient = ReturnType<typeof createOpencodeClient>;
 export type ProviderName = "opencode" | "claude-code";
 export type AgentRole = "implementer" | "tester" | "reviewer";
 
-export const DEFAULT_CLAUDE_MODEL = "sonnet-5-5";
+export const DEFAULT_CLAUDE_MODEL = "sonnet";
 
 export interface PromptResult {
   text: string;
@@ -206,9 +207,19 @@ export function parseClaudeJsonOutput(stdout: string): {
   };
 }
 
+function resolveClaudeBinary(): string {
+  if (spawnSync("claude", ["--version"], { stdio: "ignore" }).status === 0) {
+    return "claude";
+  }
+  for (const candidate of ["/opt/homebrew/bin/claude", "/usr/local/bin/claude"]) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return "claude";
+}
+
 function runClaudeCommand(cwd: string, args: string[], promptText: string): Promise<string> {
   return new Promise((resolve, reject) => {
-    const child = spawn("claude", args, {
+    const child = spawn(resolveClaudeBinary(), args, {
       cwd,
       stdio: ["pipe", "pipe", "pipe"],
       env: process.env,

@@ -28,6 +28,21 @@ For any git repository, `ai-ship` runs 4 automated stages in an isolated git wor
    ai-ship "Add org invite endpoint with RBAC and rate limiting" --repo ~/rose --pr
    ```
 
+## CLI Cheatsheet
+
+| Command | Example |
+|---|---|
+| Ship a task | `ai-ship "Fix H1 gateway host escape" --repo ~/rose` |
+| Ship + rebase + open PR | `ai-ship "Fix H1 gateway host escape" --repo ~/rose --pr` |
+| Ship a Noty item | `ai-ship "noty://item/D282FF5A-FCE0-4034-8DFF-5694B8A29F99" --repo ~/rose --pr` |
+| Attach to `opencode serve` (mobile/web) | `ai-ship "Fix bug" --repo ~/rose --server http://127.0.0.1:4096 --pr` |
+| Skip Stage 2 tests or Stage 4 review | `ai-ship "Docs update" --repo ~/rose --skip-tests --skip-review` |
+| Consolidate repo memory (dream) | `ai-ship --dream --repo ~/rose` |
+| Initialize repo config | `ai-ship --init --repo ~/rose` |
+| Clean up worktrees & `ai/*` branches | `ai-ship --cleanup --repo ~/rose` (add `--yes` to skip prompt) |
+
+For OpenCode Desktop/TUI/Mobile plugin usage, see [plugin/README.md](./plugin/README.md).
+
 ## Configuration
 - Global models & zero-friction permissions: `~/.config/opencode/opencode.json`
 - Per-repo verify commands & overrides: `<repo>/.ai-ship.json` (auto-detects `package.json`, `Package.swift`, `Cargo.toml`, `go.mod`, `pyproject.toml`, and `semgrep` when omitted).

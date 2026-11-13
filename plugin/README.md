@@ -19,3 +19,19 @@ export const AiShipPlugin: Plugin = createAiShipPlugin(tool);
 - `/dream` (`dream_consolidate` tool): Consolidates repo-scoped memory against recent session transcripts.
 - `/cleanup` (`cleanup_worktrees` tool): Lists or removes leftover `.ai-ship-worktrees/*` and `ai/*` branches.
 - `memory_save` / `memory_forget` tools + automatic system prompt injection.
+
+## Command Cheatsheet (Desktop, Web, Mobile & TUI)
+
+*(Restart OpenCode Desktop/TUI after installing the plugin so the commands appear.)*
+
+| Command | Example |
+|---|---|
+| `/ship <task>` | `/ship Add rate limiting to /api/login and open a PR` |
+| `/remember <note>` | `/remember Always pin target.pathname in gateway.ts` |
+| `/dream` | `/dream` |
+| `/cleanup` | `/cleanup` (lists worktrees/branches; ask to confirm deletion to remove them) |
+
+### Natural-language tool examples
+- **Save memory:** `Remember in repo memory (security): always pin target.pathname in gateway.ts.`
+- **Forget memory:** `Forget the repo memory note about gateway.ts.`
+- **Ship with options:** `Use ship_task to implement "Fix H1" with openPr=true.`

@@ -89,9 +89,17 @@ export function createWorktree(repoDir: string, baseBranch: string, task: string
   return { repoDir, worktreeDir, branch, baseBranch };
 }
 
+function resolveDiffBaseRef(worktreeDir: string, baseBranch: string): string {
+  const remoteRef = `origin/${baseBranch}`;
+  const hasRemoteRef =
+    spawnSync("git", ["rev-parse", "--verify", remoteRef], { cwd: worktreeDir, stdio: "ignore" }).status === 0;
+  return hasRemoteRef ? remoteRef : baseBranch;
+}
+
 export function getDiff(worktreeDir: string, baseBranch: string): string {
   try {
-    const committed = execSync(`git diff "${baseBranch}...HEAD"`, {
+    const diffBase = resolveDiffBaseRef(worktreeDir, baseBranch);
+    const committed = execSync(`git diff "${diffBase}...HEAD"`, {
       cwd: worktreeDir,
       encoding: "utf8",
       maxBuffer: 10 * 1024 * 1024,
@@ -125,7 +133,8 @@ export function getDiff(worktreeDir: string, baseBranch: string): string {
 
 /** Returns `git diff --stat` between `baseBranch` and `HEAD` for PR summaries. */
 export function getDiffStat(worktreeDir: string, baseBranch: string): string {
-  const res = spawnSync("git", ["diff", "--stat", `${baseBranch}...HEAD`], {
+  const diffBase = resolveDiffBaseRef(worktreeDir, baseBranch);
+  const res = spawnSync("git", ["diff", "--stat", `${diffBase}...HEAD`], {
     cwd: worktreeDir,
     encoding: "utf8",
   });

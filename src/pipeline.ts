@@ -50,6 +50,19 @@ export interface PipelineResult {
   usageLog: string[];
 }
 
+function truncateCleanly(text: string, maxChars: number): string {
+  const trimmed = text.trim();
+  if (trimmed.length <= maxChars) return trimmed;
+  const slice = trimmed.slice(0, maxChars);
+  const lastNewline = slice.lastIndexOf("\n");
+  if (lastNewline > maxChars * 0.6) {
+    return `${slice.slice(0, lastNewline).trimEnd()}\n\n*(truncated)*`;
+  }
+  const lastSpace = slice.lastIndexOf(" ");
+  const cut = lastSpace > maxChars * 0.6 ? slice.slice(0, lastSpace) : slice;
+  return `${cut.trimEnd()}…`;
+}
+
 export function buildPrBody(opts: {
   task: string;
   provider: ProviderName;
@@ -65,7 +78,7 @@ export function buildPrBody(opts: {
   ];
 
   if (opts.implSummary.trim()) {
-    sections.push("", "### Implementation Notes", opts.implSummary.trim().slice(0, 1500));
+    sections.push("", "### Implementation Notes", truncateCleanly(opts.implSummary, 4000));
   }
 
   if (opts.diffStat.trim()) {

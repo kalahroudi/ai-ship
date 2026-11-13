@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import readline from "node:readline/promises";
 import { listCleanupTargets, removeCleanupTargets } from "../src/git.ts";
+import { parseNotyAddress, resolveNotyTask } from "../src/noty.ts";
 import { runPipeline } from "../src/pipeline.ts";
 import { normalizeProvider } from "../src/runner.ts";
 
@@ -11,13 +12,16 @@ function printHelp() {
   console.log(`ai-ship — project-agnostic OpenCode & Claude Code delivery pipeline
 
 Usage:
-  ai-ship "<task description>" [--repo <dir>] [--provider <name>] [--model <id>] [--pr] [--skip-tests] [--skip-review]
+  ai-ship "<task description or noty://item/...>" [--repo <dir>] [--provider <name>] [--model <id>] [--pr] [--skip-tests] [--skip-review]
+  ai-ship --noty <noty://item/...> [--noty-dir <dir>] [--repo <dir>] [options]
   ai-ship --init [--repo <dir>]
   ai-ship --cleanup [--repo <dir>] [--yes]
   ai-ship --cf <account_id> <gateway_id>
 
 Options:
   --repo <dir>       Target git repository (default: current directory)
+  --noty <uri>       Resolve task description from a Noty item URI (noty://item/<uuid>)
+  --noty-dir <dir>   Override Noty markdown directory (or set NOTY_DIR)
   --provider <name>  Runner provider: opencode (default, openrouter/cloudflare) or claude-code
   --model <id>       Model ID override (defaults to sonnet-5-5 for claude-code)
   --pr               Push branch and open GitHub PR after all 4 stages pass
@@ -144,6 +148,8 @@ let skipReview = false;
 let doInit = false;
 let doCleanup = false;
 let skipConfirm = false;
+let notyAddress;
+let notyDir;
 let rawProvider;
 let model;
 const positional = [];
@@ -154,6 +160,14 @@ for (let i = 0; i < args.length; i++) {
     repoDir = path.resolve(args[++i]);
   } else if (arg.startsWith("--repo=")) {
     repoDir = path.resolve(arg.slice("--repo=".length));
+  } else if (arg === "--noty" && args[i + 1]) {
+    notyAddress = args[++i];
+  } else if (arg.startsWith("--noty=")) {
+    notyAddress = arg.slice("--noty=".length);
+  } else if (arg === "--noty-dir" && args[i + 1]) {
+    notyDir = path.resolve(args[++i]);
+  } else if (arg.startsWith("--noty-dir=")) {
+    notyDir = path.resolve(arg.slice("--noty-dir=".length));
   } else if (arg === "--provider" && args[i + 1]) {
     rawProvider = args[++i];
   } else if (arg.startsWith("--provider=")) {
@@ -197,7 +211,14 @@ if (doCleanup) {
 }
 
 const provider = normalizeProvider(rawProvider);
-const task = positional.join(" ").trim();
+let task = positional.join(" ").trim();
+const notyInput = notyAddress ?? (parseNotyAddress(task) ? task : null);
+if (notyInput) {
+  const note = resolveNotyTask(notyInput, notyDir);
+  console.log(`[ai-ship] Resolved Noty task "${note.title || note.id}" from ${note.filePath}`);
+  task = note.task;
+}
+
 if (!task) {
   console.error("Error: please provide a task description.");
   printHelp();

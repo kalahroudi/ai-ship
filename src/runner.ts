@@ -1,6 +1,8 @@
 import { spawn } from "node:child_process";
-import { createOpencode } from "@opencode-ai/sdk";
+import { createOpencode, createOpencodeClient } from "@opencode-ai/sdk";
 import type { RepoConfig } from "./config.ts";
+
+export type OpencodeClient = ReturnType<typeof createOpencodeClient>;
 
 export type ProviderName = "opencode" | "claude-code";
 export type AgentRole = "implementer" | "tester" | "reviewer";
@@ -236,12 +238,113 @@ function runClaudeCommand(cwd: string, args: string[], promptText: string): Prom
   });
 }
 
+/** Wraps an existing OpenCode client (embedded server, `opencode serve`, or plugin context). */
+export function createOpencodeClientRunner(opts: {
+  client: OpencodeClient;
+  worktreeDir: string;
+  config: RepoConfig;
+  model?: string;
+  onClose?: () => void;
+}): PipelineRunner {
+  const cliModel = parseOpencodeModel(opts.model);
+
+  const modelForRole = (role: AgentRole) => {
+    if (cliModel) return cliModel;
+    const roleCfg =
+      role === "implementer"
+        ? opts.config.implementerModel
+        : role === "tester"
+          ? opts.config.testerModel
+          : opts.config.reviewerModel;
+    return roleCfg ? { providerID: roleCfg.providerID, modelID: roleCfg.id } : undefined;
+  };
+
+  return {
+    async createSession(title: string): Promise<string> {
+      const res = await opts.client.session.create({
+        query: { directory: opts.worktreeDir },
+        body: { title },
+      });
+      const id = res.data?.id;
+      if (!id) throw new Error(`Failed to create OpenCode session (${title})`);
+      return id;
+    },
+    async prompt(sessionId: string, role: AgentRole, text: string): Promise<PromptResult> {
+      const model = modelForRole(role);
+      const res = await opts.client.session.prompt({
+        path: { id: sessionId },
+        query: { directory: opts.worktreeDir },
+        body: {
+          agent: role,
+          ...(model ? { model } : {}),
+          parts: [{ type: "text", text }],
+        },
+      });
+      return parseOpencodePromptResponse(
+        res as { data?: PromptResponseData; error?: unknown },
+        role
+      );
+    },
+    close() {
+      opts.onClose?.();
+    },
+  };
+}
+
+/** Collects a compact text digest of recent OpenCode sessions for offline dream consolidation. */
+export async function collectRecentTranscripts(
+  client: OpencodeClient,
+  directory: string,
+  maxSessions = 8
+): Promise<string> {
+  const listRes = await client.session.list({ query: { directory } });
+  const sessions = (listRes.data ?? []).slice(0, maxSessions);
+  const sections: string[] = [];
+
+  for (const s of sessions) {
+    if (!s.id || s.title?.startsWith("Dream:")) continue;
+    const msgRes = await client.session.messages({
+      path: { id: s.id },
+      query: { directory },
+    });
+    const msgs = msgRes.data ?? [];
+    if (msgs.length === 0) continue;
+
+    const lines: string[] = [`### Session: ${s.title || s.id}`];
+    for (const m of msgs.slice(-12)) {
+      const role = m.info?.role ?? "unknown";
+      const text = (m.parts ?? [])
+        .filter((p) => p.type === "text" && typeof (p as TextPart).text === "string")
+        .map((p) => (p as TextPart).text!)
+        .join(" ")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 600);
+      if (text) lines.push(`- **${role}**: ${text}`);
+    }
+    if (lines.length > 1) sections.push(lines.join("\n"));
+  }
+
+  return sections.join("\n\n").slice(0, 24000);
+}
+
 async function createOpencodeRunner(opts: {
   worktreeDir: string;
   config: RepoConfig;
   cfGatewayUrl?: string;
   model?: string;
+  serverUrl?: string;
 }): Promise<PipelineRunner> {
+  if (opts.serverUrl) {
+    const client = createOpencodeClient({ baseUrl: opts.serverUrl });
+    return createOpencodeClientRunner({
+      client,
+      worktreeDir: opts.worktreeDir,
+      config: opts.config,
+      model: opts.model,
+    });
+  }
+
   const { client, server } = await createOpencode({
     port: 0,
     ...(opts.cfGatewayUrl
@@ -259,49 +362,13 @@ async function createOpencodeRunner(opts: {
       : {}),
   });
 
-  const cliModel = parseOpencodeModel(opts.model);
-
-  const modelForRole = (role: AgentRole) => {
-    if (cliModel) return cliModel;
-    const roleCfg =
-      role === "implementer"
-        ? opts.config.implementerModel
-        : role === "tester"
-          ? opts.config.testerModel
-          : opts.config.reviewerModel;
-    return roleCfg ? { providerID: roleCfg.providerID, modelID: roleCfg.id } : undefined;
-  };
-
-  return {
-    async createSession(title: string): Promise<string> {
-      const res = await client.session.create({
-        query: { directory: opts.worktreeDir },
-        body: { title },
-      });
-      const id = res.data?.id;
-      if (!id) throw new Error(`Failed to create OpenCode session (${title})`);
-      return id;
-    },
-    async prompt(sessionId: string, role: AgentRole, text: string): Promise<PromptResult> {
-      const model = modelForRole(role);
-      const res = await client.session.prompt({
-        path: { id: sessionId },
-        query: { directory: opts.worktreeDir },
-        body: {
-          agent: role,
-          ...(model ? { model } : {}),
-          parts: [{ type: "text", text }],
-        },
-      });
-      return parseOpencodePromptResponse(
-        res as { data?: PromptResponseData; error?: unknown },
-        role
-      );
-    },
-    close() {
-      server.close();
-    },
-  };
+  return createOpencodeClientRunner({
+    client,
+    worktreeDir: opts.worktreeDir,
+    config: opts.config,
+    model: opts.model,
+    onClose: () => server.close(),
+  });
 }
 
 function createClaudeCodeRunner(opts: {
@@ -342,6 +409,7 @@ export async function createRunner(opts: {
   config: RepoConfig;
   cfGatewayUrl?: string;
   model?: string;
+  serverUrl?: string;
 }): Promise<PipelineRunner> {
   if (opts.provider === "claude-code") {
     return createClaudeCodeRunner({
@@ -354,5 +422,6 @@ export async function createRunner(opts: {
     config: opts.config,
     cfGatewayUrl: opts.cfGatewayUrl,
     model: opts.model,
+    serverUrl: opts.serverUrl,
   });
 }

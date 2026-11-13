@@ -5,15 +5,16 @@ import path from "node:path";
 import readline from "node:readline/promises";
 import { listCleanupTargets, removeCleanupTargets } from "../src/git.ts";
 import { parseNotyAddress, resolveNotyTask } from "../src/noty.ts";
-import { runPipeline } from "../src/pipeline.ts";
+import { runDreamConsolidation, runPipeline } from "../src/pipeline.ts";
 import { normalizeProvider } from "../src/runner.ts";
 
 function printHelp() {
   console.log(`ai-ship — project-agnostic OpenCode & Claude Code delivery pipeline
 
 Usage:
-  ai-ship "<task description or noty://item/...>" [--repo <dir>] [--provider <name>] [--model <id>] [--pr] [--skip-tests] [--skip-review]
+  ai-ship "<task description or noty://item/...>" [--repo <dir>] [--provider <name>] [--model <id>] [--server <url>] [--pr] [--skip-tests] [--skip-review]
   ai-ship --noty <noty://item/...> [--noty-dir <dir>] [--repo <dir>] [options]
+  ai-ship --dream [--repo <dir>] [--server <url>] [--model <id>]
   ai-ship --init [--repo <dir>]
   ai-ship --cleanup [--repo <dir>] [--yes]
   ai-ship --cf <account_id> <gateway_id>
@@ -24,6 +25,8 @@ Options:
   --noty-dir <dir>   Override Noty markdown directory (or set NOTY_DIR)
   --provider <name>  Runner provider: opencode (default, openrouter/cloudflare) or claude-code
   --model <id>       Model ID override (defaults to sonnet-5-5 for claude-code)
+  --server <url>     Attach to a running \`opencode serve\` URL (visible on mobile/web)
+  --dream            Consolidate repo memory from recent OpenCode transcripts
   --pr               Push branch and open GitHub PR after all 4 stages pass
   --skip-tests       Skip Stage 2 independent adversarial test generation
   --skip-review      Skip Stage 4 parallel multi-lens review
@@ -147,11 +150,13 @@ let skipTests = false;
 let skipReview = false;
 let doInit = false;
 let doCleanup = false;
+let doDream = false;
 let skipConfirm = false;
 let notyAddress;
 let notyDir;
 let rawProvider;
 let model;
+let serverUrl;
 const positional = [];
 
 for (let i = 0; i < args.length; i++) {
@@ -176,6 +181,12 @@ for (let i = 0; i < args.length; i++) {
     model = args[++i];
   } else if (arg.startsWith("--model=")) {
     model = arg.slice("--model=".length);
+  } else if (arg === "--server" && args[i + 1]) {
+    serverUrl = args[++i];
+  } else if (arg.startsWith("--server=")) {
+    serverUrl = arg.slice("--server=".length);
+  } else if (arg === "--dream") {
+    doDream = true;
   } else if (arg === "--pr") {
     openPr = true;
   } else if (arg === "--skip-tests") {
@@ -210,6 +221,12 @@ if (doCleanup) {
   process.exit(0);
 }
 
+if (doDream) {
+  const res = await runDreamConsolidation({ repoDir, serverUrl, model });
+  console.log(`[ai-ship] Dream consolidation: ${res.memoryPath} (${res.usageSummary})`);
+  process.exit(0);
+}
+
 const provider = normalizeProvider(rawProvider);
 let task = positional.join(" ").trim();
 const notyInput = notyAddress ?? (parseNotyAddress(task) ? task : null);
@@ -225,4 +242,4 @@ if (!task) {
   process.exit(1);
 }
 
-await runPipeline({ repoDir, task, openPr, skipTests, skipReview, provider, model });
+await runPipeline({ repoDir, task, openPr, skipTests, skipReview, provider, model, serverUrl });

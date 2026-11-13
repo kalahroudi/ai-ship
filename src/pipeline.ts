@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { createOpencode, createOpencodeClient } from "@opencode-ai/sdk";
 import { loadRepoConfig, type RepoConfig } from "./config.ts";
 import {
   abortRebase,
@@ -12,7 +13,15 @@ import {
   runShell,
   type WorktreeHandle,
 } from "./git.ts";
-import { createRunner, DEFAULT_CLAUDE_MODEL, type ProviderName } from "./runner.ts";
+import { buildDreamPrompt, getMemoryPath, readMemory, writeConsolidatedMemory } from "./memory.ts";
+import {
+  collectRecentTranscripts,
+  createOpencodeClientRunner,
+  createRunner,
+  DEFAULT_CLAUDE_MODEL,
+  type OpencodeClient,
+  type ProviderName,
+} from "./runner.ts";
 
 export interface PipelineOptions {
   repoDir: string;
@@ -22,6 +31,9 @@ export interface PipelineOptions {
   skipReview?: boolean;
   provider?: ProviderName;
   model?: string;
+  serverUrl?: string;
+  client?: OpencodeClient;
+  onProgress?: (stage: string) => void;
 }
 
 function formatUsage(label: string, summary: string): string {
@@ -91,19 +103,28 @@ export async function runPipeline(opts: PipelineOptions): Promise<void> {
   const worktree: WorktreeHandle = createWorktree(repoDir, config.baseBranch, opts.task);
   console.log(`[ai-ship] Worktree: ${worktree.worktreeDir} (branch: ${worktree.branch})`);
 
-  const runner = await createRunner({
-    provider,
-    worktreeDir: worktree.worktreeDir,
-    config,
-    cfGatewayUrl,
-    model: opts.model,
-  });
+  const runner = opts.client
+    ? createOpencodeClientRunner({
+        client: opts.client,
+        worktreeDir: worktree.worktreeDir,
+        config,
+        model: opts.model,
+      })
+    : await createRunner({
+        provider,
+        worktreeDir: worktree.worktreeDir,
+        config,
+        cfGatewayUrl,
+        model: opts.model,
+        serverUrl: opts.serverUrl,
+      });
   const usageLog: string[] = [];
 
   try {
     // -------------------------------------------------------------------------
     // Stage 1: Implementer Session
     // -------------------------------------------------------------------------
+    opts.onProgress?.("Stage 1/4: Implementing in isolated worktree");
     console.log("\n[Stage 1/4] Implementing in isolated worktree...");
     const implSessionId = await runner.createSession(`Implement: ${opts.task.slice(0, 60)}`);
 
@@ -126,6 +147,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<void> {
     // Stage 2: Independent Adversarial Test Session (Separate Session & Model)
     // -------------------------------------------------------------------------
     if (!opts.skipTests) {
+      opts.onProgress?.("Stage 2/4: Independent adversarial tests");
       console.log("\n[Stage 2/4] Independent adversarial test generation (separate session)...");
       const diff = getDiff(worktree.worktreeDir, worktree.baseBranch);
       if (diff.trim()) {
@@ -158,6 +180,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<void> {
     // -------------------------------------------------------------------------
     // Stage 3: Deterministic Local Verification Gate (Zero LLM Tokens)
     // -------------------------------------------------------------------------
+    opts.onProgress?.("Stage 3/4: Running local verify gate");
     console.log("\n[Stage 3/4] Running deterministic local verify gate...");
     let lastAgentText = implRes.text;
     for (let attempt = 1; attempt <= config.maxFixRetries + 1; attempt++) {
@@ -324,6 +347,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<void> {
       }
 
       console.log("\n[ai-ship] Pushing branch and opening PR...");
+      opts.onProgress?.("Pushing branch and opening PR");
       pushAndOpenPR(
         worktree,
         opts.task.slice(0, 72),
@@ -332,5 +356,75 @@ export async function runPipeline(opts: PipelineOptions): Promise<void> {
     }
   } finally {
     runner.close();
+  }
+}
+
+/** Runs an offline "dream" pass to consolidate repo memory from recent OpenCode transcripts. */
+export async function runDreamConsolidation(opts: {
+  repoDir: string;
+  client?: OpencodeClient;
+  serverUrl?: string;
+  model?: string;
+}): Promise<{ memoryPath: string; usageSummary: string; consolidated: string }> {
+  const repoDir = path.resolve(opts.repoDir);
+  const config = loadRepoConfig(repoDir);
+  const repoName = path.basename(repoDir);
+  const currentMemory = readMemory(repoDir, 500);
+
+  const localBin = path.resolve(import.meta.dirname, "..", "node_modules", ".bin");
+  if (!process.env.PATH?.includes(localBin)) {
+    process.env.PATH = `${localBin}:${process.env.PATH ?? ""}`;
+  }
+
+  let client = opts.client;
+  let closeServer: (() => void) | undefined;
+  if (!client) {
+    if (opts.serverUrl) {
+      client = createOpencodeClient({ baseUrl: opts.serverUrl });
+    } else {
+      const cfGatewayUrl = resolveCloudflareGatewayUrl();
+      const started = await createOpencode({
+        port: 0,
+        ...(cfGatewayUrl
+          ? {
+              config: {
+                provider: { openrouter: { options: { baseURL: cfGatewayUrl } } },
+              },
+            }
+          : {}),
+      });
+      client = started.client;
+      closeServer = () => started.server.close();
+    }
+  }
+
+  try {
+    const transcriptsText = await collectRecentTranscripts(client, repoDir);
+    if (!currentMemory && !transcriptsText) {
+      return {
+        memoryPath: getMemoryPath(repoDir),
+        usageSummary: "skipped (no memory or transcripts)",
+        consolidated: "",
+      };
+    }
+
+    const runner = createOpencodeClientRunner({
+      client,
+      worktreeDir: repoDir,
+      config,
+      model: opts.model ?? "openrouter/google/gemini-2.5-flash",
+    });
+
+    const sessionId = await runner.createSession(`Dream: ${repoName}`);
+    const prompt = buildDreamPrompt(repoName, currentMemory, transcriptsText);
+    const res = await runner.prompt(sessionId, "reviewer", prompt);
+    const consolidated = res.text.trim();
+    if (!consolidated) {
+      throw new Error("Dream consolidation returned empty output.");
+    }
+    const memoryPath = writeConsolidatedMemory(repoDir, consolidated);
+    return { memoryPath, usageSummary: res.usageSummary, consolidated };
+  } finally {
+    closeServer?.();
   }
 }

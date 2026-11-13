@@ -2,10 +2,13 @@ import fs from "node:fs";
 import path from "node:path";
 import { loadRepoConfig, type RepoConfig } from "./config.ts";
 import {
+  abortRebase,
   commitAll,
   createWorktree,
   getDiff,
+  isRebaseInProgress,
   pushAndOpenPR,
+  rebaseOntoBase,
   runShell,
   type WorktreeHandle,
 } from "./git.ts";
@@ -63,7 +66,7 @@ export function resolveCloudflareGatewayUrl(): string | undefined {
   const accountId = process.env.CF_ACCOUNT_ID;
   const gatewayId = process.env.CF_GATEWAY_ID;
   if (accountId && gatewayId) {
-    return `https://gateway.cloudflare.com/v1/${accountId}/${gatewayId}/openrouter`;
+    return `https://gateway.ai.cloudflare.com/v1/${accountId}/${gatewayId}/openrouter`;
   }
   return undefined;
 }
@@ -286,6 +289,40 @@ export async function runPipeline(opts: PipelineOptions): Promise<void> {
     for (const line of usageLog) console.log(line);
 
     if (opts.openPr && committed) {
+      console.log(`\n[ai-ship] Ensuring branch is up-to-date with ${worktree.baseBranch}...`);
+      const rebase = rebaseOntoBase(worktree);
+      if (rebase.conflicted) {
+        console.log(
+          `  -> Rebase onto ${rebase.targetRef} hit conflicts in: ${rebase.conflictedFiles.join(", ")}. Asking implementer to resolve...`
+        );
+        const resolveRes = await runner.prompt(
+          implSessionId,
+          "implementer",
+          [
+            `Rebase onto ${rebase.targetRef} hit merge conflicts in:`,
+            ...rebase.conflictedFiles.map((f) => `- ${f}`),
+            "",
+            "Instructions:",
+            "- Resolve all conflict markers while preserving both upstream changes and your task implementation.",
+            "- Stage resolved files with `git add` and complete the rebase with `GIT_EDITOR=true git rebase --continue`.",
+          ].join("\n")
+        );
+        usageLog.push(formatUsage("Pre-PR Rebase", resolveRes.usageSummary));
+
+        if (isRebaseInProgress(worktree.worktreeDir)) {
+          abortRebase(worktree.worktreeDir);
+          throw new Error(`Rebase onto ${rebase.targetRef} remained incomplete after conflict resolution.`);
+        }
+      }
+
+      if (rebase.updated) {
+        console.log(`  -> Rebased onto ${rebase.targetRef}. Re-running verify gate...`);
+        const postRebaseVerify = await runDeterministicVerify(worktree.worktreeDir, config);
+        if (!postRebaseVerify.ok) {
+          throw new Error(`Verify failed after rebasing onto ${rebase.targetRef}:\n${postRebaseVerify.output}`);
+        }
+      }
+
       console.log("\n[ai-ship] Pushing branch and opening PR...");
       pushAndOpenPR(
         worktree,

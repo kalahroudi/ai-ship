@@ -53,15 +53,29 @@ export function setupWorktreeDependencies(
   }
 }
 
+export function resolveFreshBaseRef(repoDir: string, baseBranch: string): string {
+  const hasOrigin =
+    spawnSync("git", ["remote", "get-url", "origin"], { cwd: repoDir, stdio: "ignore" }).status === 0;
+  if (hasOrigin) {
+    spawnSync("git", ["fetch", "origin", baseBranch], { cwd: repoDir, stdio: "ignore" });
+    const remoteRef = `origin/${baseBranch}`;
+    const hasRemoteRef =
+      spawnSync("git", ["rev-parse", "--verify", remoteRef], { cwd: repoDir, stdio: "ignore" }).status === 0;
+    if (hasRemoteRef) return remoteRef;
+  }
+  return baseBranch;
+}
+
 export function createWorktree(repoDir: string, baseBranch: string, task: string): WorktreeHandle {
   const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
   const slug = `${slugify(task)}-${stamp}`;
   const branch = `ai/${slug}`;
   const root = path.join(repoDir, ".ai-ship-worktrees");
   const worktreeDir = path.join(root, slug);
+  const startRef = resolveFreshBaseRef(repoDir, baseBranch);
 
   fs.mkdirSync(root, { recursive: true });
-  execSync(`git worktree add -b "${branch}" "${worktreeDir}" "${baseBranch}"`, {
+  execSync(`git worktree add -b "${branch}" "${worktreeDir}" "${startRef}"`, {
     cwd: repoDir,
     stdio: "inherit",
   });
@@ -122,6 +136,58 @@ export function commitAll(worktreeDir: string, message: string): boolean {
   execSync("git add -A", { cwd: worktreeDir, stdio: "ignore" });
   spawnSync("git", ["commit", "-m", message], { cwd: worktreeDir, stdio: "inherit" });
   return true;
+}
+
+export interface RebaseResult {
+  updated: boolean;
+  conflicted: boolean;
+  targetRef: string;
+  conflictedFiles: string[];
+}
+
+export function isRebaseInProgress(worktreeDir: string): boolean {
+  const gitDirRes = spawnSync("git", ["rev-parse", "--git-dir"], {
+    cwd: worktreeDir,
+    encoding: "utf8",
+  });
+  if (gitDirRes.status !== 0) return false;
+  const gitDir = path.resolve(worktreeDir, gitDirRes.stdout.trim());
+  return fs.existsSync(path.join(gitDir, "rebase-merge")) || fs.existsSync(path.join(gitDir, "rebase-apply"));
+}
+
+export function abortRebase(worktreeDir: string): void {
+  spawnSync("git", ["rebase", "--abort"], { cwd: worktreeDir, stdio: "ignore" });
+}
+
+export function rebaseOntoBase(worktree: WorktreeHandle): RebaseResult {
+  const targetRef = resolveFreshBaseRef(worktree.worktreeDir, worktree.baseBranch);
+  const aheadRes = spawnSync("git", ["rev-list", "--count", `HEAD..${targetRef}`], {
+    cwd: worktree.worktreeDir,
+    encoding: "utf8",
+  });
+  const behindCount = aheadRes.status === 0 ? Number(aheadRes.stdout.trim()) : 0;
+  if (!behindCount) {
+    return { updated: false, conflicted: false, targetRef, conflictedFiles: [] };
+  }
+
+  const rebaseRes = spawnSync("git", ["rebase", targetRef], {
+    cwd: worktree.worktreeDir,
+    encoding: "utf8",
+  });
+  if (rebaseRes.status === 0) {
+    return { updated: true, conflicted: false, targetRef, conflictedFiles: [] };
+  }
+
+  const conflictsRes = spawnSync("git", ["diff", "--name-only", "--diff-filter=U"], {
+    cwd: worktree.worktreeDir,
+    encoding: "utf8",
+  });
+  const conflictedFiles = (conflictsRes.stdout || "")
+    .split("\n")
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  return { updated: true, conflicted: true, targetRef, conflictedFiles };
 }
 
 export function pushAndOpenPR(worktree: WorktreeHandle, title: string, body: string): void {

@@ -6,7 +6,9 @@ import {
   normalizeProvider,
   parseClaudeJsonOutput,
   parseOpencodeModel,
+  parseOpencodePromptResponse,
 } from "../src/runner.ts";
+import { resolveCloudflareGatewayUrl } from "../src/pipeline.ts";
 
 test("normalizeProvider defaults to opencode and accepts aliases", () => {
   assert.equal(normalizeProvider(undefined), "opencode");
@@ -79,4 +81,72 @@ test("parseClaudeJsonOutput throws on error payload", () => {
     result: "Invalid model",
   });
   assert.throws(() => parseClaudeJsonOutput(errPayload), /Invalid model/);
+});
+
+test("parseOpencodePromptResponse extracts text and usage on success", () => {
+  const res = parseOpencodePromptResponse(
+    {
+      data: {
+        parts: [{ type: "text", text: "VERDICT: CLEAN" }],
+        info: {
+          cost: 0.025,
+          tokens: { input: 200, output: 50, cache: { read: 10 } },
+        },
+      },
+    },
+    "reviewer"
+  );
+  assert.equal(res.text, "VERDICT: CLEAN");
+  assert.equal(res.usageSummary, "in=200 out=50 cache_read=10 | $0.0250");
+});
+
+test("parseOpencodePromptResponse throws on transport error, assistant error, or empty data", () => {
+  assert.throws(
+    () => parseOpencodePromptResponse({ error: new Error("ECONNREFUSED") }, "implementer"),
+    /OpenCode implementer request failed: ECONNREFUSED/
+  );
+  assert.throws(
+    () =>
+      parseOpencodePromptResponse(
+        {
+          data: {
+            parts: [],
+            info: {
+              error: {
+                name: "APIError",
+                data: { statusCode: 404, message: "Not Found" },
+              },
+            },
+          },
+        },
+        "implementer"
+      ),
+    /OpenCode implementer failed: APIError HTTP 404: Not Found/
+  );
+  assert.throws(
+    () => parseOpencodePromptResponse({}, "tester"),
+    /OpenCode tester returned an empty response/
+  );
+});
+
+test("resolveCloudflareGatewayUrl uses gateway.ai.cloudflare.com", () => {
+  const prevUrl = process.env.CF_AI_GATEWAY_URL;
+  const prevAcct = process.env.CF_ACCOUNT_ID;
+  const prevGw = process.env.CF_GATEWAY_ID;
+  try {
+    delete process.env.CF_AI_GATEWAY_URL;
+    process.env.CF_ACCOUNT_ID = "acct123";
+    process.env.CF_GATEWAY_ID = "gw456";
+    assert.equal(
+      resolveCloudflareGatewayUrl(),
+      "https://gateway.ai.cloudflare.com/v1/acct123/gw456/openrouter"
+    );
+  } finally {
+    if (prevUrl === undefined) delete process.env.CF_AI_GATEWAY_URL;
+    else process.env.CF_AI_GATEWAY_URL = prevUrl;
+    if (prevAcct === undefined) delete process.env.CF_ACCOUNT_ID;
+    else process.env.CF_ACCOUNT_ID = prevAcct;
+    if (prevGw === undefined) delete process.env.CF_GATEWAY_ID;
+    else process.env.CF_GATEWAY_ID = prevGw;
+  }
 });

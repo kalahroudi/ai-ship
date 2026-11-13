@@ -23,9 +23,20 @@ interface TextPart {
   text?: string;
 }
 
+interface OpencodeMessageError {
+  name?: string;
+  message?: string;
+  data?: {
+    message?: string;
+    statusCode?: number;
+    responseBody?: string;
+  };
+}
+
 interface PromptResponseData {
   parts?: TextPart[];
   info?: {
+    error?: OpencodeMessageError;
     cost?: number;
     tokens?: {
       input?: number;
@@ -83,6 +94,40 @@ function extractOpencodeText(data: PromptResponseData | undefined): string {
     .map((p) => p.text!)
     .join("\n")
     .trim();
+}
+
+function formatOpencodeError(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (typeof err === "string") return err;
+  if (typeof err === "object" && err !== null) {
+    const e = err as OpencodeMessageError;
+    const msg = e.data?.message || e.message || e.data?.responseBody;
+    const status = typeof e.data?.statusCode === "number" ? ` HTTP ${e.data.statusCode}` : "";
+    if (e.name && msg) return `${e.name}${status}: ${msg}`;
+    if (msg) return `${msg}${status}`;
+    return JSON.stringify(err);
+  }
+  return String(err);
+}
+
+/** Extracts text and usage from an OpenCode prompt response, throwing on transport or model errors. */
+export function parseOpencodePromptResponse(
+  res: { data?: PromptResponseData; error?: unknown },
+  role: AgentRole
+): PromptResult {
+  if (res.error) {
+    throw new Error(`OpenCode ${role} request failed: ${formatOpencodeError(res.error)}`);
+  }
+  if (!res.data) {
+    throw new Error(`OpenCode ${role} returned an empty response.`);
+  }
+  if (res.data.info?.error) {
+    throw new Error(`OpenCode ${role} failed: ${formatOpencodeError(res.data.info.error)}`);
+  }
+  return {
+    text: extractOpencodeText(res.data),
+    usageSummary: formatOpencodeUsage(res.data),
+  };
 }
 
 function formatOpencodeUsage(data: PromptResponseData | undefined): string {
@@ -248,11 +293,10 @@ async function createOpencodeRunner(opts: {
           parts: [{ type: "text", text }],
         },
       });
-      const data = res.data as PromptResponseData | undefined;
-      return {
-        text: extractOpencodeText(data),
-        usageSummary: formatOpencodeUsage(data),
-      };
+      return parseOpencodePromptResponse(
+        res as { data?: PromptResponseData; error?: unknown },
+        role
+      );
     },
     close() {
       server.close();

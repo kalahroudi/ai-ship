@@ -5,8 +5,12 @@ import os from "node:os";
 import path from "node:path";
 import { execSync, spawnSync } from "node:child_process";
 import {
+  abortRebase,
+  commitAll,
   createWorktree,
+  isRebaseInProgress,
   listCleanupTargets,
+  rebaseOntoBase,
   removeCleanupTargets,
   setupWorktreeDependencies,
 } from "../src/git.ts";
@@ -153,6 +157,43 @@ test("CLI --cleanup prompts for confirmation before deleting", () => {
   assert.match(confirmRun.stdout, /Are you sure/);
   assert.match(confirmRun.stdout, /Removed 1 worktree\(s\) and 1 branch\(es\)/);
   assert.equal(fs.existsSync(handle.worktreeDir), false);
+
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("rebaseOntoBase cleanly rebases non-conflicting upstream changes and reports conflicts", () => {
+  const dir = makeCommittedRepo({ "shared.txt": "line 1\n", "other.txt": "base\n" });
+  const handle = createWorktree(dir, "main", "rebase test");
+
+  // Commit in worktree on shared.txt
+  fs.writeFileSync(path.join(handle.worktreeDir, "shared.txt"), "worktree change\n");
+  assert.equal(commitAll(handle.worktreeDir, "feat: worktree change"), true);
+
+  // Advance main on a non-conflicting file
+  fs.writeFileSync(path.join(dir, "other.txt"), "main non-conflicting\n");
+  execSync('git add other.txt && git commit -m "main non-conflicting"', { cwd: dir, stdio: "ignore" });
+
+  const cleanRebase = rebaseOntoBase(handle);
+  assert.deepEqual(cleanRebase, {
+    updated: true,
+    conflicted: false,
+    targetRef: "main",
+    conflictedFiles: [],
+  });
+  assert.equal(fs.readFileSync(path.join(handle.worktreeDir, "other.txt"), "utf8"), "main non-conflicting\n");
+
+  // Now advance main on shared.txt to trigger a conflict
+  fs.writeFileSync(path.join(dir, "shared.txt"), "conflicting main change\n");
+  execSync('git add shared.txt && git commit -m "main conflict"', { cwd: dir, stdio: "ignore" });
+
+  const conflictRebase = rebaseOntoBase(handle);
+  assert.equal(conflictRebase.updated, true);
+  assert.equal(conflictRebase.conflicted, true);
+  assert.deepEqual(conflictRebase.conflictedFiles, ["shared.txt"]);
+  assert.equal(isRebaseInProgress(handle.worktreeDir), true);
+
+  abortRebase(handle.worktreeDir);
+  assert.equal(isRebaseInProgress(handle.worktreeDir), false);
 
   fs.rmSync(dir, { recursive: true, force: true });
 });

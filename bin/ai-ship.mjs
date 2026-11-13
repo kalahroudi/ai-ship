@@ -38,7 +38,7 @@ Options:
 function configureCloudflareGateway(accountId, gatewayId) {
   const configPath = path.join(os.homedir(), ".config", "opencode", "opencode.json");
   const cfg = JSON.parse(fs.readFileSync(configPath, "utf8"));
-  const baseURL = `https://gateway.cloudflare.com/v1/${accountId}/${gatewayId}/openrouter`;
+  const baseURL = `https://gateway.ai.cloudflare.com/v1/${accountId}/${gatewayId}/openrouter`;
   cfg.provider = cfg.provider ?? {};
   cfg.provider.openrouter = cfg.provider.openrouter ?? {};
   cfg.provider.openrouter.options = cfg.provider.openrouter.options ?? {};

@@ -208,6 +208,9 @@ export function pushAndOpenPR(worktree: WorktreeHandle, title: string, body: str
   const err = (res.stderr || "").trim();
   if (out) console.log(out);
   if (err) console.error(err);
+  if (res.status !== 0) {
+    throw new Error(`gh pr create failed: ${err || out || `exit code ${res.status ?? "unknown"}`}`);
+  }
   const match = out.match(/https:\/\/github\.com\/\S+/);
   return match ? match[0] : out || undefined;
 }

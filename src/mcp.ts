@@ -198,7 +198,7 @@ async function executeTool(
         provider: typeof args.provider === "string" ? args.provider : undefined,
       });
       const provider = resolveMcpProvider(resolved.provider ?? args.provider);
-      await deps.runPipeline({
+      const result = await deps.runPipeline({
         repoDir: targetRepo,
         task: resolved.task,
         openPr: resolved.openPr,
@@ -207,7 +207,29 @@ async function executeTool(
         provider,
         model: typeof args.model === "string" ? args.model : undefined,
       });
-      return `ai-ship pipeline completed for "${resolved.title || resolved.task}" in ${targetRepo}.`;
+      if (!result) {
+        return `ai-ship pipeline completed for "${resolved.title || resolved.task}" in ${targetRepo}.`;
+      }
+      const reviewSummary = result.reviewVerdicts.length
+        ? result.reviewVerdicts.map((r) => `${r.lens}: ${r.verdict}`).join(", ")
+        : "(skipped)";
+      const verifySummary = result.verifyCommands.length
+        ? `${result.verifyCommands.join(" && ")} (passed)`
+        : "(none)";
+      const lines = [
+        `ai-ship pipeline completed for "${resolved.title || resolved.task}"`,
+        `- Repo: ${result.repoDir}`,
+        `- Branch: ${result.branch} (base: ${result.baseBranch}, ${result.committed ? "committed" : "no changes"})`,
+        `- Worktree: ${result.worktreeDir}`,
+        `- Provider: ${result.provider}`,
+        `- Verify: ${verifySummary}`,
+        `- Review: ${reviewSummary}`,
+        `- PR: ${result.prUrl ?? (resolved.openPr ? "(not created — no changes or gh failed)" : "(not requested)")}`,
+      ];
+      if (result.usageLog.length) {
+        lines.push("- Usage:", ...result.usageLog);
+      }
+      return lines.join("\n");
     }
     case "memory_save": {
       if (typeof args.entry !== "string" || !args.entry.trim()) {

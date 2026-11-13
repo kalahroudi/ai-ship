@@ -194,16 +194,22 @@ export function rebaseOntoBase(worktree: WorktreeHandle): RebaseResult {
   return { updated: true, conflicted: true, targetRef, conflictedFiles };
 }
 
-export function pushAndOpenPR(worktree: WorktreeHandle, title: string, body: string): void {
+export function pushAndOpenPR(worktree: WorktreeHandle, title: string, body: string): string | undefined {
   execSync(`git push -u origin "${worktree.branch}"`, {
     cwd: worktree.worktreeDir,
     stdio: inheritStdio(),
   });
-  spawnSync(
+  const res = spawnSync(
     "gh",
     ["pr", "create", "--base", worktree.baseBranch, "--head", worktree.branch, "--title", title, "--body", body],
-    { cwd: worktree.worktreeDir, stdio: inheritStdio() }
+    { cwd: worktree.worktreeDir, encoding: "utf8" }
   );
+  const out = (res.stdout || "").trim();
+  const err = (res.stderr || "").trim();
+  if (out) console.log(out);
+  if (err) console.error(err);
+  const match = out.match(/https:\/\/github\.com\/\S+/);
+  return match ? match[0] : out || undefined;
 }
 
 export interface WorktreeCleanupItem {

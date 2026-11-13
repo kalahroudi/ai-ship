@@ -36,6 +36,19 @@ export interface PipelineOptions {
   onProgress?: (stage: string) => void;
 }
 
+export interface PipelineResult {
+  repoDir: string;
+  worktreeDir: string;
+  branch: string;
+  baseBranch: string;
+  provider: ProviderName;
+  committed: boolean;
+  verifyCommands: string[];
+  reviewVerdicts: Array<{ lens: string; verdict: "CLEAN" | "OPEN" }>;
+  prUrl?: string;
+  usageLog: string[];
+}
+
 function formatUsage(label: string, summary: string): string {
   return `  [${label}] ${summary}`;
 }
@@ -83,7 +96,7 @@ export function resolveCloudflareGatewayUrl(): string | undefined {
   return undefined;
 }
 
-export async function runPipeline(opts: PipelineOptions): Promise<void> {
+export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult> {
   const repoDir = path.resolve(opts.repoDir);
   const config = loadRepoConfig(repoDir);
 
@@ -119,6 +132,8 @@ export async function runPipeline(opts: PipelineOptions): Promise<void> {
         serverUrl: opts.serverUrl,
       });
   const usageLog: string[] = [];
+  let reviewVerdicts: Array<{ lens: string; verdict: "CLEAN" | "OPEN" }> = [];
+  let prUrl: string | undefined;
 
   try {
     // -------------------------------------------------------------------------
@@ -267,6 +282,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<void> {
         fs.rmSync(sharedContextPath, { force: true });
 
         const openFindings = reviews.filter((r) => r.verdict === "OPEN");
+        reviewVerdicts = reviews.map((r) => ({ lens: r.lens, verdict: r.verdict }));
         for (const r of reviews) {
           console.log(`  -> ${r.lens}: ${r.verdict}`);
         }
@@ -348,12 +364,25 @@ export async function runPipeline(opts: PipelineOptions): Promise<void> {
 
       console.log("\n[ai-ship] Pushing branch and opening PR...");
       opts.onProgress?.("Pushing branch and opening PR");
-      pushAndOpenPR(
+      prUrl = pushAndOpenPR(
         worktree,
         opts.task.slice(0, 72),
         `Automated via \`ai-ship\` (${provider}).\n\nVerified locally with:\n${config.verify.map((c) => `- \`${c}\``).join("\n")}`
       );
     }
+
+    return {
+      repoDir,
+      worktreeDir: worktree.worktreeDir,
+      branch: worktree.branch,
+      baseBranch: worktree.baseBranch,
+      provider,
+      committed,
+      verifyCommands: config.verify,
+      reviewVerdicts,
+      prUrl,
+      usageLog,
+    };
   } finally {
     runner.close();
   }

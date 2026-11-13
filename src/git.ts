@@ -123,6 +123,15 @@ export function getDiff(worktreeDir: string, baseBranch: string): string {
   }
 }
 
+/** Returns `git diff --stat` between `baseBranch` and `HEAD` for PR summaries. */
+export function getDiffStat(worktreeDir: string, baseBranch: string): string {
+  const res = spawnSync("git", ["diff", "--stat", `${baseBranch}...HEAD`], {
+    cwd: worktreeDir,
+    encoding: "utf8",
+  });
+  return res.status === 0 ? (res.stdout || "").trim() : "";
+}
+
 export function runShell(command: string, cwd: string): { ok: boolean; output: string } {
   const res = spawnSync(command, {
     cwd,

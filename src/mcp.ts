@@ -331,7 +331,10 @@ export async function handleMcpRequest(
       return {
         jsonrpc: "2.0",
         id,
-        result: { content: [{ type: "text", text: message }], isError: true },
+        result: {
+          content: [{ type: "text", text: `ai-ship (${String(name ?? "unknown")}) failed: ${message}` }],
+          isError: true,
+        },
       };
     }
   }

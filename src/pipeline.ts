@@ -7,6 +7,7 @@ import {
   commitAll,
   createWorktree,
   getDiff,
+  getDiffStat,
   isRebaseInProgress,
   pushAndOpenPR,
   rebaseOntoBase,
@@ -47,6 +48,47 @@ export interface PipelineResult {
   reviewVerdicts: Array<{ lens: string; verdict: "CLEAN" | "OPEN" }>;
   prUrl?: string;
   usageLog: string[];
+}
+
+export function buildPrBody(opts: {
+  task: string;
+  provider: ProviderName;
+  implSummary: string;
+  diffStat: string;
+  verifyCommands: string[];
+  adversarialTestsRan: boolean;
+  reviewVerdicts: Array<{ lens: string; verdict: "CLEAN" | "OPEN" }>;
+}): string {
+  const sections: string[] = [
+    "## Summary",
+    opts.task.trim(),
+  ];
+
+  if (opts.implSummary.trim()) {
+    sections.push("", "### Implementation Notes", opts.implSummary.trim().slice(0, 1500));
+  }
+
+  if (opts.diffStat.trim()) {
+    sections.push("", "## Changed Files", "```text", opts.diffStat.trim(), "```");
+  }
+
+  const verifyLines = opts.verifyCommands.length
+    ? opts.verifyCommands.map((c) => `- [x] \`${c}\``)
+    : ["- (none configured)"];
+  verifyLines.push(
+    opts.adversarialTestsRan
+      ? "- [x] Independent adversarial tests (Stage 2)"
+      : "- [ ] Independent adversarial tests (skipped)"
+  );
+  sections.push("", "## Verification", ...verifyLines);
+
+  const reviewLines = opts.reviewVerdicts.length
+    ? opts.reviewVerdicts.map((r) => `- **${r.lens}:** ${r.verdict}`)
+    : ["- (skipped)"];
+  sections.push("", "## Multi-Lens Review", ...reviewLines);
+
+  sections.push("", `---`, `*Automated via \`ai-ship\` (${opts.provider}).*`);
+  return sections.join("\n");
 }
 
 function formatUsage(label: string, summary: string): string {
@@ -364,11 +406,17 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
 
       console.log("\n[ai-ship] Pushing branch and opening PR...");
       opts.onProgress?.("Pushing branch and opening PR");
-      prUrl = pushAndOpenPR(
-        worktree,
-        opts.task.slice(0, 72),
-        `Automated via \`ai-ship\` (${provider}).\n\nVerified locally with:\n${config.verify.map((c) => `- \`${c}\``).join("\n")}`
-      );
+      const prTitle = opts.task.split(/\r?\n/)[0].trim().slice(0, 72);
+      const prBody = buildPrBody({
+        task: opts.task,
+        provider,
+        implSummary: implRes.text,
+        diffStat: getDiffStat(worktree.worktreeDir, worktree.baseBranch),
+        verifyCommands: config.verify,
+        adversarialTestsRan: !opts.skipTests,
+        reviewVerdicts,
+      });
+      prUrl = pushAndOpenPR(worktree, prTitle, prBody);
     }
 
     return {

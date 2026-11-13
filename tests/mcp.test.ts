@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { handleMcpRequest, MCP_TOOLS, type McpToolDeps } from "../src/mcp.ts";
+import { buildPrBody } from "../src/pipeline.ts";
 
 test("handleMcpRequest handles initialize, notifications, ping, and tools/list", async () => {
   const initResp = await handleMcpRequest({
@@ -124,5 +125,28 @@ test("handleMcpRequest handles memory_save, memory_forget, and unknown tools", a
     fakeDeps
   );
   assert.equal(errResp?.result.isError, true);
-  assert.match(errResp?.result.content[0].text, /Unknown tool/);
+  assert.match(errResp?.result.content[0].text, /ai-ship \(nonexistent_tool\) failed: Unknown tool/);
+});
+
+test("buildPrBody includes task summary, implementation notes, diff stat, verify, and review verdicts", () => {
+  const body = buildPrBody({
+    task: "Move contacts import payload out of control D1 DB",
+    provider: "claude-code",
+    implSummary: "Moved import payload to R2 and cleared D1 column on completion.",
+    diffStat: " src/import.ts | 24 ++++++++++++------------\n 1 file changed, 12 insertions(+), 12 deletions(-)",
+    verifyCommands: ["pnpm verify"],
+    adversarialTestsRan: true,
+    reviewVerdicts: [
+      { lens: "Security", verdict: "CLEAN" },
+      { lens: "Performance", verdict: "CLEAN" },
+      { lens: "Correctness", verdict: "CLEAN" },
+    ],
+  });
+
+  assert.match(body, /## Summary/);
+  assert.match(body, /### Implementation Notes/);
+  assert.match(body, /## Changed Files/);
+  assert.match(body, /pnpm verify/);
+  assert.match(body, /Independent adversarial tests \(Stage 2\)/);
+  assert.match(body, /\*\*Security:\*\* CLEAN/);
 });

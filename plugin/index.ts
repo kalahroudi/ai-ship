@@ -1,3 +1,4 @@
+import { listCleanupTargets, removeCleanupTargets } from "../src/git.ts";
 import { appendMemory, forgetMemory, readMemory } from "../src/memory.ts";
 import { runDreamConsolidation, runPipeline } from "../src/pipeline.ts";
 import type { OpencodeClient } from "../src/runner.ts";
@@ -58,6 +59,11 @@ export function createAiShipPlugin(tool: ToolHelper) {
         cfg.command.remember = {
           description: "Save a note directly to persistent repository memory",
           template: "$ARGUMENTS",
+        };
+        cfg.command.cleanup = {
+          description: "List or remove leftover ai-ship worktrees and ai/* branches",
+          template:
+            "Use `cleanup_worktrees` to inspect leftover ai-ship worktrees and branches (pass `confirm: true` only if the user asked to delete them): $ARGUMENTS",
         };
       },
 
@@ -165,6 +171,37 @@ export function createAiShipPlugin(tool: ToolHelper) {
             });
             notifyProgress(ctx.client, toolCtx, "Memory consolidated", "success");
             return `Consolidated memory at ${res.memoryPath} (${res.usageSummary}).`;
+          },
+        }),
+
+        cleanup_worktrees: tool({
+          description:
+            "List or remove leftover ai-ship worktrees and ai/* branches. Defaults to dry-run unless confirm is true.",
+          args: {
+            confirm: z.boolean().optional().describe("Set true to delete listed worktrees and branches"),
+          },
+          async execute(args, toolCtx) {
+            const targetRepo = toolCtx.worktree || toolCtx.directory || repoRoot;
+            const targets = listCleanupTargets(targetRepo);
+            const deletableBranches = targets.branches.filter((b) => !b.checkedOutInMain);
+            if (targets.worktrees.length === 0 && deletableBranches.length === 0) {
+              return "Nothing to clean up.";
+            }
+            const summary = [
+              `Worktrees (${targets.worktrees.length}): ${targets.worktrees.map((w) => w.path).join(", ") || "(none)"}`,
+              `Branches (${deletableBranches.length}): ${deletableBranches.map((b) => `${b.name}${b.merged ? " [merged]" : ""}`).join(", ") || "(none)"}`,
+            ].join("\n");
+            if (!args.confirm) {
+              return `Dry run — pass confirm=true to remove:\n${summary}`;
+            }
+            const removed = removeCleanupTargets(targetRepo, targets);
+            notifyProgress(
+              ctx.client,
+              toolCtx,
+              `Cleaned ${removed.removedWorktrees.length} worktree(s), ${removed.removedBranches.length} branch(es)`,
+              "success"
+            );
+            return `Removed ${removed.removedWorktrees.length} worktree(s) and ${removed.removedBranches.length} branch(es).`;
           },
         }),
       },

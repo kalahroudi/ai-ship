@@ -28,8 +28,9 @@ test("handleMcpRequest handles initialize, notifications, ping, and tools/list",
   assert.ok(listResp?.result.tools.some((t: any) => t.name === "ship_task"));
 });
 
-test("handleMcpRequest executes ship_task with inline flags and noty resolution", async () => {
+test("handleMcpRequest executes ship_task with inline flags, noty resolution, and progress notifications", async () => {
   const calls: any[] = [];
+  const notifications: any[] = [];
   const fakeDeps = {
     resolveShipTaskInput: () => ({
       task: "Fix auth bug",
@@ -39,8 +40,10 @@ test("handleMcpRequest executes ship_task with inline flags and noty resolution"
       title: "Auth bug",
     }),
     runPipeline: async (opts: any) => {
+      opts.onProgress?.("Stage 1/4: Implementing");
       calls.push(opts);
     },
+    notify: (n: any) => notifications.push(n),
   } as unknown as McpToolDeps;
 
   const resp = await handleMcpRequest(
@@ -51,6 +54,7 @@ test("handleMcpRequest executes ship_task with inline flags and noty resolution"
       params: {
         name: "ship_task",
         arguments: { task: "noty://item/123 --pr --skip-tests", repoDir: "/tmp/my-repo", provider: "claude-code" },
+        _meta: { progressToken: "tok-1" },
       },
     },
     fakeDeps
@@ -58,15 +62,22 @@ test("handleMcpRequest executes ship_task with inline flags and noty resolution"
 
   assert.equal(resp?.result.isError, undefined);
   assert.match(resp?.result.content[0].text, /Auth bug/);
-  assert.deepEqual(calls[0], {
-    repoDir: "/tmp/my-repo",
-    task: "Fix auth bug",
-    openPr: true,
-    skipTests: true,
-    skipReview: false,
-    provider: "claude-code",
-    model: undefined,
-  });
+  assert.equal(typeof calls[0].onProgress, "function");
+  assert.deepEqual(
+    { ...calls[0], onProgress: undefined },
+    {
+      repoDir: "/tmp/my-repo",
+      task: "Fix auth bug",
+      openPr: true,
+      skipTests: true,
+      skipReview: false,
+      provider: "claude-code",
+      model: undefined,
+      onProgress: undefined,
+    }
+  );
+  assert.ok(notifications.some((n) => n.method === "notifications/message" && n.params.data === "Stage 1/4: Implementing"));
+  assert.ok(notifications.some((n) => n.method === "notifications/progress" && n.params.progressToken === "tok-1"));
 });
 
 test("handleMcpRequest handles memory_save, memory_forget, and unknown tools", async () => {

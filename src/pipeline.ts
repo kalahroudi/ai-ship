@@ -155,6 +155,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
   if (provider === "opencode" && cfGatewayUrl) console.log(`[ai-ship] Cloudflare AI Gateway: ${cfGatewayUrl}`);
   console.log(`[ai-ship] Verify pipeline: ${config.verify.length ? config.verify.join(" && ") : "(none detected)"}`);
 
+  opts.onProgress?.("Creating isolated worktree");
   const worktree: WorktreeHandle = createWorktree(repoDir, config.baseBranch, opts.task);
   console.log(`[ai-ship] Worktree: ${worktree.worktreeDir} (branch: ${worktree.branch})`);
 
@@ -302,6 +303,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
           "utf8"
         );
 
+        opts.onProgress?.(`Stage 4/4: Parallel 3-lens review (round ${round}/${config.maxReviewRounds})`);
         const reviews = await Promise.all(
           lenses.map(async (lens) => {
             const sid = await runner.createSession(`Review (${lens.name})`);
@@ -342,6 +344,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
           throw new Error("Review findings remain OPEN. Inspect the worktree before pushing.");
         }
 
+        opts.onProgress?.(`Stage 4/4: Addressing review findings (round ${round})`);
         console.log("  -> Sending OPEN findings back to implementer...");
         const findingsText = openFindings
           .map((f) => `### ${f.lens} Review\n${f.text}`)
@@ -370,6 +373,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
     for (const line of usageLog) console.log(line);
 
     if (opts.openPr && committed) {
+      opts.onProgress?.(`Rebasing onto ${worktree.baseBranch}`);
       console.log(`\n[ai-ship] Ensuring branch is up-to-date with ${worktree.baseBranch}...`);
       const rebase = rebaseOntoBase(worktree);
       if (rebase.conflicted) {

@@ -31,6 +31,7 @@ export interface McpToolDeps {
   forgetMemory: typeof forgetMemory;
   listCleanupTargets: typeof listCleanupTargets;
   removeCleanupTargets: typeof removeCleanupTargets;
+  notify?: (notification: { jsonrpc: "2.0"; method: string; params: Record<string, any> }) => void;
 }
 
 const DEFAULT_DEPS: McpToolDeps = {
@@ -180,7 +181,8 @@ function resolveMcpProvider(rawProvider: unknown): ProviderName {
 async function executeTool(
   name: string,
   args: Record<string, any>,
-  deps: McpToolDeps
+  deps: McpToolDeps,
+  onProgress?: (stage: string) => void
 ): Promise<string> {
   const targetRepo = typeof args.repoDir === "string" && args.repoDir.trim()
     ? args.repoDir.trim()
@@ -197,6 +199,9 @@ async function executeTool(
         skipReview: Boolean(args.skipReview),
         provider: typeof args.provider === "string" ? args.provider : undefined,
       });
+      if (resolved.title) {
+        onProgress?.(`Resolved Noty: ${resolved.title}`);
+      }
       const provider = resolveMcpProvider(resolved.provider ?? args.provider);
       const result = await deps.runPipeline({
         repoDir: targetRepo,
@@ -206,6 +211,7 @@ async function executeTool(
         skipReview: resolved.skipReview,
         provider,
         model: typeof args.model === "string" ? args.model : undefined,
+        onProgress,
       });
       if (!result) {
         return `ai-ship pipeline completed for "${resolved.title || resolved.task}" in ${targetRepo}.`;
@@ -298,13 +304,13 @@ export async function handleMcpRequest(
       id,
       result: {
         protocolVersion,
-        capabilities: { tools: {} },
+        capabilities: { tools: {}, logging: {} },
         serverInfo: { name: "ai-ship", version: "0.1.0" },
       },
     };
   }
 
-  if (req.method === "ping") {
+  if (req.method === "ping" || req.method === "logging/setLevel") {
     return { jsonrpc: "2.0", id, result: {} };
   }
 
@@ -319,8 +325,25 @@ export async function handleMcpRequest(
   if (req.method === "tools/call") {
     const name = req.params?.name;
     const args = (req.params?.arguments ?? {}) as Record<string, any>;
+    const progressToken = req.params?._meta?.progressToken as string | number | undefined;
+    let step = 0;
+    const onProgress = (stage: string) => {
+      step += 1;
+      deps.notify?.({
+        jsonrpc: "2.0",
+        method: "notifications/message",
+        params: { level: "info", logger: "ai-ship", data: stage },
+      });
+      if (progressToken !== undefined) {
+        deps.notify?.({
+          jsonrpc: "2.0",
+          method: "notifications/progress",
+          params: { progressToken, progress: step, message: stage },
+        });
+      }
+    };
     try {
-      const text = await executeTool(String(name ?? ""), args, deps);
+      const text = await executeTool(String(name ?? ""), args, deps, onProgress);
       return {
         jsonrpc: "2.0",
         id,
@@ -370,7 +393,14 @@ export function startMcpServer(): void {
       return;
     }
 
-    void handleMcpRequest(parsed).then((resp) => {
+    const stdioDeps: McpToolDeps = {
+      ...DEFAULT_DEPS,
+      notify: (notification) => {
+        process.stdout.write(JSON.stringify(notification) + "\n");
+      },
+    };
+
+    void handleMcpRequest(parsed, stdioDeps).then((resp) => {
       if (resp) {
         process.stdout.write(JSON.stringify(resp) + "\n");
       }

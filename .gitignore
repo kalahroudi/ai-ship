@@ -1,0 +1,5 @@
+node_modules/
+.DS_Store
+.ai-ship-worktrees/
+.ai-ship-shared-context.txt
+*.log

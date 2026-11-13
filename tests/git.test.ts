@@ -1,0 +1,158 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { execSync, spawnSync } from "node:child_process";
+import {
+  createWorktree,
+  listCleanupTargets,
+  removeCleanupTargets,
+  setupWorktreeDependencies,
+} from "../src/git.ts";
+
+function makeCommittedRepo(files: Record<string, string>) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ai-ship-git-test-"));
+  execSync("git init -b main", { cwd: dir, stdio: "ignore" });
+  execSync('git config user.email "test@example.com"', { cwd: dir, stdio: "ignore" });
+  execSync('git config user.name "Test"', { cwd: dir, stdio: "ignore" });
+  for (const [name, content] of Object.entries(files)) {
+    fs.writeFileSync(path.join(dir, name), content);
+  }
+  execSync("git add -A && git commit -m init", { cwd: dir, stdio: "ignore" });
+  return dir;
+}
+
+test("createWorktree symlinks node_modules for npm repos", () => {
+  const dir = makeCommittedRepo({
+    "package.json": JSON.stringify({ name: "npm-app", version: "1.0.0" }),
+  });
+  fs.mkdirSync(path.join(dir, "node_modules", "pkg"), { recursive: true });
+
+  const handle = createWorktree(dir, "main", "test npm worktree");
+  const wtModules = path.join(handle.worktreeDir, "node_modules");
+  assert.equal(fs.lstatSync(wtModules).isSymbolicLink(), true);
+
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("setupWorktreeDependencies runs pnpm install offline without symlinking node_modules", () => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "ai-ship-pnpm-repo-"));
+  const worktreeDir = fs.mkdtempSync(path.join(os.tmpdir(), "ai-ship-pnpm-wt-"));
+  fs.mkdirSync(path.join(repoDir, "node_modules"), { recursive: true });
+  fs.writeFileSync(path.join(worktreeDir, "package.json"), "{}");
+  fs.writeFileSync(path.join(worktreeDir, "pnpm-lock.yaml"), "");
+
+  const calls: Array<{ args: string[]; cwd: string; quiet: boolean }> = [];
+  setupWorktreeDependencies(repoDir, worktreeDir, (args, cwd, quiet) => {
+    calls.push({ args, cwd, quiet });
+    return 0;
+  });
+
+  assert.equal(fs.existsSync(path.join(worktreeDir, "node_modules")), false);
+  assert.deepEqual(calls, [
+    { args: ["install", "--frozen-lockfile", "--offline"], cwd: worktreeDir, quiet: true },
+  ]);
+
+  fs.rmSync(repoDir, { recursive: true, force: true });
+  fs.rmSync(worktreeDir, { recursive: true, force: true });
+});
+
+test("setupWorktreeDependencies falls back to --prefer-offline when offline install fails", () => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "ai-ship-pnpm-repo-"));
+  const worktreeDir = fs.mkdtempSync(path.join(os.tmpdir(), "ai-ship-pnpm-wt-"));
+  fs.writeFileSync(path.join(worktreeDir, "package.json"), "{}");
+  fs.writeFileSync(path.join(worktreeDir, "pnpm-workspace.yaml"), "packages:\n  - .\n");
+
+  const calls: Array<{ args: string[]; quiet: boolean }> = [];
+  setupWorktreeDependencies(repoDir, worktreeDir, (args, _cwd, quiet) => {
+    calls.push({ args, quiet });
+    return calls.length === 1 ? 1 : 0;
+  });
+
+  assert.deepEqual(calls, [
+    { args: ["install", "--offline"], quiet: true },
+    { args: ["install", "--prefer-offline"], quiet: false },
+  ]);
+
+  fs.rmSync(repoDir, { recursive: true, force: true });
+  fs.rmSync(worktreeDir, { recursive: true, force: true });
+});
+
+test("setupWorktreeDependencies throws if pnpm install fails both offline and online", () => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "ai-ship-pnpm-repo-"));
+  const worktreeDir = fs.mkdtempSync(path.join(os.tmpdir(), "ai-ship-pnpm-wt-"));
+  fs.writeFileSync(path.join(worktreeDir, "package.json"), "{}");
+  fs.writeFileSync(path.join(worktreeDir, "pnpm-lock.yaml"), "");
+
+  assert.throws(
+    () => setupWorktreeDependencies(repoDir, worktreeDir, () => 1),
+    /pnpm install failed in worktree/
+  );
+
+  fs.rmSync(repoDir, { recursive: true, force: true });
+  fs.rmSync(worktreeDir, { recursive: true, force: true });
+});
+
+test("listCleanupTargets and removeCleanupTargets clean up worktrees and ai/* branches", () => {
+  const dir = makeCommittedRepo({ "README.md": "hello\n" });
+  execSync("git branch feature/keep-me", { cwd: dir, stdio: "ignore" });
+
+  const handle = createWorktree(dir, "main", "cleanup test");
+  fs.writeFileSync(path.join(handle.worktreeDir, "dirty.txt"), "uncommitted\n");
+
+  const orphanDir = path.join(dir, ".ai-ship-worktrees", "orphaned-dir");
+  fs.mkdirSync(orphanDir, { recursive: true });
+
+  const targets = listCleanupTargets(dir, "main");
+  assert.equal(targets.worktrees.length, 2);
+  const registered = targets.worktrees.find((w) => w.registered);
+  const orphan = targets.worktrees.find((w) => !w.registered);
+  assert.ok(registered);
+  assert.equal(registered.branch, handle.branch);
+  assert.equal(registered.dirty, true);
+  assert.ok(orphan);
+
+  assert.deepEqual(
+    targets.branches.map((b) => b.name),
+    [handle.branch]
+  );
+  assert.equal(targets.branches[0].checkedOutInMain, false);
+
+  const res = removeCleanupTargets(targets);
+  assert.equal(res.removedWorktrees.length, 2);
+  assert.deepEqual(res.removedBranches, [handle.branch]);
+  assert.equal(fs.existsSync(path.join(dir, ".ai-ship-worktrees")), false);
+
+  const branches = execSync("git branch --format='%(refname:short)'", { cwd: dir, encoding: "utf8" });
+  assert.equal(branches.includes(handle.branch), false);
+  assert.equal(branches.includes("feature/keep-me"), true);
+
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("CLI --cleanup prompts for confirmation before deleting", () => {
+  const dir = makeCommittedRepo({ "README.md": "hello\n" });
+  const handle = createWorktree(dir, "main", "confirm test");
+  const cliPath = path.resolve(import.meta.dirname, "..", "bin", "ai-ship.mjs");
+
+  const cancelRun = spawnSync(process.execPath, [cliPath, "--cleanup", "--repo", dir], {
+    input: "n\n",
+    encoding: "utf8",
+  });
+  assert.equal(cancelRun.status, 0);
+  assert.match(cancelRun.stdout, /Are you sure/);
+  assert.match(cancelRun.stdout, /Cleanup cancelled/);
+  assert.equal(fs.existsSync(handle.worktreeDir), true);
+
+  const confirmRun = spawnSync(process.execPath, [cliPath, "--cleanup", "--repo", dir], {
+    input: "y\n",
+    encoding: "utf8",
+  });
+  assert.equal(confirmRun.status, 0);
+  assert.match(confirmRun.stdout, /Are you sure/);
+  assert.match(confirmRun.stdout, /Removed 1 worktree\(s\) and 1 branch\(es\)/);
+  assert.equal(fs.existsSync(handle.worktreeDir), false);
+
+  fs.rmSync(dir, { recursive: true, force: true });
+});

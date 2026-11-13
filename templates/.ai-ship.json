@@ -1,0 +1,10 @@
+{
+  "baseBranch": "main",
+  "verify": [],
+  "maxFixRetries": 3,
+  "maxReviewRounds": 2,
+  "securityScan": true,
+  "implementerModel": { "providerID": "openrouter", "id": "anthropic/claude-sonnet-4" },
+  "testerModel": { "providerID": "openrouter", "id": "openai/gpt-4.1" },
+  "reviewerModel": { "providerID": "openrouter", "id": "google/gemini-2.5-pro" }
+}

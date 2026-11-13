@@ -1,0 +1,17 @@
+{
+  "name": "ai-ship",
+  "version": "0.1.0",
+  "description": "Project-agnostic OpenCode pipeline: worktree -> implement -> independent adversarial tests -> local verify -> parallel multi-lens review",
+  "type": "module",
+  "bin": {
+    "ai-ship": "./bin/ai-ship.mjs"
+  },
+  "scripts": {
+    "start": "node ./bin/ai-ship.mjs",
+    "test": "node --test ./tests/*.test.ts"
+  },
+  "dependencies": {
+    "@opencode-ai/sdk": "^1.19.5",
+    "opencode-ai": "^1.19.5"
+  }
+}

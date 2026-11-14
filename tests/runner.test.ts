@@ -299,6 +299,20 @@ test("buildOpencodeProviderConfig configures DeepSeek Direct, Parasail.io, and C
     (viaBareCf?.parasail?.options as Record<string, unknown>)?.baseURL,
     "https://api.parasail.io/v1"
   );
+
+  const viaContextLens = buildOpencodeProviderConfig(
+    baseCfg,
+    undefined,
+    "http://localhost:4040/"
+  );
+  assert.equal(
+    (viaContextLens?.deepseek?.options as Record<string, unknown>)?.baseURL,
+    "http://localhost:4040"
+  );
+  assert.equal(
+    (viaContextLens?.parasail?.options as Record<string, unknown>)?.baseURL,
+    "http://localhost:4040"
+  );
 });
 
 

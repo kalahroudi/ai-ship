@@ -34,6 +34,8 @@ export const DEFAULT_CONTEXT_LIMITS: ContextLimits = {
   memoryMaxLines: 120,
 };
 
+export const DEFAULT_CONTEXT_LENS_URL = "http://localhost:4040";
+
 export interface RepoConfig {
   baseBranch: string;
   verify: string[];
@@ -60,6 +62,7 @@ export interface RepoConfig {
   safetyCheck: boolean;
   safetyAllowlist?: string[];
   bughunter?: boolean;
+  contextLens?: boolean | string;
 }
 
 export const DEFAULT_PROVIDERS: Record<string, ProviderConfig> = {
@@ -271,4 +274,125 @@ export function loadRepoConfig(repoDir: string): RepoConfig {
     safetyCheck,
     bughunter,
   };
+}
+
+export interface ParsedCliArgs {
+  help: boolean;
+  repoDir: string;
+  openPr: boolean;
+  draft: boolean;
+  worktreeDir?: string;
+  skipTests: boolean;
+  skipReview: boolean;
+  skipBughunter: boolean;
+  doInit: boolean;
+  doCleanup: boolean;
+  doSafetyCheck: boolean;
+  doDream: boolean;
+  skipConfirm: boolean;
+  notyAddress?: string;
+  notyDir?: string;
+  rawProvider?: string;
+  model?: string;
+  serverUrl?: string;
+  contextLens?: boolean | string;
+  cfArgs?: { accountId: string; gatewayId: string; provider?: string };
+  positional: string[];
+  unknownOption?: string;
+}
+
+/** Parses `ai-ship` CLI arguments into a structured options object. */
+export function parseCliArgs(args: string[], cwd = process.cwd()): ParsedCliArgs {
+  const result: ParsedCliArgs = {
+    help: args.length === 0,
+    repoDir: cwd,
+    openPr: false,
+    draft: false,
+    skipTests: false,
+    skipReview: false,
+    skipBughunter: false,
+    doInit: false,
+    doCleanup: false,
+    doSafetyCheck: false,
+    doDream: false,
+    skipConfirm: false,
+    positional: [],
+  };
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === "-h" || arg === "--help") {
+      result.help = true;
+    } else if (arg === "--repo" && args[i + 1]) {
+      result.repoDir = path.resolve(cwd, args[++i]);
+    } else if (arg.startsWith("--repo=")) {
+      result.repoDir = path.resolve(cwd, arg.slice("--repo=".length));
+    } else if (arg === "--noty" && args[i + 1]) {
+      result.notyAddress = args[++i];
+    } else if (arg.startsWith("--noty=")) {
+      result.notyAddress = arg.slice("--noty=".length);
+    } else if (arg === "--noty-dir" && args[i + 1]) {
+      result.notyDir = path.resolve(cwd, args[++i]);
+    } else if (arg.startsWith("--noty-dir=")) {
+      result.notyDir = path.resolve(cwd, arg.slice("--noty-dir=".length));
+    } else if (arg === "--provider" && args[i + 1]) {
+      result.rawProvider = args[++i];
+    } else if (arg.startsWith("--provider=")) {
+      result.rawProvider = arg.slice("--provider=".length);
+    } else if (arg === "--model" && args[i + 1]) {
+      result.model = args[++i];
+    } else if (arg.startsWith("--model=")) {
+      result.model = arg.slice("--model=".length);
+    } else if (arg === "--server" && args[i + 1]) {
+      result.serverUrl = args[++i];
+    } else if (arg.startsWith("--server=")) {
+      result.serverUrl = arg.slice("--server=".length);
+    } else if (arg === "--context-lens") {
+      if (args[i + 1] && /^https?:\/\//i.test(args[i + 1])) {
+        result.contextLens = args[++i];
+      } else {
+        result.contextLens = true;
+      }
+    } else if (arg.startsWith("--context-lens=")) {
+      const val = arg.slice("--context-lens=".length).trim();
+      result.contextLens = val || true;
+    } else if (arg === "--dream") {
+      result.doDream = true;
+    } else if (arg === "--pr") {
+      result.openPr = true;
+    } else if (arg === "--draft") {
+      result.draft = true;
+      result.openPr = true;
+    } else if (arg === "--worktree" && args[i + 1]) {
+      result.worktreeDir = path.resolve(cwd, args[++i]);
+    } else if (arg.startsWith("--worktree=")) {
+      result.worktreeDir = path.resolve(cwd, arg.slice("--worktree=".length));
+    } else if (arg === "--skip-tests") {
+      result.skipTests = true;
+    } else if (arg === "--skip-review") {
+      result.skipReview = true;
+    } else if (arg === "--skip-bughunter") {
+      result.skipBughunter = true;
+    } else if (arg === "--init") {
+      result.doInit = true;
+    } else if (arg === "--cleanup") {
+      result.doCleanup = true;
+    } else if (arg === "--safety-check") {
+      result.doSafetyCheck = true;
+    } else if (arg === "--yes" || arg === "-y") {
+      result.skipConfirm = true;
+    } else if ((arg === "--cf" || arg === "-cf") && args[i + 1] && args[i + 2]) {
+      const accountId = args[++i];
+      const gatewayId = args[++i];
+      const cfProvider = args[i + 1] && !args[i + 1].startsWith("-") ? args[++i] : undefined;
+      result.cfArgs = { accountId, gatewayId, provider: cfProvider };
+    } else if (arg.startsWith("-")) {
+      result.unknownOption = arg;
+      return result;
+    } else {
+      result.positional.push(arg);
+    }
+  }
+
+  return result;
 }

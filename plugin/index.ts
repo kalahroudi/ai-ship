@@ -43,6 +43,7 @@ export function resolveShipTaskInput(
     skipTests?: boolean;
     skipReview?: boolean;
     provider?: string;
+    contextLens?: boolean | string;
   } = {}
 ): {
   task: string;
@@ -52,6 +53,7 @@ export function resolveShipTaskInput(
   skipTests: boolean;
   skipReview: boolean;
   provider?: string;
+  contextLens?: boolean | string;
   title?: string;
 } {
   let openPr = Boolean(opts.openPr || opts.draft);
@@ -60,6 +62,7 @@ export function resolveShipTaskInput(
   let skipTests = Boolean(opts.skipTests);
   let skipReview = Boolean(opts.skipReview);
   let provider = opts.provider;
+  let contextLens = opts.contextLens;
 
   const tokens = rawTask.trim().split(/\s+/).filter(Boolean);
   const kept: string[] = [];
@@ -75,7 +78,12 @@ export function resolveShipTaskInput(
     else if (tok === "--skip-review") skipReview = true;
     else if (tok === "--provider" && tokens[i + 1]) provider = tokens[++i];
     else if (tok.startsWith("--provider=")) provider = tok.slice("--provider=".length);
-    else kept.push(tok);
+    else if (tok === "--context-lens") {
+      contextLens = tokens[i + 1] && /^https?:\/\//i.test(tokens[i + 1]) ? tokens[++i] : true;
+    } else if (tok.startsWith("--context-lens=")) {
+      const val = tok.slice("--context-lens=".length).trim();
+      contextLens = val || true;
+    } else kept.push(tok);
   }
 
   let task = kept.join(" ").trim();
@@ -86,7 +94,7 @@ export function resolveShipTaskInput(
     title = note.title || note.id;
   }
 
-  return { task, openPr, draft, worktreeDir, skipTests, skipReview, provider, title };
+  return { task, openPr, draft, worktreeDir, skipTests, skipReview, provider, contextLens, title };
 }
 
 /**
@@ -191,6 +199,7 @@ export function createAiShipPlugin(tool: ToolHelper) {
               worktreeDir: resolved.worktreeDir,
               skipTests: resolved.skipTests,
               skipReview: resolved.skipReview,
+              contextLens: resolved.contextLens,
               model: args.model,
               client: ctx.client,
               onProgress: (stage) => notifyProgress(ctx.client, toolCtx, stage),

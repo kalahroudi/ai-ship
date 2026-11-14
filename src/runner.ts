@@ -666,10 +666,11 @@ const CF_NATIVE_GATEWAY_PROVIDERS = new Set([
 
 const CF_BARE_GATEWAY_RE = /^https:\/\/gateway\.ai\.cloudflare\.com\/v1\/[^/]+\/[^/]+$/i;
 
-/** Builds OpenCode `config.provider` entries from `.ai-ship.json` and optional Cloudflare AI Gateway URL. */
+/** Builds OpenCode `config.provider` entries from `.ai-ship.json`, optional Cloudflare AI Gateway URL, and optional Context Lens proxy URL. */
 export function buildOpencodeProviderConfig(
   config: RepoConfig,
-  cfGatewayUrl?: string
+  cfGatewayUrl?: string,
+  contextLensUrl?: string
 ): Record<string, Record<string, unknown>> | undefined {
   const providers: Record<string, Record<string, unknown>> = {};
   for (const [id, pCfg] of Object.entries(config.providers ?? {})) {
@@ -720,6 +721,17 @@ export function buildOpencodeProviderConfig(
     }
   }
 
+  if (contextLensUrl) {
+    const trimmed = contextLensUrl.replace(/\/+$/, "");
+    for (const id of Object.keys(providers)) {
+      const existingOpts = (providers[id].options as Record<string, unknown> | undefined) ?? {};
+      providers[id].options = {
+        ...existingOpts,
+        baseURL: trimmed,
+      };
+    }
+  }
+
   return Object.keys(providers).length > 0 ? providers : undefined;
 }
 
@@ -727,6 +739,7 @@ async function createOpencodeRunner(opts: {
   worktreeDir: string;
   config: RepoConfig;
   cfGatewayUrl?: string;
+  contextLensUrl?: string;
   model?: string;
   serverUrl?: string;
 }): Promise<PipelineRunner> {
@@ -740,7 +753,7 @@ async function createOpencodeRunner(opts: {
     });
   }
 
-  const providerConfig = buildOpencodeProviderConfig(opts.config, opts.cfGatewayUrl);
+  const providerConfig = buildOpencodeProviderConfig(opts.config, opts.cfGatewayUrl, opts.contextLensUrl);
   const agentConfig = buildOpencodeAgentConfig();
   const { client, server } = await createOpencode({
     port: 0,
@@ -802,6 +815,7 @@ export async function createRunner(opts: {
   worktreeDir: string;
   config: RepoConfig;
   cfGatewayUrl?: string;
+  contextLensUrl?: string;
   model?: string;
   serverUrl?: string;
 }): Promise<PipelineRunner> {
@@ -815,6 +829,7 @@ export async function createRunner(opts: {
     worktreeDir: opts.worktreeDir,
     config: opts.config,
     cfGatewayUrl: opts.cfGatewayUrl,
+    contextLensUrl: opts.contextLensUrl,
     model: opts.model,
     serverUrl: opts.serverUrl,
   });

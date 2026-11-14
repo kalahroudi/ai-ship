@@ -19,10 +19,12 @@ import {
   buildImplementerPrompt,
   buildReviewerLensPrompt,
   buildTesterPrompt,
+  computeCacheHitRatio,
   formatBughunterFindings,
   formatOpenReviewFindings,
   formatPipelineResult,
   parseBughunterVerdict,
+  resolveContextLensUrl,
   runBughunterPass,
   runPipeline,
   runReviewLenses,
@@ -604,4 +606,104 @@ test("runBughunterPass runs Hunter -> Skeptic -> Referee with bughunter role and
   assert.deepEqual(shortCalls, ["bughunter:Bughunter: Hunter"]);
   assert.equal(cleanRes.verdict, "CLEAN");
   assert.deepEqual(cleanRes.findings, []);
+});
+
+test("resolveContextLensUrl respects CLI override, CONTEXT_LENS_URL env var, and RepoConfig", () => {
+  const prev = process.env.CONTEXT_LENS_URL;
+  try {
+    delete process.env.CONTEXT_LENS_URL;
+    assert.equal(resolveContextLensUrl({}), undefined);
+    assert.equal(resolveContextLensUrl({ contextLens: true }), "http://localhost:4040");
+    assert.equal(resolveContextLensUrl({ contextLens: "http://127.0.0.1:4040/" }), "http://127.0.0.1:4040");
+    assert.equal(resolveContextLensUrl({ contextLens: false }), undefined);
+
+    process.env.CONTEXT_LENS_URL = "http://localhost:4040/";
+    assert.equal(resolveContextLensUrl({ contextLens: false }), "http://localhost:4040");
+
+    process.env.CONTEXT_LENS_URL = "true";
+    assert.equal(resolveContextLensUrl({}), "http://localhost:4040");
+
+    process.env.CONTEXT_LENS_URL = "false";
+    assert.equal(resolveContextLensUrl({ contextLens: true }), undefined);
+
+    // Explicit override takes highest precedence
+    assert.equal(resolveContextLensUrl({ contextLens: false }, true), "http://localhost:4040");
+    assert.equal(
+      resolveContextLensUrl({ contextLens: true }, "http://127.0.0.1:4041/"),
+      "http://127.0.0.1:4041"
+    );
+    assert.equal(resolveContextLensUrl({ contextLens: true }, false), undefined);
+  } finally {
+    if (prev === undefined) delete process.env.CONTEXT_LENS_URL;
+    else process.env.CONTEXT_LENS_URL = prev;
+  }
+});
+
+test("computeCacheHitRatio, BudgetTracker, and formatPipelineResult surface per-stage cache_hit and USD cost", () => {
+  assert.equal(computeCacheHitRatio(0, 0), 0);
+  assert.ok(Math.abs(computeCacheHitRatio(100, 300) - 0.75) < 1e-9);
+
+  const tracker = new BudgetTracker({});
+  tracker.record("Stage 1: Implement", {
+    text: "ok",
+    usageSummary: "in=100 out=50 cache_read=300 | $0.0125",
+    usage: { input: 100, output: 50, cacheRead: 300, costUsd: 0.0125 },
+  });
+  tracker.record("Stage 4: Review", {
+    text: "ok",
+    usageSummary: "in=200 out=40 cache_read=200 | $0.0075",
+    usage: { input: 200, output: 40, cacheRead: 200, costUsd: 0.0075 },
+  });
+
+  const stageSummaries = tracker.getStageSummaries();
+  assert.ok(Math.abs(stageSummaries[0].cacheHitRatio - 0.75) < 1e-9);
+  assert.ok(Math.abs(stageSummaries[1].cacheHitRatio - 0.5) < 1e-9);
+
+  const totals = tracker.getTotals();
+  assert.ok(Math.abs(totals.cacheHitRatio - 500 / 800) < 1e-9);
+
+  const summaryLines = tracker.formatSummaryLines();
+  assert.ok(
+    summaryLines.some((l) =>
+      l.includes("Stage 1: Implement: in=100 out=50 cache_read=300 cache_hit=75.0% total=450 | $0.0125 (1 call)")
+    )
+  );
+  assert.ok(
+    summaryLines.some((l) =>
+      l.includes("[Task Total] in=300 out=90 cache_read=500 total=890 | $0.0200 (cache_hit=62.5%)")
+    )
+  );
+
+  // formatPipelineResult also surfaces per-stage telemetry when stageUsage/totalUsage are provided
+  const formatted = formatPipelineResult(
+    {
+      repoDir: "/tmp/repo",
+      worktreeDir: "/tmp/repo/.ai-ship-worktrees/cl",
+      branch: "ai/cl",
+      baseBranch: "main",
+      provider: "opencode",
+      committed: true,
+      verifyCommands: ["npm test"],
+      reviewVerdicts: [{ lens: "Security", verdict: "CLEAN" }],
+      usageLog: [],
+      stageUsage: stageSummaries,
+      totalUsage: totals,
+    },
+    "Context Lens",
+    false
+  );
+  assert.match(
+    formatted,
+    /Stage 1: Implement: in=100 out=50 cache_read=300 cache_hit=75\.0% total=450 \| \$0\.0125 \(1 call\)/
+  );
+  assert.match(
+    formatted,
+    /\[Task Total\] in=300 out=90 cache_read=500 total=890 \| \$0\.0200 \(cache_hit=62\.5%\)/
+  );
+
+  // resolveShipTaskInput supports --context-lens
+  const inline = resolveShipTaskInput("Add telemetry --context-lens=http://localhost:4040 --pr");
+  assert.equal(inline.contextLens, "http://localhost:4040");
+  assert.equal(inline.openPr, true);
+  assert.equal(inline.task, "Add telemetry");
 });

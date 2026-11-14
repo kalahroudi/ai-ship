@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execSync } from "node:child_process";
-import { loadRepoConfig } from "../src/config.ts";
+import { loadRepoConfig, parseCliArgs } from "../src/config.ts";
 import { slugify } from "../src/git.ts";
 
 function makeTempRepo() {
@@ -279,6 +279,37 @@ test("loadRepoConfig loads bughunterModel defaults and supports overrides or dis
     providerID: "deepseek",
     id: "deepseek-chat",
   });
+
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("loadRepoConfig loads contextLens option and parseCliArgs handles --context-lens flags", () => {
+  const dir = makeTempRepo();
+  assert.equal(loadRepoConfig(dir).contextLens, undefined);
+
+  fs.writeFileSync(
+    path.join(dir, ".ai-ship.json"),
+    JSON.stringify({ contextLens: "http://127.0.0.1:4040" })
+  );
+  assert.equal(loadRepoConfig(dir).contextLens, "http://127.0.0.1:4040");
+
+  fs.writeFileSync(path.join(dir, ".ai-ship.json"), JSON.stringify({ contextLens: true }));
+  assert.equal(loadRepoConfig(dir).contextLens, true);
+
+  // --context-lens without a URL must not swallow the positional task
+  const boolFlag = parseCliArgs(["--context-lens", "Fix auth bug", "--pr"], dir);
+  assert.equal(boolFlag.contextLens, true);
+  assert.deepEqual(boolFlag.positional, ["Fix auth bug"]);
+  assert.equal(boolFlag.openPr, true);
+
+  // --context-lens=<url> and --context-lens <url>
+  const eqFlag = parseCliArgs(["--context-lens=http://localhost:4040/", "Ship feature"], dir);
+  assert.equal(eqFlag.contextLens, "http://localhost:4040/");
+  assert.deepEqual(eqFlag.positional, ["Ship feature"]);
+
+  const spaceFlag = parseCliArgs(["--context-lens", "http://127.0.0.1:4040", "Ship feature"], dir);
+  assert.equal(spaceFlag.contextLens, "http://127.0.0.1:4040");
+  assert.deepEqual(spaceFlag.positional, ["Ship feature"]);
 
   fs.rmSync(dir, { recursive: true, force: true });
 });

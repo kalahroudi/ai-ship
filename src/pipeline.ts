@@ -3,6 +3,7 @@ import path from "node:path";
 import { createOpencode, createOpencodeClient } from "@opencode-ai/sdk";
 import {
   DEFAULT_CONTEXT_LIMITS,
+  DEFAULT_CONTEXT_LENS_URL,
   loadRepoConfig,
   type ModelRef,
   type RepoConfig,
@@ -48,6 +49,7 @@ export interface PipelineOptions {
   provider?: ProviderName;
   model?: string;
   serverUrl?: string;
+  contextLens?: boolean | string;
   client?: OpencodeClient;
   onProgress?: (stage: string) => void;
 }
@@ -85,11 +87,47 @@ export interface UsageTotals {
   cacheRead: number;
   totalTokens: number;
   costUsd: number;
+  cacheHitRatio: number;
 }
 
 export interface StageUsageSummary extends UsageTotals {
   stage: string;
   calls: number;
+}
+
+/** Computes prompt cache-hit ratio as `cacheRead / (input + cacheRead)` in `[0, 1]`. */
+export function computeCacheHitRatio(input: number, cacheRead: number): number {
+  const denominator = input + cacheRead;
+  return denominator > 0 ? cacheRead / denominator : 0;
+}
+
+function formatCacheHitPercent(ratio: number): string {
+  return `${(ratio * 100).toFixed(1)}%`;
+}
+
+function formatStageTelemetryLines(
+  stages: StageUsageSummary[],
+  totals?: UsageTotals
+): string[] {
+  if (stages.length === 0 && !totals) return [];
+  const lines: string[] = [];
+  if (stages.length > 0) {
+    lines.push("  [Stage Totals]");
+    for (const s of stages) {
+      const callLabel = s.calls === 1 ? "1 call" : `${s.calls} calls`;
+      const ratio = s.cacheHitRatio ?? computeCacheHitRatio(s.input, s.cacheRead);
+      lines.push(
+        `    ${s.stage}: in=${s.input} out=${s.output} cache_read=${s.cacheRead} cache_hit=${formatCacheHitPercent(ratio)} total=${s.totalTokens} | $${s.costUsd.toFixed(4)} (${callLabel})`
+      );
+    }
+  }
+  if (totals) {
+    const ratio = totals.cacheHitRatio ?? computeCacheHitRatio(totals.input, totals.cacheRead);
+    lines.push(
+      `  [Task Total] in=${totals.input} out=${totals.output} cache_read=${totals.cacheRead} total=${totals.totalTokens} | $${totals.costUsd.toFixed(4)} (cache_hit=${formatCacheHitPercent(ratio)})`
+    );
+  }
+  return lines;
 }
 
 export class BudgetExceededError extends Error {
@@ -123,6 +161,7 @@ export class BudgetTracker {
     cacheRead: 0,
     totalTokens: 0,
     costUsd: 0,
+    cacheHitRatio: 0,
   };
   private readonly stages = new Map<string, StageUsageSummary>();
 
@@ -152,6 +191,7 @@ export class BudgetTracker {
     this.totals.cacheRead += u.cacheRead;
     this.totals.totalTokens += tokens;
     this.totals.costUsd += u.costUsd;
+    this.totals.cacheHitRatio = computeCacheHitRatio(this.totals.input, this.totals.cacheRead);
 
     const existing = this.stages.get(stage);
     if (existing) {
@@ -161,6 +201,7 @@ export class BudgetTracker {
       existing.totalTokens += tokens;
       existing.costUsd += u.costUsd;
       existing.calls += 1;
+      existing.cacheHitRatio = computeCacheHitRatio(existing.input, existing.cacheRead);
     } else {
       this.stages.set(stage, {
         stage,
@@ -169,6 +210,7 @@ export class BudgetTracker {
         cacheRead: u.cacheRead,
         totalTokens: tokens,
         costUsd: u.costUsd,
+        cacheHitRatio: computeCacheHitRatio(u.input, u.cacheRead),
         calls: 1,
       });
     }
@@ -209,27 +251,23 @@ export class BudgetTracker {
   }
 
   getTotals(): UsageTotals {
-    return { ...this.totals };
+    return {
+      ...this.totals,
+      cacheHitRatio: computeCacheHitRatio(this.totals.input, this.totals.cacheRead),
+    };
   }
 
   getStageSummaries(): StageUsageSummary[] {
-    return Array.from(this.stages.values()).map((s) => ({ ...s }));
+    return Array.from(this.stages.values()).map((s) => ({
+      ...s,
+      cacheHitRatio: computeCacheHitRatio(s.input, s.cacheRead),
+    }));
   }
 
   formatSummaryLines(): string[] {
     const stages = this.getStageSummaries();
     if (stages.length === 0) return [];
-    const lines = ["  [Stage Totals]"];
-    for (const s of stages) {
-      const callLabel = s.calls === 1 ? "1 call" : `${s.calls} calls`;
-      lines.push(
-        `    ${s.stage}: in=${s.input} out=${s.output} cache_read=${s.cacheRead} total=${s.totalTokens} | $${s.costUsd.toFixed(4)} (${callLabel})`
-      );
-    }
-    lines.push(
-      `  [Task Total] in=${this.totals.input} out=${this.totals.output} cache_read=${this.totals.cacheRead} total=${this.totals.totalTokens} | $${this.totals.costUsd.toFixed(4)}`
-    );
-    return lines;
+    return formatStageTelemetryLines(stages, this.getTotals());
   }
 }
 
@@ -287,8 +325,13 @@ export function buildPrBody(opts: {
   return sections.join("\n");
 }
 
-function formatUsage(label: string, summary: string): string {
-  return `  [${label}] ${summary}`;
+function formatUsage(label: string, res: PromptResult): string {
+  const usage = res.usage ?? parseUsageSummary(res.usageSummary);
+  if (usage && !res.usageSummary.includes("cache_hit=")) {
+    const ratio = computeCacheHitRatio(usage.input, usage.cacheRead);
+    return `  [${label}] ${res.usageSummary} (cache_hit=${formatCacheHitPercent(ratio)})`;
+  }
+  return `  [${label}] ${res.usageSummary}`;
 }
 
 function recordUsage(
@@ -298,7 +341,7 @@ function recordUsage(
   budget?: BudgetTracker,
   stageKey?: string
 ): void {
-  usageLog.push(formatUsage(label, res.usageSummary));
+  usageLog.push(formatUsage(label, res));
   if (res.fallback) {
     const line = `  [${label} Fallback] ${res.fallback.from} -> ${res.fallback.to} (${res.fallback.reason})`;
     console.log(line);
@@ -740,6 +783,33 @@ export function resolveCloudflareGatewayUrl(provider?: string): string | undefin
   return undefined;
 }
 
+/**
+ * Resolves the Context Lens proxy URL from (in priority order):
+ * 1. Explicit CLI/pipeline override (`true` -> default URL, `false` -> disabled, string -> URL)
+ * 2. `CONTEXT_LENS_URL` environment variable
+ * 3. `RepoConfig.contextLens`
+ */
+export function resolveContextLensUrl(
+  config?: Pick<RepoConfig, "contextLens">,
+  override?: boolean | string
+): string | undefined {
+  const normalize = (value: boolean | string | undefined): string | undefined => {
+    if (value === undefined || value === false) return undefined;
+    if (value === true) return DEFAULT_CONTEXT_LENS_URL;
+    const trimmed = value.trim().replace(/\/+$/, "");
+    if (!trimmed) return undefined;
+    const lower = trimmed.toLowerCase();
+    if (lower === "false" || lower === "0") return undefined;
+    if (lower === "true" || lower === "1") return DEFAULT_CONTEXT_LENS_URL;
+    return trimmed;
+  };
+
+  if (override !== undefined) return normalize(override);
+  const envVal = process.env.CONTEXT_LENS_URL;
+  if (envVal !== undefined && envVal.trim() !== "") return normalize(envVal);
+  return normalize(config?.contextLens);
+}
+
 export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult> {
   const repoDir = path.resolve(opts.repoDir);
   const config = loadRepoConfig(repoDir);
@@ -752,9 +822,11 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
 
   const provider: ProviderName = opts.provider ?? "opencode";
   const cfGatewayUrl = resolveCloudflareGatewayUrl();
+  const contextLensUrl = resolveContextLensUrl(config, opts.contextLens);
   console.log(`\n[ai-ship] Repo: ${repoDir} (base: ${config.baseBranch})`);
   console.log(`[ai-ship] Provider: ${provider}${opts.model ? ` (model: ${opts.model})` : provider === "claude-code" ? ` (model: ${DEFAULT_CLAUDE_MODEL})` : ""}`);
   if (provider === "opencode" && cfGatewayUrl) console.log(`[ai-ship] Cloudflare AI Gateway: ${cfGatewayUrl}`);
+  if (provider === "opencode" && contextLensUrl) console.log(`[ai-ship] Context Lens Proxy: ${contextLensUrl}`);
   console.log(`[ai-ship] Verify pipeline: ${config.verify.length ? config.verify.join(" && ") : "(none detected)"}`);
 
   opts.onProgress?.(opts.worktreeDir ? "Opening existing worktree" : "Creating isolated worktree");
@@ -775,6 +847,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
         worktreeDir: worktree.worktreeDir,
         config,
         cfGatewayUrl,
+        contextLensUrl,
         model: opts.model,
         serverUrl: opts.serverUrl,
       });
@@ -1149,7 +1222,8 @@ export async function runDreamConsolidation(opts: {
       client = createOpencodeClient({ baseUrl: opts.serverUrl });
     } else {
       const cfGatewayUrl = resolveCloudflareGatewayUrl();
-      const providerConfig = buildOpencodeProviderConfig(config, cfGatewayUrl);
+      const contextLensUrl = resolveContextLensUrl(config);
+      const providerConfig = buildOpencodeProviderConfig(config, cfGatewayUrl, contextLensUrl);
       const started = await createOpencode({
         port: 0,
         ...(providerConfig ? { config: { provider: providerConfig as never } } : {}),
@@ -1225,8 +1299,16 @@ export function formatPipelineResult(
   if (result.implSummary?.trim()) {
     lines.push("- Implementation summary:", truncateCleanly(result.implSummary, 2500));
   }
-  if (result.usageLog.length) {
-    lines.push("- Usage:", ...result.usageLog);
+  const hasSummaryInLog = result.usageLog.some(
+    (l) => l.includes("[Stage Totals]") || l.includes("[Task Total]")
+  );
+  const extraTelemetry =
+    !hasSummaryInLog && (result.stageUsage?.length || result.totalUsage)
+      ? formatStageTelemetryLines(result.stageUsage ?? [], result.totalUsage)
+      : [];
+  const usageLines = [...result.usageLog, ...extraTelemetry];
+  if (usageLines.length) {
+    lines.push("- Usage:", ...usageLines);
   }
   return lines.join("\n");
 }

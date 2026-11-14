@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import readline from "node:readline/promises";
 import { listCleanupTargets, removeCleanupTargets } from "../src/git.ts";
-import { loadRepoConfig } from "../src/config.ts";
+import { loadRepoConfig, parseCliArgs } from "../src/config.ts";
 import { startMcpServer } from "../src/mcp.ts";
 import { parseNotyAddress, resolveNotyTask } from "../src/noty.ts";
 import { runDreamConsolidation, runPipeline } from "../src/pipeline.ts";
@@ -31,6 +31,7 @@ Options:
   --provider <name>  Runner provider: opencode (default, deepseek/parasail/telnyx/openrouter/cloudflare) or claude-code
   --model <id>       Model ID override (defaults to sonnet-5-5 for claude-code)
   --server <url>     Attach to a running \`opencode serve\` URL (visible on mobile/web)
+  --context-lens [url]  Route OpenCode provider requests through Context Lens proxy (default: http://localhost:4040)
   --dream            Consolidate repo memory from recent OpenCode transcripts
   --pr               Push branch and open GitHub PR after all 4 stages pass
   --draft            Open the PR as a GitHub Draft PR (implies --pr)
@@ -168,93 +169,42 @@ if (args.includes("--mcp")) {
 }
 
 async function runCli(args) {
-if (args.length === 0 || args.includes("-h") || args.includes("--help")) {
+const parsed = parseCliArgs(args);
+if (parsed.unknownOption) {
+  console.error(`Error: unknown or incomplete option "${parsed.unknownOption}".`);
+  printHelp();
+  process.exit(1);
+}
+if (parsed.help) {
   printHelp();
   process.exit(0);
 }
-
-let repoDir = process.cwd();
-let openPr = false;
-let draft = false;
-let worktreeDir;
-let skipTests = false;
-let skipReview = false;
-let skipBughunter = false;
-let doInit = false;
-let doCleanup = false;
-let doSafetyCheck = false;
-let doDream = false;
-let skipConfirm = false;
-let notyAddress;
-let notyDir;
-let rawProvider;
-let model;
-let serverUrl;
-const positional = [];
-
-for (let i = 0; i < args.length; i++) {
-  const arg = args[i];
-  if (arg === "--repo" && args[i + 1]) {
-    repoDir = path.resolve(args[++i]);
-  } else if (arg.startsWith("--repo=")) {
-    repoDir = path.resolve(arg.slice("--repo=".length));
-  } else if (arg === "--noty" && args[i + 1]) {
-    notyAddress = args[++i];
-  } else if (arg.startsWith("--noty=")) {
-    notyAddress = arg.slice("--noty=".length);
-  } else if (arg === "--noty-dir" && args[i + 1]) {
-    notyDir = path.resolve(args[++i]);
-  } else if (arg.startsWith("--noty-dir=")) {
-    notyDir = path.resolve(arg.slice("--noty-dir=".length));
-  } else if (arg === "--provider" && args[i + 1]) {
-    rawProvider = args[++i];
-  } else if (arg.startsWith("--provider=")) {
-    rawProvider = arg.slice("--provider=".length);
-  } else if (arg === "--model" && args[i + 1]) {
-    model = args[++i];
-  } else if (arg.startsWith("--model=")) {
-    model = arg.slice("--model=".length);
-  } else if (arg === "--server" && args[i + 1]) {
-    serverUrl = args[++i];
-  } else if (arg.startsWith("--server=")) {
-    serverUrl = arg.slice("--server=".length);
-  } else if (arg === "--dream") {
-    doDream = true;
-  } else if (arg === "--pr") {
-    openPr = true;
-  } else if (arg === "--draft") {
-    draft = true;
-    openPr = true;
-  } else if (arg === "--worktree" && args[i + 1]) {
-    worktreeDir = path.resolve(args[++i]);
-  } else if (arg.startsWith("--worktree=")) {
-    worktreeDir = path.resolve(arg.slice("--worktree=".length));
-  } else if (arg === "--skip-tests") {
-    skipTests = true;
-  } else if (arg === "--skip-review") {
-    skipReview = true;
-  } else if (arg === "--skip-bughunter") {
-    skipBughunter = true;
-  } else if (arg === "--init") {
-    doInit = true;
-  } else if (arg === "--cleanup") {
-    doCleanup = true;
-  } else if (arg === "--safety-check") {
-    doSafetyCheck = true;
-  } else if (arg === "--yes" || arg === "-y") {
-    skipConfirm = true;
-  } else if ((arg === "--cf" || arg === "-cf") && args[i + 1] && args[i + 2]) {
-    const cfProvider = args[i + 3] && !args[i + 3].startsWith("-") ? args[i + 3] : undefined;
-    configureCloudflareGateway(args[i + 1], args[i + 2], cfProvider);
-    process.exit(0);
-  } else if (arg.startsWith("-")) {
-    console.error(`Error: unknown or incomplete option "${arg}".`);
-    printHelp();
-    process.exit(1);
-  } else {
-    positional.push(arg);
-  }
+if (parsed.cfArgs) {
+  configureCloudflareGateway(parsed.cfArgs.accountId, parsed.cfArgs.gatewayId, parsed.cfArgs.provider);
+  process.exit(0);
 }
+
+const {
+  repoDir,
+  openPr,
+  draft,
+  worktreeDir,
+  skipTests,
+  skipReview,
+  skipBughunter,
+  doInit,
+  doCleanup,
+  doSafetyCheck,
+  doDream,
+  skipConfirm,
+  notyAddress,
+  notyDir,
+  rawProvider,
+  model,
+  serverUrl,
+  contextLens,
+  positional,
+} = parsed;
 
 if (doInit) {
   initRepo(repoDir);
@@ -297,5 +247,5 @@ if (!task) {
   process.exit(1);
 }
 
-await runPipeline({ repoDir, worktreeDir, task, openPr, draft, skipTests, skipReview, skipBughunter, provider, model, serverUrl });
+await runPipeline({ repoDir, worktreeDir, task, openPr, draft, skipTests, skipReview, skipBughunter, provider, model, serverUrl, contextLens });
 }

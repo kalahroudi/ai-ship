@@ -37,6 +37,7 @@ For any git repository, `ai-ship` runs 4 automated stages in an isolated git wor
 | Ship + rebase + open PR | `ai-ship "Fix H1 gateway host escape" --repo ~/rose --pr` |
 | Ship a Noty item | `ai-ship "noty://item/D282FF5A-FCE0-4034-8DFF-5694B8A29F99" --repo ~/rose --pr` |
 | Attach to `opencode serve` (mobile/web) | `ai-ship "Fix bug" --repo ~/rose --server http://127.0.0.1:4096 --pr` |
+| Route OpenCode through Context Lens proxy | `ai-ship "Fix bug" --repo ~/rose --context-lens` |
 | Skip Stage 2 tests or Stage 4 review | `ai-ship "Docs update" --repo ~/rose --skip-tests --skip-review` |
 | Consolidate repo memory (dream) | `ai-ship --dream --repo ~/rose` |
 | Initialize repo config | `ai-ship --init --repo ~/rose` |
@@ -91,4 +92,29 @@ Example `.ai-ship.json` with `contextLimits`:
     "memoryMaxLines": 80
   }
 }
+```
+
+### Context Lens Observability & Per-Stage Token Telemetry
+Route OpenCode provider requests through a local [Context Lens](http://localhost:4040) proxy to inspect prompts, context growth, and KV cache behavior in real time.
+
+Enable it via any of:
+- **CLI flag:** `--context-lens` (defaults to `http://localhost:4040`) or `--context-lens=http://localhost:4040` / `--context-lens http://localhost:4040`
+- **Environment variable:** `CONTEXT_LENS_URL=http://localhost:4040`
+- **Repo config (`.ai-ship.json`):** `"contextLens": true` or `"contextLens": "http://localhost:4040"`
+
+Example:
+```sh
+# Start Context Lens on http://localhost:4040, then run ai-ship:
+CONTEXT_LENS_URL=http://localhost:4040 ai-ship "Add rate limiter" --repo ~/rose
+# Or pass the CLI flag directly:
+ai-ship "Add rate limiter" --repo ~/rose --context-lens
+```
+
+Every run also logs per-stage and task-total token/cache telemetry (`in`, `out`, `cache_read`, `cache_hit` ratio, and USD cost) in `usageLog` and `formatPipelineResult()`:
+```text
+[ai-ship] Per-Stage & Task Totals:
+  [Stage Totals]
+    Stage 1: Implement: in=1200 out=350 cache_read=4800 cache_hit=80.0% total=6350 | $0.0142 (1 call)
+    Stage 4: Review: in=900 out=240 cache_read=2700 cache_hit=75.0% total=3840 | $0.0095 (3 calls)
+  [Task Total] in=2100 out=590 cache_read=7500 total=10190 | $0.0237 (cache_hit=78.1%)
 ```

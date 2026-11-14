@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createOpencode, createOpencodeClient } from "@opencode-ai/sdk";
-import { loadRepoConfig, type RepoConfig } from "./config.ts";
+import { loadRepoConfig, type ModelRef, type RepoConfig } from "./config.ts";
 import {
   abortRebase,
   commitAll,
@@ -24,6 +24,8 @@ import {
   createRunner,
   DEFAULT_CLAUDE_MODEL,
   type OpencodeClient,
+  type PipelineRunner,
+  type PromptResult,
   type ProviderName,
 } from "./runner.ts";
 
@@ -113,6 +115,101 @@ export function buildPrBody(opts: {
 
 function formatUsage(label: string, summary: string): string {
   return `  [${label}] ${summary}`;
+}
+
+function recordUsage(usageLog: string[], label: string, res: PromptResult): void {
+  usageLog.push(formatUsage(label, res.usageSummary));
+  if (res.fallback) {
+    const line = `  [${label} Fallback] ${res.fallback.from} -> ${res.fallback.to} (${res.fallback.reason})`;
+    console.log(line);
+    usageLog.push(line);
+  }
+}
+
+export interface ReviewLens {
+  name: string;
+  focus: string;
+}
+
+/** Resolves an optional per-lens model override from `config.reviewerLensModels`. */
+export function resolveLensModel(config: RepoConfig, lensName: string): ModelRef | undefined {
+  const map = config.reviewerLensModels;
+  if (!map) return undefined;
+  if (map[lensName]) return map[lensName];
+  const lower = lensName.toLowerCase();
+  for (const [key, val] of Object.entries(map)) {
+    if (key.toLowerCase() === lower) return val;
+  }
+  return undefined;
+}
+
+/**
+ * Runs Stage 4 review lenses with optional per-lens model/provider routing and
+ * lightweight concurrency pacing (staggering same-provider launches to avoid 429 bursts).
+ */
+export async function runReviewLenses(opts: {
+  lenses: ReviewLens[];
+  config: RepoConfig;
+  runner: PipelineRunner;
+  usageLog: string[];
+  sleep?: (ms: number) => Promise<void>;
+}): Promise<Array<{ lens: string; text: string; verdict: "CLEAN" | "OPEN" }>> {
+  const staggerMs = Math.max(0, opts.config.reviewStaggerMs ?? 250);
+  const concurrency = Math.max(1, opts.config.reviewConcurrency ?? opts.lenses.length);
+  const sleepFn =
+    opts.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+
+  const providerCounts = new Map<string, number>();
+  const launchPlan = opts.lenses.map((lens) => {
+    const lensModel = resolveLensModel(opts.config, lens.name);
+    const effectiveProvider =
+      lensModel?.providerID ??
+      opts.config.reviewerModel?.providerID ??
+      opts.config.defaultProvider ??
+      "default";
+    const sameProviderIdx = providerCounts.get(effectiveProvider) ?? 0;
+    providerCounts.set(effectiveProvider, sameProviderIdx + 1);
+    return {
+      lens,
+      modelOverride: lensModel
+        ? { providerID: lensModel.providerID, modelID: lensModel.id }
+        : undefined,
+      delayMs: sameProviderIdx * staggerMs,
+    };
+  });
+
+  const results: Array<{ lens: string; text: string; verdict: "CLEAN" | "OPEN" }> = new Array(
+    launchPlan.length
+  );
+  let nextIdx = 0;
+
+  const worker = async () => {
+    while (nextIdx < launchPlan.length) {
+      const idx = nextIdx++;
+      const item = launchPlan[idx];
+      if (item.delayMs > 0) {
+        await sleepFn(item.delayMs);
+      }
+      const sid = await opts.runner.createSession(`Review (${item.lens.name})`);
+      const r = await opts.runner.prompt(
+        sid,
+        "reviewer",
+        [
+          `Review lens: ${item.lens.name}`,
+          `Focus strictly on: ${item.lens.focus}.`,
+          `Read .ai-ship-shared-context.txt in the repo root.`,
+          "Report ONLY concrete, reproducible high/critical issues with exact file paths, line numbers, and how to reproduce.",
+          "End with `VERDICT: CLEAN` or `VERDICT: OPEN`.",
+        ].join("\n"),
+        item.modelOverride ? { modelOverride: item.modelOverride } : undefined
+      );
+      recordUsage(opts.usageLog, `Stage 4: ${item.lens.name} Lens`, r);
+      results[idx] = { lens: item.lens.name, text: r.text, verdict: parseVerdict(r.text) };
+    }
+  };
+
+  await Promise.all(Array.from({ length: Math.min(concurrency, launchPlan.length) }, () => worker()));
+  return results;
 }
 
 async function runDeterministicVerify(
@@ -246,7 +343,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
         "- Run relevant local checks before finishing.",
       ].join("\n")
     );
-    usageLog.push(formatUsage("Stage 1: Implement", implRes.usageSummary));
+    recordUsage(usageLog, "Stage 1: Implement", implRes);
 
     // -------------------------------------------------------------------------
     // Stage 2: Independent Adversarial Test Session (Separate Session & Model)
@@ -278,7 +375,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
             "```",
           ].join("\n")
         );
-        usageLog.push(formatUsage("Stage 2: Adversarial Tests", testRes.usageSummary));
+        recordUsage(usageLog, "Stage 2: Adversarial Tests", testRes);
       }
     }
 
@@ -313,7 +410,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
         ].join("\n")
       );
       lastAgentText = fixRes.text;
-      usageLog.push(formatUsage(`Stage 3: Fix #${attempt}`, fixRes.usageSummary));
+      recordUsage(usageLog, `Stage 3: Fix #${attempt}`, fixRes);
     }
 
     // -------------------------------------------------------------------------
@@ -351,24 +448,12 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
         );
 
         opts.onProgress?.(`Stage 4/4: Parallel 3-lens review (round ${round}/${config.maxReviewRounds})`);
-        const reviews = await Promise.all(
-          lenses.map(async (lens) => {
-            const sid = await runner.createSession(`Review (${lens.name})`);
-            const r = await runner.prompt(
-              sid,
-              "reviewer",
-              [
-                `Review lens: ${lens.name}`,
-                `Focus strictly on: ${lens.focus}.`,
-                `Read .ai-ship-shared-context.txt in the repo root.`,
-                "Report ONLY concrete, reproducible high/critical issues with exact file paths, line numbers, and how to reproduce.",
-                "End with `VERDICT: CLEAN` or `VERDICT: OPEN`.",
-              ].join("\n")
-            );
-            usageLog.push(formatUsage(`Stage 4: ${lens.name} Lens`, r.usageSummary));
-            return { lens: lens.name, text: r.text, verdict: parseVerdict(r.text) };
-          })
-        );
+        const reviews = await runReviewLenses({
+          lenses,
+          config,
+          runner,
+          usageLog,
+        });
 
         fs.rmSync(sharedContextPath, { force: true });
 
@@ -402,7 +487,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
           "implementer",
           `Address these review findings, then re-run local checks:\n\n${findingsText}`
         );
-        usageLog.push(formatUsage(`Stage 4: Review Fix #${round}`, fixReviewRes.usageSummary));
+        recordUsage(usageLog, `Stage 4: Review Fix #${round}`, fixReviewRes);
 
         const reverify = await runDeterministicVerify(worktree.worktreeDir, config);
         if (!reverify.ok) {
@@ -446,7 +531,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
             "- Stage resolved files with `git add` and complete the rebase with `GIT_EDITOR=true git rebase --continue`.",
           ].join("\n")
         );
-        usageLog.push(formatUsage("Pre-PR Rebase", resolveRes.usageSummary));
+        recordUsage(usageLog, "Pre-PR Rebase", resolveRes);
 
         if (isRebaseInProgress(worktree.worktreeDir)) {
           abortRebase(worktree.worktreeDir);

@@ -3,11 +3,15 @@ import assert from "node:assert/strict";
 import {
   buildClaudeArgs,
   buildOpencodeProviderConfig,
+  classifyProviderError,
+  computeBackoffMs,
+  createOpencodeClientRunner,
   DEFAULT_CLAUDE_MODEL,
   normalizeProvider,
   parseClaudeJsonOutput,
   parseOpencodeModel,
   parseOpencodePromptResponse,
+  type OpencodeClient,
 } from "../src/runner.ts";
 import { DEFAULT_PROVIDERS, type RepoConfig } from "../src/config.ts";
 import { resolveCloudflareGatewayUrl } from "../src/pipeline.ts";
@@ -217,4 +221,226 @@ test("buildOpencodeProviderConfig configures DeepSeek Direct, Parasail.io, and C
     (viaBareCf?.parasail?.options as Record<string, unknown>)?.baseURL,
     "https://api.parasail.io/v1"
   );
+});
+
+
+test("classifyProviderError identifies transient 429 and 5xx errors vs non-transient 4xx", () => {
+  assert.equal(classifyProviderError({ statusCode: 429 }).transient, true);
+  assert.equal(classifyProviderError({ data: { statusCode: 503 } }).transient, true);
+  assert.equal(classifyProviderError(new Error("OpenCode implementer failed: APIError HTTP 429: Too Many Requests")).transient, true);
+  assert.equal(classifyProviderError(new Error("OpenCode reviewer failed: APIError HTTP 502: Bad Gateway")).transient, true);
+  assert.equal(classifyProviderError(new Error("Rate limit exceeded")).transient, true);
+
+  assert.equal(classifyProviderError({ statusCode: 400 }).transient, false);
+  assert.equal(classifyProviderError(new Error("OpenCode implementer failed: APIError HTTP 404: Not Found")).transient, false);
+});
+
+test("computeBackoffMs applies bounded exponential backoff with jitter", () => {
+  const low0 = computeBackoffMs(0, { baseDelayMs: 1000, maxDelayMs: 5000, random: () => 0 });
+  const high0 = computeBackoffMs(0, { baseDelayMs: 1000, maxDelayMs: 5000, random: () => 1 });
+  assert.equal(low0, 500);
+  assert.equal(high0, 1000);
+
+  const high2 = computeBackoffMs(2, { baseDelayMs: 1000, maxDelayMs: 5000, random: () => 1 });
+  assert.equal(high2, 4000);
+
+  const capped = computeBackoffMs(5, { baseDelayMs: 1000, maxDelayMs: 5000, random: () => 1 });
+  assert.equal(capped, 5000);
+});
+
+function makeMockClient(
+  handler: (model?: { providerID: string; modelID: string }) => Promise<unknown>
+): OpencodeClient {
+  return {
+    session: {
+      create: async () => ({ data: { id: "sess-1" } }),
+      prompt: async (args: { body?: { model?: { providerID: string; modelID: string } } }) =>
+        handler(args.body?.model),
+    },
+  } as unknown as OpencodeClient;
+}
+
+test("createOpencodeClientRunner performs 0ms immediate failover to per-role fallbackModel on 429/5xx", async () => {
+  const calls: Array<{ providerID: string; modelID: string } | undefined> = [];
+  const sleeps: number[] = [];
+
+  const client = makeMockClient(async (model) => {
+    calls.push(model);
+    if (model?.providerID === "deepseek") {
+      return {
+        data: {
+          parts: [],
+          info: { error: { name: "APIError", data: { statusCode: 429, message: "Rate limit" } } },
+        },
+      };
+    }
+    return {
+      data: {
+        parts: [{ type: "text", text: "ok from parasail" }],
+        info: { cost: 0.001, tokens: { input: 10, output: 5 } },
+      },
+    };
+  });
+
+  const config: RepoConfig = {
+    baseBranch: "main",
+    verify: [],
+    testCommand: null,
+    implementerModel: { providerID: "deepseek", id: "deepseek-chat" },
+    implementerFallbackModel: { providerID: "parasail", id: "Qwen/Qwen2.5-Coder-32B-Instruct" },
+    testerModel: { providerID: "parasail", id: "Qwen/Qwen2.5-Coder-32B-Instruct" },
+    testerFallbackModel: { providerID: "deepseek", id: "deepseek-chat" },
+    reviewerModel: { providerID: "deepseek", id: "deepseek-reasoner" },
+    reviewerFallbackModel: { providerID: "parasail", id: "Qwen/Qwen2.5-Coder-32B-Instruct" },
+    bughunterModel: { providerID: "deepseek", id: "deepseek-chat" },
+    bughunterFallbackModel: { providerID: "parasail", id: "Qwen/Qwen2.5-Coder-32B-Instruct" },
+    maxFixRetries: 3,
+    maxReviewRounds: 2,
+    securityScan: true,
+    safetyCheck: true,
+  };
+
+  const runner = createOpencodeClientRunner({
+    client,
+    worktreeDir: "/tmp/wt",
+    config,
+    retry: {
+      sleep: async (ms) => {
+        sleeps.push(ms);
+      },
+      random: () => 0.5,
+    },
+  });
+
+  const implRes = await runner.prompt("sess-1", "implementer", "build feature");
+  assert.equal(implRes.text, "ok from parasail");
+  assert.equal(sleeps.length, 0);
+  assert.deepEqual(calls, [
+    { providerID: "deepseek", modelID: "deepseek-chat" },
+    { providerID: "parasail", modelID: "Qwen/Qwen2.5-Coder-32B-Instruct" },
+  ]);
+  assert.deepEqual(implRes.fallback, {
+    role: "implementer",
+    from: "deepseek/deepseek-chat",
+    to: "parasail/Qwen/Qwen2.5-Coder-32B-Instruct",
+    reason: "HTTP 429",
+  });
+
+  calls.length = 0;
+  const bhRes = await runner.prompt("sess-1", "bughunter", "hunt bugs");
+  assert.equal(bhRes.text, "ok from parasail");
+  assert.equal(sleeps.length, 0);
+  assert.equal(bhRes.fallback?.role, "bughunter");
+});
+
+test("createOpencodeClientRunner retries with bounded backoff when no fallback or both fail, and aborts on non-transient errors", async () => {
+  const sleeps: number[] = [];
+  let attempts = 0;
+
+  const recoveringClient = makeMockClient(async () => {
+    attempts++;
+    if (attempts < 3) {
+      return {
+        data: {
+          parts: [],
+          info: { error: { name: "APIError", data: { statusCode: 503, message: "Service Unavailable" } } },
+        },
+      };
+    }
+    return {
+      data: {
+        parts: [{ type: "text", text: "recovered" }],
+        info: { tokens: { input: 5, output: 5 } },
+      },
+    };
+  });
+
+  const baseConfig: RepoConfig = {
+    baseBranch: "main",
+    verify: [],
+    testCommand: null,
+    implementerModel: { providerID: "deepseek", id: "deepseek-chat" },
+    maxFixRetries: 3,
+    maxReviewRounds: 2,
+    securityScan: true,
+    safetyCheck: true,
+  };
+
+  const runner1 = createOpencodeClientRunner({
+    client: recoveringClient,
+    worktreeDir: "/tmp/wt",
+    config: baseConfig,
+    retry: {
+      maxRetries: 3,
+      baseDelayMs: 100,
+      maxDelayMs: 300,
+      random: () => 1,
+      sleep: async (ms) => {
+        sleeps.push(ms);
+      },
+    },
+  });
+
+  const res = await runner1.prompt("sess-1", "implementer", "hi");
+  assert.equal(res.text, "recovered");
+  assert.deepEqual(sleeps, [100, 200]);
+
+  // Both primary and fallback failing transiently exhausts maxRetries and throws
+  const bothFailSleeps: number[] = [];
+  let bothFailCalls = 0;
+  const bothFailClient = makeMockClient(async () => {
+    bothFailCalls++;
+    return {
+      data: {
+        parts: [],
+        info: { error: { name: "APIError", data: { statusCode: 429, message: "Too Many Requests" } } },
+      },
+    };
+  });
+
+  const runner2 = createOpencodeClientRunner({
+    client: bothFailClient,
+    worktreeDir: "/tmp/wt",
+    config: {
+      ...baseConfig,
+      implementerFallbackModel: { providerID: "parasail", id: "Qwen/Qwen2.5-Coder-32B-Instruct" },
+    },
+    retry: {
+      maxRetries: 2,
+      baseDelayMs: 100,
+      maxDelayMs: 250,
+      random: () => 1,
+      sleep: async (ms) => {
+        bothFailSleeps.push(ms);
+      },
+    },
+  });
+
+  await assert.rejects(() => runner2.prompt("sess-1", "implementer", "hi"), /HTTP 429/);
+  assert.equal(bothFailCalls, 6); // 3 rounds x (primary + 0ms fallback)
+  assert.deepEqual(bothFailSleeps, [100, 200]);
+
+  // Non-transient 400 fails immediately with 0 retries and 0 fallback
+  let nonTransientCalls = 0;
+  const nonTransientClient = makeMockClient(async () => {
+    nonTransientCalls++;
+    return {
+      data: {
+        parts: [],
+        info: { error: { name: "APIError", data: { statusCode: 400, message: "Bad Request" } } },
+      },
+    };
+  });
+
+  const runner3 = createOpencodeClientRunner({
+    client: nonTransientClient,
+    worktreeDir: "/tmp/wt",
+    config: {
+      ...baseConfig,
+      implementerFallbackModel: { providerID: "parasail", id: "Qwen/Qwen2.5-Coder-32B-Instruct" },
+    },
+  });
+
+  await assert.rejects(() => runner3.prompt("sess-1", "implementer", "hi"), /HTTP 400/);
+  assert.equal(nonTransientCalls, 1);
 });

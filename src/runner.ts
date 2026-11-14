@@ -1,23 +1,35 @@
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import { createOpencode, createOpencodeClient } from "@opencode-ai/sdk";
-import type { RepoConfig } from "./config.ts";
+import type { ModelRef, RepoConfig } from "./config.ts";
 
 export type OpencodeClient = ReturnType<typeof createOpencodeClient>;
 
 export type ProviderName = "opencode" | "claude-code";
-export type AgentRole = "implementer" | "tester" | "reviewer";
+export type AgentRole = "implementer" | "tester" | "reviewer" | "bughunter";
 
 export const DEFAULT_CLAUDE_MODEL = "sonnet";
+
+export interface FallbackActivation {
+  role: AgentRole;
+  from: string;
+  to: string;
+  reason: string;
+}
 
 export interface PromptResult {
   text: string;
   usageSummary: string;
+  fallback?: FallbackActivation;
+}
+
+export interface PromptOptions {
+  modelOverride?: { providerID: string; modelID: string };
 }
 
 export interface PipelineRunner {
   createSession(title: string): Promise<string>;
-  prompt(sessionId: string, role: AgentRole, text: string): Promise<PromptResult>;
+  prompt(sessionId: string, role: AgentRole, text: string, options?: PromptOptions): Promise<PromptResult>;
   close(): void;
 }
 
@@ -261,27 +273,209 @@ function runClaudeCommand(cwd: string, args: string[], promptText: string): Prom
   });
 }
 
+export interface TransientErrorInfo {
+  transient: boolean;
+  statusCode?: number;
+  reason: string;
+}
+
+export interface RetryOptions {
+  maxRetries?: number;
+  baseDelayMs?: number;
+  maxDelayMs?: number;
+  sleep?: (ms: number) => Promise<void>;
+  random?: () => number;
+  onRetry?: (info: { attempt: number; delayMs: number; reason: string }) => void;
+}
+
+function extractNumericStatus(err: unknown): number | undefined {
+  if (typeof err !== "object" || err === null) return undefined;
+  const obj = err as Record<string, unknown>;
+  for (const key of ["statusCode", "status"]) {
+    if (typeof obj[key] === "number") return obj[key] as number;
+  }
+  for (const nestedKey of ["data", "cause", "response"]) {
+    const nested = obj[nestedKey];
+    if (typeof nested === "object" && nested !== null) {
+      const status = extractNumericStatus(nested);
+      if (status !== undefined) return status;
+    }
+  }
+  return undefined;
+}
+
+/** Classifies whether a provider/transport error is a transient 429 or 5xx failure. */
+export function classifyProviderError(err: unknown): TransientErrorInfo {
+  const statusCode = extractNumericStatus(err);
+  if (statusCode !== undefined) {
+    if (statusCode === 429 || (statusCode >= 500 && statusCode < 600)) {
+      return { transient: true, statusCode, reason: `HTTP ${statusCode}` };
+    }
+    return { transient: false, statusCode, reason: `HTTP ${statusCode}` };
+  }
+
+  const msg = formatOpencodeError(err);
+  const httpMatch = msg.match(/\b(?:HTTP|status(?:\s*code)?[:=\s]*)\s*(4\d{2}|5\d{2})\b/i);
+  if (httpMatch) {
+    const code = Number(httpMatch[1]);
+    if (code === 429 || (code >= 500 && code < 600)) {
+      return { transient: true, statusCode: code, reason: `HTTP ${code}` };
+    }
+    return { transient: false, statusCode: code, reason: `HTTP ${code}` };
+  }
+
+  if (/\b(?:too many requests|rate[- ]?limit(?:ed| exceed(?:ed)?)?)\b/i.test(msg)) {
+    return { transient: true, statusCode: 429, reason: "HTTP 429 (rate limit)" };
+  }
+
+  const serverPhrase = msg.match(
+    /\b(?:internal server error|bad gateway|service unavailable|gateway timeout|overloaded)\b/i
+  );
+  if (serverPhrase) {
+    return { transient: true, reason: serverPhrase[0] };
+  }
+
+  const netMatch = msg.match(
+    /\b(?:ECONNRESET|ETIMEDOUT|EAI_AGAIN|ECONNREFUSED|UND_ERR_CONNECT_TIMEOUT|fetch failed|socket hang up)\b/i
+  );
+  if (netMatch) {
+    return { transient: true, reason: netMatch[0] };
+  }
+
+  return { transient: false, reason: msg.slice(0, 120) };
+}
+
+/** Computes bounded exponential backoff with equal jitter for transient retries. */
+export function computeBackoffMs(
+  retryIndex: number,
+  opts?: { baseDelayMs?: number; maxDelayMs?: number; random?: () => number }
+): number {
+  const baseDelayMs = Math.max(0, opts?.baseDelayMs ?? 1000);
+  const maxDelayMs = Math.max(baseDelayMs, opts?.maxDelayMs ?? 15000);
+  const rand = opts?.random ?? Math.random;
+  const exp = Math.min(maxDelayMs, baseDelayMs * 2 ** Math.max(0, retryIndex));
+  const jittered = Math.round(exp * (0.5 + 0.5 * Math.min(1, Math.max(0, rand()))));
+  return Math.min(maxDelayMs, jittered);
+}
+
+function formatModelLabel(model?: { providerID: string; modelID: string }): string {
+  return model ? `${model.providerID}/${model.modelID}` : "(default)";
+}
+
+/**
+ * Executes an LLM prompt with 0ms immediate failover to `fallbackModel` on 429/5xx,
+ * plus bounded exponential backoff + jitter retries when no fallback is configured
+ * or when both primary and fallback fail transiently.
+ */
+export async function executeWithFailoverAndRetry(opts: {
+  role: AgentRole;
+  primaryModel?: { providerID: string; modelID: string };
+  fallbackModel?: { providerID: string; modelID: string };
+  invoke: (model?: { providerID: string; modelID: string }) => Promise<PromptResult>;
+  retry?: RetryOptions;
+}): Promise<PromptResult> {
+  const maxRetries = Math.max(0, opts.retry?.maxRetries ?? 3);
+  const sleepFn =
+    opts.retry?.sleep ??
+    ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+
+  const fallback = opts.fallbackModel;
+  const hasDistinctFallback = Boolean(
+    fallback &&
+      (!opts.primaryModel ||
+        fallback.providerID !== opts.primaryModel.providerID ||
+        fallback.modelID !== opts.primaryModel.modelID)
+  );
+
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await opts.invoke(opts.primaryModel);
+    } catch (primaryErr) {
+      const primaryInfo = classifyProviderError(primaryErr);
+      if (!primaryInfo.transient) {
+        throw primaryErr;
+      }
+      lastError = primaryErr;
+
+      if (hasDistinctFallback && fallback) {
+        try {
+          const fallbackRes = await opts.invoke(fallback);
+          return {
+            ...fallbackRes,
+            fallback: {
+              role: opts.role,
+              from: formatModelLabel(opts.primaryModel),
+              to: formatModelLabel(fallback),
+              reason: primaryInfo.reason,
+            },
+          };
+        } catch (fallbackErr) {
+          const fbInfo = classifyProviderError(fallbackErr);
+          if (!fbInfo.transient) {
+            throw fallbackErr;
+          }
+          lastError = fallbackErr;
+        }
+      }
+
+      if (attempt < maxRetries) {
+        const delayMs = computeBackoffMs(attempt, opts.retry);
+        opts.retry?.onRetry?.({
+          attempt: attempt + 1,
+          delayMs,
+          reason: primaryInfo.reason,
+        });
+        await sleepFn(delayMs);
+      }
+    }
+  }
+
+  throw lastError;
+}
+
+function toOpencodeModel(ref?: ModelRef): { providerID: string; modelID: string } | undefined {
+  return ref ? { providerID: ref.providerID, modelID: ref.id } : undefined;
+}
+
 /** Wraps an existing OpenCode client (embedded server, `opencode serve`, or plugin context). */
 export function createOpencodeClientRunner(opts: {
   client: OpencodeClient;
   worktreeDir: string;
   config: RepoConfig;
   model?: string;
+  retry?: RetryOptions;
   onClose?: () => void;
 }): PipelineRunner {
   const defaultProvider =
     opts.config.defaultProvider ?? opts.config.implementerModel?.providerID ?? "deepseek";
   const cliModel = parseOpencodeModel(opts.model, defaultProvider);
 
-  const modelForRole = (role: AgentRole) => {
+  const modelForRole = (role: AgentRole, override?: { providerID: string; modelID: string }) => {
+    if (override) return override;
     if (cliModel) return cliModel;
     const roleCfg =
       role === "implementer"
         ? opts.config.implementerModel
         : role === "tester"
           ? opts.config.testerModel
-          : opts.config.reviewerModel;
-    return roleCfg ? { providerID: roleCfg.providerID, modelID: roleCfg.id } : undefined;
+          : role === "bughunter"
+            ? opts.config.bughunterModel
+            : opts.config.reviewerModel;
+    return toOpencodeModel(roleCfg);
+  };
+
+  const fallbackModelForRole = (role: AgentRole) => {
+    const roleCfg =
+      role === "implementer"
+        ? opts.config.implementerFallbackModel
+        : role === "tester"
+          ? opts.config.testerFallbackModel
+          : role === "bughunter"
+            ? opts.config.bughunterFallbackModel
+            : opts.config.reviewerFallbackModel;
+    return toOpencodeModel(roleCfg);
   };
 
   return {
@@ -294,21 +488,36 @@ export function createOpencodeClientRunner(opts: {
       if (!id) throw new Error(`Failed to create OpenCode session (${title})`);
       return id;
     },
-    async prompt(sessionId: string, role: AgentRole, text: string): Promise<PromptResult> {
-      const model = modelForRole(role);
-      const res = await opts.client.session.prompt({
-        path: { id: sessionId },
-        query: { directory: opts.worktreeDir },
-        body: {
-          agent: role,
-          ...(model ? { model } : {}),
-          parts: [{ type: "text", text }],
+    async prompt(
+      sessionId: string,
+      role: AgentRole,
+      text: string,
+      promptOpts?: PromptOptions
+    ): Promise<PromptResult> {
+      const primaryModel = modelForRole(role, promptOpts?.modelOverride);
+      const fallbackModel = fallbackModelForRole(role);
+
+      return executeWithFailoverAndRetry({
+        role,
+        primaryModel,
+        fallbackModel,
+        retry: opts.retry,
+        invoke: async (model) => {
+          const res = await opts.client.session.prompt({
+            path: { id: sessionId },
+            query: { directory: opts.worktreeDir },
+            body: {
+              agent: role,
+              ...(model ? { model } : {}),
+              parts: [{ type: "text", text }],
+            },
+          });
+          return parseOpencodePromptResponse(
+            res as { data?: PromptResponseData; error?: unknown },
+            role
+          );
         },
       });
-      return parseOpencodePromptResponse(
-        res as { data?: PromptResponseData; error?: unknown },
-        role
-      );
     },
     close() {
       opts.onClose?.();
@@ -471,17 +680,22 @@ function createClaudeCodeRunner(opts: {
       return localId;
     },
     async prompt(sessionId: string, role: AgentRole, text: string): Promise<PromptResult> {
-      const resumeSessionId = sessionMap.get(sessionId);
-      const args = buildClaudeArgs({ model, role, resumeSessionId });
-      const stdout = await runClaudeCommand(opts.worktreeDir, args, text);
-      const parsed = parseClaudeJsonOutput(stdout);
-      if (parsed.sessionId) {
-        sessionMap.set(sessionId, parsed.sessionId);
-      }
-      return {
-        text: parsed.text,
-        usageSummary: parsed.usageSummary,
-      };
+      return executeWithFailoverAndRetry({
+        role,
+        invoke: async () => {
+          const resumeSessionId = sessionMap.get(sessionId);
+          const args = buildClaudeArgs({ model, role, resumeSessionId });
+          const stdout = await runClaudeCommand(opts.worktreeDir, args, text);
+          const parsed = parseClaudeJsonOutput(stdout);
+          if (parsed.sessionId) {
+            sessionMap.set(sessionId, parsed.sessionId);
+          }
+          return {
+            text: parsed.text,
+            usageSummary: parsed.usageSummary,
+          };
+        },
+      });
     },
     close() {},
   };

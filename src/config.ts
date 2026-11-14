@@ -15,13 +15,26 @@ export interface ProviderConfig {
   models?: Record<string, unknown>;
 }
 
+export interface ModelRef {
+  providerID: string;
+  id: string;
+}
+
 export interface RepoConfig {
   baseBranch: string;
   verify: string[];
   testCommand: string | null;
-  implementerModel?: { providerID: string; id: string };
-  testerModel?: { providerID: string; id: string };
-  reviewerModel?: { providerID: string; id: string };
+  implementerModel?: ModelRef;
+  testerModel?: ModelRef;
+  reviewerModel?: ModelRef;
+  bughunterModel?: ModelRef;
+  implementerFallbackModel?: ModelRef;
+  testerFallbackModel?: ModelRef;
+  reviewerFallbackModel?: ModelRef;
+  bughunterFallbackModel?: ModelRef;
+  reviewerLensModels?: Record<string, ModelRef>;
+  reviewConcurrency?: number;
+  reviewStaggerMs?: number;
   providers?: Record<string, ProviderConfig>;
   defaultProvider?: string;
   maxFixRetries: number;

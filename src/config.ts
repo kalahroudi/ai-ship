@@ -59,6 +59,7 @@ export interface RepoConfig {
   securityScan: boolean;
   safetyCheck: boolean;
   safetyAllowlist?: string[];
+  bughunter?: boolean;
 }
 
 export const DEFAULT_PROVIDERS: Record<string, ProviderConfig> = {
@@ -87,6 +88,7 @@ const DEFAULT_CONFIG: RepoConfig = {
   implementerModel: { providerID: "deepseek", id: "deepseek-chat" },
   testerModel: { providerID: "parasail", id: "Qwen/Qwen2.5-Coder-32B-Instruct" },
   reviewerModel: { providerID: "deepseek", id: "deepseek-reasoner" },
+  bughunterModel: { providerID: "deepseek", id: "deepseek-reasoner" },
   providers: DEFAULT_PROVIDERS,
   defaultProvider: "deepseek",
   maxFixRetries: 3,
@@ -96,6 +98,7 @@ const DEFAULT_CONFIG: RepoConfig = {
   contextLimits: { ...DEFAULT_CONTEXT_LIMITS },
   securityScan: true,
   safetyCheck: true,
+  bughunter: true,
 };
 
 function mergeProviders(
@@ -220,6 +223,7 @@ export function loadRepoConfig(repoDir: string): RepoConfig {
 
   const securityScan = userConfig.securityScan ?? DEFAULT_CONFIG.securityScan;
   const safetyCheck = userConfig.safetyCheck ?? DEFAULT_CONFIG.safetyCheck;
+  const bughunter = userConfig.bughunter ?? DEFAULT_CONFIG.bughunter;
   const resolveBudgetLimit = (override: number | null | undefined, fallback: number | undefined): number | undefined => {
     if (override === null) return undefined;
     if (typeof override === "number") return override > 0 ? override : undefined;
@@ -265,5 +269,6 @@ export function loadRepoConfig(repoDir: string): RepoConfig {
     contextLimits,
     securityScan,
     safetyCheck,
+    bughunter,
   };
 }

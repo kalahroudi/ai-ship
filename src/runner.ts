@@ -8,6 +8,44 @@ export type OpencodeClient = ReturnType<typeof createOpencodeClient>;
 export type ProviderName = "opencode" | "claude-code";
 export type AgentRole = "implementer" | "tester" | "reviewer" | "bughunter";
 
+export const READ_ONLY_OPENCODE_TOOLS: Readonly<Record<string, boolean>> = {
+  write: false,
+  edit: false,
+  patch: false,
+  multiedit: false,
+  bash: false,
+};
+
+/** Returns true when the given role must be restricted to read-only file inspection tools. */
+export function isReadOnlyRole(role: AgentRole): boolean {
+  return role === "reviewer" || role === "bughunter";
+}
+
+/** Builds OpenCode `config.agent` entries enforcing read-only permissions for reviewer and bughunter roles. */
+export function buildOpencodeAgentConfig(): Record<
+  "reviewer" | "bughunter",
+  {
+    tools: Record<string, boolean>;
+    permission: { edit: "deny"; bash: "deny"; webfetch: "deny" };
+  }
+> {
+  const readOnly = {
+    tools: { ...READ_ONLY_OPENCODE_TOOLS },
+    permission: {
+      edit: "deny" as const,
+      bash: "deny" as const,
+      webfetch: "deny" as const,
+    },
+  };
+  return {
+    reviewer: readOnly,
+    bughunter: {
+      tools: { ...readOnly.tools },
+      permission: { ...readOnly.permission },
+    },
+  };
+}
+
 export const DEFAULT_CLAUDE_MODEL = "sonnet";
 
 export interface FallbackActivation {
@@ -218,7 +256,7 @@ export function buildClaudeArgs(opts: {
     opts.model,
     "--dangerously-skip-permissions",
   ];
-  if (opts.role === "reviewer") {
+  if (isReadOnlyRole(opts.role)) {
     args.push("--tools", "Read,Glob,Grep");
   }
   if (opts.resumeSessionId) {
@@ -553,12 +591,14 @@ export function createOpencodeClientRunner(opts: {
         fallbackModel,
         retry: opts.retry,
         invoke: async (model) => {
+          const tools = isReadOnlyRole(role) ? { ...READ_ONLY_OPENCODE_TOOLS } : undefined;
           const res = await opts.client.session.prompt({
             path: { id: sessionId },
             query: { directory: opts.worktreeDir },
             body: {
               agent: role,
               ...(model ? { model } : {}),
+              ...(tools ? { tools } : {}),
               parts: [{ type: "text", text }],
             },
           });
@@ -701,9 +741,13 @@ async function createOpencodeRunner(opts: {
   }
 
   const providerConfig = buildOpencodeProviderConfig(opts.config, opts.cfGatewayUrl);
+  const agentConfig = buildOpencodeAgentConfig();
   const { client, server } = await createOpencode({
     port: 0,
-    ...(providerConfig ? { config: { provider: providerConfig as never } } : {}),
+    config: {
+      ...(providerConfig ? { provider: providerConfig as never } : {}),
+      agent: agentConfig as never,
+    },
   });
 
   return createOpencodeClientRunner({

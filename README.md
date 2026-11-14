@@ -8,6 +8,7 @@ For any git repository, `ai-ship` runs 4 automated stages in an isolated git wor
 2. **Independent Adversarial Tests (`tester` agent):** Spins up a **separate session on a different model** that sees only the task intent + diff and writes hostile security, edge-case, and performance tests.
 3. **Deterministic Local Gate:** Runs your repo's `typecheck`, `lint`, `build`, `test`, and `semgrep` (if installed) locally—looping back to the implementer on failure before a commit is pushed.
 4. **Shared-Context Multi-Lens Review (`reviewer` agent):** Writes `.ai-ship-shared-context.txt` once and runs **3 parallel read-only reviewers** (Security, Performance, Correctness) returning `VERDICT: CLEAN` or `VERDICT: OPEN`.
+   - **Stage 4b — Adversarial Bughunter (`bughunter` agent):** Runs a read-only `Hunter -> Skeptic -> Referee` pass to hypothesize cross-boundary bugs, challenge false positives, and emit structured confirmed findings before committing.
 
 ## Quickstart
 
@@ -57,6 +58,21 @@ Example `.ai-ship.json`:
   "maxReviewRounds": 2,
   "maxTaskCostUsd": 2.5,
   "maxTaskTokens": 500000
+}
+```
+
+### Adversarial Bughunter (`Hunter -> Skeptic -> Referee`)
+`ai-ship` includes a dedicated 4th `bughunter` role (read-only in both OpenCode and `claude-code`) that runs after the 3-lens review as Stage 4b:
+1. **Hunter:** Hypothesizes cross-boundary bugs (caller/callee mismatches, shared state, auth/validation gaps) across files.
+2. **Skeptic:** Challenges each hypothesis against the actual code and diff to filter out false positives.
+3. **Referee:** Weighs both sides and emits structured `FINDING BUG-N | CONFIRMED | ...` lines and `VERDICT: CLEAN` or `VERDICT: OPEN`.
+
+Configure `bughunter` and `bughunterModel` in `.ai-ship.json` (or pass `--skip-bughunter` on the CLI to skip Stage 4b):
+```json
+{
+  "bughunter": true,
+  "bughunterModel": { "providerID": "deepseek", "id": "deepseek-reasoner" },
+  "bughunterFallbackModel": { "providerID": "parasail", "id": "Qwen/Qwen2.5-Coder-32B-Instruct" }
 }
 ```
 

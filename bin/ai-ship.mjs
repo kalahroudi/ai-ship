@@ -37,6 +37,7 @@ Options:
   --worktree <dir>   Reuse an existing ai-ship worktree to iterate on its branch
   --skip-tests       Skip Stage 2 independent adversarial test generation
   --skip-review      Skip Stage 4 parallel multi-lens review
+  --skip-bughunter   Skip Stage 4b adversarial Hunter -> Skeptic -> Referee pass
   --init             Copy starter AGENTS.md and .ai-ship.json into target repo
   --cleanup          List and remove leftover ai-ship worktrees and ai/* branches (prompts for confirmation)
   --safety-check     Scan repo/worktree diff and untracked files for leaked deployment config, secrets, keys, emails, and IDs
@@ -178,6 +179,7 @@ let draft = false;
 let worktreeDir;
 let skipTests = false;
 let skipReview = false;
+let skipBughunter = false;
 let doInit = false;
 let doCleanup = false;
 let doSafetyCheck = false;
@@ -231,6 +233,8 @@ for (let i = 0; i < args.length; i++) {
     skipTests = true;
   } else if (arg === "--skip-review") {
     skipReview = true;
+  } else if (arg === "--skip-bughunter") {
+    skipBughunter = true;
   } else if (arg === "--init") {
     doInit = true;
   } else if (arg === "--cleanup") {
@@ -293,5 +297,5 @@ if (!task) {
   process.exit(1);
 }
 
-await runPipeline({ repoDir, worktreeDir, task, openPr, draft, skipTests, skipReview, provider, model, serverUrl });
+await runPipeline({ repoDir, worktreeDir, task, openPr, draft, skipTests, skipReview, skipBughunter, provider, model, serverUrl });
 }

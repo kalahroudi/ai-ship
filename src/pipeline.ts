@@ -44,11 +44,21 @@ export interface PipelineOptions {
   worktreeDir?: string;
   skipTests?: boolean;
   skipReview?: boolean;
+  skipBughunter?: boolean;
   provider?: ProviderName;
   model?: string;
   serverUrl?: string;
   client?: OpencodeClient;
   onProgress?: (stage: string) => void;
+}
+
+export interface BughunterFinding {
+  id: string;
+  severity: "CRITICAL" | "HIGH" | "MEDIUM" | "LOW";
+  location: string;
+  boundary: string;
+  status: "CONFIRMED" | "REJECTED";
+  reason: string;
 }
 
 export interface PipelineResult {
@@ -62,6 +72,7 @@ export interface PipelineResult {
   implSummary?: string;
   verifyCommands: string[];
   reviewVerdicts: Array<{ lens: string; verdict: "CLEAN" | "OPEN" }>;
+  bughunterFindings?: BughunterFinding[];
   prUrl?: string;
   usageLog: string[];
   stageUsage?: StageUsageSummary[];
@@ -322,6 +333,35 @@ export const REVIEWER_STATIC_INSTRUCTIONS = [
   "End with `VERDICT: CLEAN` or `VERDICT: OPEN`.",
 ].join("\n");
 
+export const BUGHUNTER_HUNTER_STATIC_INSTRUCTIONS = [
+  "You are an adversarial Bug Hunter (read-only). Your job is to hypothesize subtle cross-boundary bugs introduced or exposed by the diff.",
+  "Inspect callers, callees, shared state, auth/validation boundaries, schema/type contracts, and error propagation across files.",
+  "For each hypothesis, emit a numbered block:",
+  "BUG-1: <short title>",
+  "- Location: <file:line>",
+  "- Boundary: <caller -> callee or module A -> module B>",
+  "- Trigger: <concrete input or sequence>",
+  "- Impact: <failure mode or security/data corruption impact>",
+  "If you find no credible cross-boundary bugs, output `NO_HYPOTHESES` and `VERDICT: CLEAN`.",
+].join("\n");
+
+export const BUGHUNTER_SKEPTIC_STATIC_INSTRUCTIONS = [
+  "You are an adversarial Skeptic (read-only). Challenge every bug hypothesis from the Hunter.",
+  "Verify against the actual code and diff whether existing guards, types, invariants, or caller preconditions already prevent the bug.",
+  "For each BUG-N, output:",
+  "CHALLENGE BUG-N: REFUTE | CONCEDE",
+  "- Evidence: <exact file:line, guard, or why the trigger is/isn't reachable>",
+].join("\n");
+
+export const BUGHUNTER_REFEREE_STATIC_INSTRUCTIONS = [
+  "You are the Referee (read-only). Weigh the Hunter's hypotheses against the Skeptic's challenges and emit a final structured verdict.",
+  "Filter out false positives refuted by the Skeptic. Confirm only concrete, reproducible cross-boundary bugs.",
+  "For each hypothesis, emit one line in this exact format:",
+  "FINDING BUG-N | CONFIRMED | CRITICAL | <file:line> | <boundary> | <concise root cause & fix>",
+  "(Use CONFIRMED or REJECTED, and severity CRITICAL, HIGH, MEDIUM, or LOW.)",
+  "End with `VERDICT: OPEN` if any finding is CONFIRMED, or `VERDICT: CLEAN` if none are confirmed.",
+].join("\n");
+
 /** Builds a prompt-cache-safe implementer prompt with static instructions first and dynamic task/memory at the end. */
 export function buildImplementerPrompt(task: string, memory?: string): string {
   const parts = [IMPLEMENTER_STATIC_INSTRUCTIONS, "", `Task: ${task}`];
@@ -352,6 +392,54 @@ export function buildReviewerLensPrompt(lens: ReviewLens): string {
     "",
     `Review lens: ${lens.name}`,
     `Focus strictly on: ${lens.focus}.`,
+  ].join("\n");
+}
+
+/** Builds a prompt-cache-safe Hunter prompt with static instructions first and dynamic task/diff at the end. */
+export function buildBughunterHunterPrompt(opts: {
+  task: string;
+  diff: string;
+  memory?: string;
+}): string {
+  const parts = [BUGHUNTER_HUNTER_STATIC_INSTRUCTIONS, "", `Task: ${opts.task}`];
+  if (opts.memory?.trim()) {
+    parts.push("", `## Persistent Repository Memory\n${opts.memory.trim()}`);
+  }
+  parts.push("", "Diff:", "```diff", opts.diff, "```");
+  return parts.join("\n");
+}
+
+/** Builds a prompt-cache-safe Skeptic prompt with static instructions first and Hunter output + diff at the end. */
+export function buildBughunterSkepticPrompt(opts: {
+  hunterFindings: string;
+  diff: string;
+}): string {
+  return [
+    BUGHUNTER_SKEPTIC_STATIC_INSTRUCTIONS,
+    "",
+    "Hunter Hypotheses:",
+    opts.hunterFindings,
+    "",
+    "Diff:",
+    "```diff",
+    opts.diff,
+    "```",
+  ].join("\n");
+}
+
+/** Builds a prompt-cache-safe Referee prompt with static instructions first and Hunter + Skeptic outputs at the end. */
+export function buildBughunterRefereePrompt(opts: {
+  hunterFindings: string;
+  skepticChallenges: string;
+}): string {
+  return [
+    BUGHUNTER_REFEREE_STATIC_INSTRUCTIONS,
+    "",
+    "Hunter Hypotheses:",
+    opts.hunterFindings,
+    "",
+    "Skeptic Challenges:",
+    opts.skepticChallenges,
   ].join("\n");
 }
 
@@ -488,6 +576,152 @@ function parseVerdict(text: string): "CLEAN" | "OPEN" {
     : "CLEAN";
 }
 
+const BUGHUNTER_FINDING_RE =
+  /^(?:[-*]\s*)?`?FINDING\s+([A-Za-z0-9_-]+)\s*\|\s*(CONFIRMED|REJECTED)\s*\|\s*(CRITICAL|HIGH|MEDIUM|LOW)\s*\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|\s*(.+?)`?$/i;
+
+/** Parses structured Referee findings and overall verdict from Bughunter output. */
+export function parseBughunterVerdict(text: string): {
+  verdict: "CLEAN" | "OPEN";
+  findings: BughunterFinding[];
+} {
+  const findings: BughunterFinding[] = [];
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    const m = line.match(BUGHUNTER_FINDING_RE);
+    if (!m) continue;
+    findings.push({
+      id: m[1].trim(),
+      status: m[2].toUpperCase() as "CONFIRMED" | "REJECTED",
+      severity: m[3].toUpperCase() as "CRITICAL" | "HIGH" | "MEDIUM" | "LOW",
+      location: m[4].trim(),
+      boundary: m[5].trim(),
+      reason: m[6].trim(),
+    });
+  }
+
+  const explicitMatch = text.match(/VERDICT:\s*(CLEAN|OPEN)/i);
+  const hasConfirmed = findings.some((f) => f.status === "CONFIRMED");
+  if (hasConfirmed) {
+    return { verdict: "OPEN", findings };
+  }
+  if (explicitMatch) {
+    return { verdict: explicitMatch[1].toUpperCase() as "CLEAN" | "OPEN", findings };
+  }
+  if (findings.length > 0) {
+    return { verdict: "CLEAN", findings };
+  }
+  return { verdict: parseVerdict(text), findings };
+}
+
+/** Formats confirmed Bughunter findings (or fallback Referee text) into markdown for implementer fixes or errors. */
+export function formatBughunterFindings(
+  findings: BughunterFinding[],
+  fallbackText?: string
+): string {
+  const confirmed = findings.filter((f) => f.status === "CONFIRMED");
+  if (confirmed.length === 0) {
+    return fallbackText?.trim() ? `### Bughunter Review\n${fallbackText.trim()}` : "";
+  }
+  const lines = confirmed.map(
+    (f) => `- **${f.id} [${f.severity}]** \`${f.location}\` (${f.boundary}): ${f.reason}`
+  );
+  return `### Bughunter Confirmed Cross-Boundary Bugs\n${lines.join("\n")}`;
+}
+
+export interface BughunterResult {
+  hunterText: string;
+  skepticText: string;
+  refereeText: string;
+  verdict: "CLEAN" | "OPEN";
+  findings: BughunterFinding[];
+}
+
+/** Runs the adversarial Hunter -> Skeptic -> Referee verification pass using the read-only `bughunter` role. */
+export async function runBughunterPass(opts: {
+  task: string;
+  diff: string;
+  memory?: string;
+  runner: PipelineRunner;
+  usageLog: string[];
+  budget?: BudgetTracker;
+}): Promise<BughunterResult> {
+  opts.budget?.assertWithinBudget("Stage 4b: Bughunter (Hunter)");
+  const hunterSessionId = await opts.runner.createSession("Bughunter: Hunter");
+  const hunterRes = await opts.runner.prompt(
+    hunterSessionId,
+    "bughunter",
+    buildBughunterHunterPrompt({
+      task: opts.task,
+      diff: opts.diff,
+      memory: opts.memory,
+    })
+  );
+  recordUsage(
+    opts.usageLog,
+    "Stage 4b: Bughunter (Hunter)",
+    hunterRes,
+    opts.budget,
+    "Stage 4b: Bughunter"
+  );
+
+  const hasHypotheses = /\bBUG-\d+\b/i.test(hunterRes.text);
+  const noHypotheses = /\bNO_HYPOTHESES\b/i.test(hunterRes.text);
+  if (noHypotheses || (!hasHypotheses && parseVerdict(hunterRes.text) === "CLEAN")) {
+    return {
+      hunterText: hunterRes.text,
+      skepticText: "",
+      refereeText: "VERDICT: CLEAN",
+      verdict: "CLEAN",
+      findings: [],
+    };
+  }
+
+  opts.budget?.assertWithinBudget("Stage 4b: Bughunter (Skeptic)");
+  const skepticSessionId = await opts.runner.createSession("Bughunter: Skeptic");
+  const skepticRes = await opts.runner.prompt(
+    skepticSessionId,
+    "bughunter",
+    buildBughunterSkepticPrompt({
+      hunterFindings: hunterRes.text,
+      diff: opts.diff,
+    })
+  );
+  recordUsage(
+    opts.usageLog,
+    "Stage 4b: Bughunter (Skeptic)",
+    skepticRes,
+    opts.budget,
+    "Stage 4b: Bughunter"
+  );
+
+  opts.budget?.assertWithinBudget("Stage 4b: Bughunter (Referee)");
+  const refereeSessionId = await opts.runner.createSession("Bughunter: Referee");
+  const refereeRes = await opts.runner.prompt(
+    refereeSessionId,
+    "bughunter",
+    buildBughunterRefereePrompt({
+      hunterFindings: hunterRes.text,
+      skepticChallenges: skepticRes.text,
+    })
+  );
+  recordUsage(
+    opts.usageLog,
+    "Stage 4b: Bughunter (Referee)",
+    refereeRes,
+    opts.budget,
+    "Stage 4b: Bughunter"
+  );
+
+  const parsed = parseBughunterVerdict(refereeRes.text);
+  return {
+    hunterText: hunterRes.text,
+    skepticText: skepticRes.text,
+    refereeText: refereeRes.text,
+    verdict: parsed.verdict,
+    findings: parsed.findings,
+  };
+}
+
 export function resolveCloudflareGatewayUrl(provider?: string): string | undefined {
   const normalizedProvider = provider?.trim().replace(/^\/+|\/+$/g, "");
   if (process.env.CF_AI_GATEWAY_URL) {
@@ -557,6 +791,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
     config.contextLimits?.memoryMaxLines ?? DEFAULT_CONTEXT_LIMITS.memoryMaxLines;
   const memory = readMemory(repoDir, memoryMaxLines);
   let reviewVerdicts: Array<{ lens: string; verdict: "CLEAN" | "OPEN" }> = [];
+  let bughunterFindings: BughunterFinding[] = [];
   let prUrl: string | undefined;
 
   try {
@@ -723,6 +958,75 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
     }
 
     // -------------------------------------------------------------------------
+    // Stage 4b: Adversarial Bughunter Pass (Hunter -> Skeptic -> Referee)
+    // -------------------------------------------------------------------------
+    if (!opts.skipReview && !opts.skipBughunter && config.bughunter !== false) {
+      for (let round = 1; round <= config.maxReviewRounds; round++) {
+        const diff = getDiff(worktree.worktreeDir, worktree.baseBranch);
+        if (!diff.trim()) {
+          break;
+        }
+
+        opts.onProgress?.(
+          `Stage 4b: Adversarial bughunter Hunter -> Skeptic -> Referee (round ${round}/${config.maxReviewRounds})`
+        );
+        console.log(
+          `\n[Stage 4b] Adversarial bughunter Hunter -> Skeptic -> Referee (round ${round}/${config.maxReviewRounds})...`
+        );
+
+        const bh = await runBughunterPass({
+          task: opts.task,
+          diff: diff.slice(0, reviewDiffMaxChars),
+          memory,
+          runner,
+          usageLog,
+          budget,
+        });
+
+        bughunterFindings = bh.findings;
+        reviewVerdicts = [
+          ...reviewVerdicts.filter((r) => r.lens !== "Bughunter"),
+          { lens: "Bughunter", verdict: bh.verdict },
+        ];
+        console.log(`  -> Bughunter: ${bh.verdict}`);
+
+        if (bh.verdict === "CLEAN") {
+          break;
+        }
+
+        const bhFindingsText = formatBughunterFindings(bh.findings, bh.refereeText);
+        if (round === config.maxReviewRounds) {
+          console.log("\n[ai-ship] Bughunter findings remain open after max rounds:");
+          console.log(`\n${bhFindingsText}`);
+          throw new Error(
+            `Bughunter findings remain OPEN after ${config.maxReviewRounds} round(s). Inspect the worktree (${worktree.worktreeDir}) before pushing.\n\n${bhFindingsText}`
+          );
+        }
+
+        opts.onProgress?.(`Stage 4b: Addressing bughunter findings (round ${round})`);
+        console.log("  -> Sending confirmed Bughunter findings back to implementer...");
+        budget.assertWithinBudget(`Stage 4b: Bughunter Fix #${round}`);
+        const fixBhRes = await runner.prompt(
+          implSessionId,
+          "implementer",
+          `Address these confirmed cross-boundary bugs, then re-run local checks:\n\n${bhFindingsText}`
+        );
+        recordUsage(
+          usageLog,
+          `Stage 4b: Bughunter Fix #${round}`,
+          fixBhRes,
+          budget,
+          "Stage 4b: Bughunter"
+        );
+
+        const reverify = await runDeterministicVerify(worktree.worktreeDir, config);
+        if (!reverify.ok) {
+          throw new Error(`Verify failed after bughunter fix:\n${reverify.output}`);
+        }
+      }
+    }
+
+    // -------------------------------------------------------------------------
     // Commit & Optional PR
     // -------------------------------------------------------------------------
     if (config.safetyCheck !== false) {
@@ -810,6 +1114,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
       implSummary: implRes.text,
       verifyCommands: config.verify,
       reviewVerdicts,
+      ...(bughunterFindings.length > 0 ? { bughunterFindings } : {}),
       prUrl,
       usageLog,
       stageUsage,

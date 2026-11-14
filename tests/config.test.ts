@@ -69,6 +69,8 @@ test("templates/.ai-ship.json includes distinct multi-provider role models and p
   assert.deepEqual(cfg.implementerModel, { providerID: "deepseek", id: "deepseek-chat" });
   assert.deepEqual(cfg.testerModel, { providerID: "parasail", id: "Qwen/Qwen2.5-Coder-32B-Instruct" });
   assert.deepEqual(cfg.reviewerModel, { providerID: "deepseek", id: "deepseek-reasoner" });
+  assert.deepEqual(cfg.bughunterModel, { providerID: "deepseek", id: "deepseek-reasoner" });
+  assert.equal(cfg.bughunter, true);
   assert.equal(cfg.providers?.deepseek?.npm, "@ai-sdk/openai-compatible");
   assert.equal(cfg.providers?.deepseek?.options?.baseURL, "https://api.deepseek.com/v1");
   assert.equal(cfg.providers?.parasail?.npm, "@ai-sdk/openai-compatible");
@@ -100,6 +102,8 @@ test("loadRepoConfig defaults to DeepSeek Direct and Parasail.io when .ai-ship.j
   assert.deepEqual(cfg.implementerModel, { providerID: "deepseek", id: "deepseek-chat" });
   assert.deepEqual(cfg.testerModel, { providerID: "parasail", id: "Qwen/Qwen2.5-Coder-32B-Instruct" });
   assert.deepEqual(cfg.reviewerModel, { providerID: "deepseek", id: "deepseek-reasoner" });
+  assert.deepEqual(cfg.bughunterModel, { providerID: "deepseek", id: "deepseek-reasoner" });
+  assert.equal(cfg.bughunter, true);
   assert.equal(cfg.providers?.deepseek?.options?.baseURL, "https://api.deepseek.com/v1");
   assert.equal(cfg.providers?.parasail?.options?.baseURL, "https://api.parasail.io/v1");
 
@@ -246,6 +250,34 @@ test("loadRepoConfig sets default contextLimits and supports partial overrides",
     reviewDiffMaxChars: 60_000,
     verifyOutputMaxChars: 2500,
     memoryMaxLines: 120,
+  });
+
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("loadRepoConfig loads bughunterModel defaults and supports overrides or disabling", () => {
+  const dir = makeTempRepo();
+  const defaults = loadRepoConfig(dir);
+  assert.equal(defaults.bughunter, true);
+  assert.deepEqual(defaults.bughunterModel, { providerID: "deepseek", id: "deepseek-reasoner" });
+
+  fs.writeFileSync(
+    path.join(dir, ".ai-ship.json"),
+    JSON.stringify({
+      bughunter: false,
+      bughunterModel: { providerID: "parasail", id: "Qwen/Qwen2.5-Coder-32B-Instruct" },
+      bughunterFallbackModel: { providerID: "deepseek", id: "deepseek-chat" },
+    })
+  );
+  const custom = loadRepoConfig(dir);
+  assert.equal(custom.bughunter, false);
+  assert.deepEqual(custom.bughunterModel, {
+    providerID: "parasail",
+    id: "Qwen/Qwen2.5-Coder-32B-Instruct",
+  });
+  assert.deepEqual(custom.bughunterFallbackModel, {
+    providerID: "deepseek",
+    id: "deepseek-chat",
   });
 
   fs.rmSync(dir, { recursive: true, force: true });

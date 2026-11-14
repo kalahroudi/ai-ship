@@ -2,15 +2,18 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   buildClaudeArgs,
+  buildOpencodeAgentConfig,
   buildOpencodeProviderConfig,
   classifyProviderError,
   computeBackoffMs,
   createOpencodeClientRunner,
   DEFAULT_CLAUDE_MODEL,
+  isReadOnlyRole,
   normalizeProvider,
   parseClaudeJsonOutput,
   parseOpencodeModel,
   parseOpencodePromptResponse,
+  READ_ONLY_OPENCODE_TOOLS,
   type OpencodeClient,
 } from "../src/runner.ts";
 import { DEFAULT_PROVIDERS, type RepoConfig } from "../src/config.ts";
@@ -48,9 +51,14 @@ test("parseOpencodeModel splits provider/model and uses configurable default pro
   });
 });
 
-test("buildClaudeArgs configures read-only tools for reviewer and resume for follow-ups", () => {
+test("buildClaudeArgs configures read-only tools for reviewer and bughunter and resume for follow-ups", () => {
   assert.deepEqual(
     buildClaudeArgs({ model: DEFAULT_CLAUDE_MODEL, role: "implementer" }),
+    ["-p", "--output-format", "json", "--model", "sonnet", "--dangerously-skip-permissions"]
+  );
+
+  assert.deepEqual(
+    buildClaudeArgs({ model: DEFAULT_CLAUDE_MODEL, role: "tester" }),
     ["-p", "--output-format", "json", "--model", "sonnet", "--dangerously-skip-permissions"]
   );
 
@@ -69,6 +77,76 @@ test("buildClaudeArgs configures read-only tools for reviewer and resume for fol
       "sess-123",
     ]
   );
+
+  assert.deepEqual(
+    buildClaudeArgs({ model: "sonnet", role: "bughunter" }),
+    [
+      "-p",
+      "--output-format",
+      "json",
+      "--model",
+      "sonnet",
+      "--dangerously-skip-permissions",
+      "--tools",
+      "Read,Glob,Grep",
+    ]
+  );
+});
+
+test("OpenCode runner enforces read-only tool permissions for reviewer and bughunter", async () => {
+  assert.equal(isReadOnlyRole("implementer"), false);
+  assert.equal(isReadOnlyRole("tester"), false);
+  assert.equal(isReadOnlyRole("reviewer"), true);
+  assert.equal(isReadOnlyRole("bughunter"), true);
+
+  const agentCfg = buildOpencodeAgentConfig();
+  assert.deepEqual(agentCfg.reviewer.tools, READ_ONLY_OPENCODE_TOOLS);
+  assert.deepEqual(agentCfg.bughunter.tools, READ_ONLY_OPENCODE_TOOLS);
+  assert.equal(agentCfg.reviewer.permission.edit, "deny");
+  assert.equal(agentCfg.bughunter.permission.bash, "deny");
+
+  const capturedBodies: Array<{ agent?: string; tools?: Record<string, boolean> }> = [];
+  const fakeClient = {
+    session: {
+      async create() {
+        return { data: { id: "sess-ro" } };
+      },
+      async prompt(input: { body: { agent?: string; tools?: Record<string, boolean> } }) {
+        capturedBodies.push(input.body);
+        return {
+          data: {
+            parts: [{ type: "text", text: "ok" }],
+            info: { cost: 0.001, tokens: { input: 10, output: 5 } },
+          },
+        };
+      },
+    },
+  } as unknown as OpencodeClient;
+
+  const runner = createOpencodeClientRunner({
+    client: fakeClient,
+    worktreeDir: "/tmp/repo",
+    config: {
+      baseBranch: "main",
+      verify: [],
+      testCommand: null,
+      maxFixRetries: 1,
+      maxReviewRounds: 1,
+      securityScan: false,
+      safetyCheck: false,
+      bughunterModel: { providerID: "deepseek", id: "deepseek-reasoner" },
+    },
+  });
+
+  await runner.prompt("sess-ro", "implementer", "write code");
+  await runner.prompt("sess-ro", "tester", "write tests");
+  await runner.prompt("sess-ro", "reviewer", "review code");
+  await runner.prompt("sess-ro", "bughunter", "hunt bugs");
+
+  assert.equal(capturedBodies[0].tools, undefined);
+  assert.equal(capturedBodies[1].tools, undefined);
+  assert.deepEqual(capturedBodies[2].tools, READ_ONLY_OPENCODE_TOOLS);
+  assert.deepEqual(capturedBodies[3].tools, READ_ONLY_OPENCODE_TOOLS);
 });
 
 test("parseClaudeJsonOutput extracts result, session_id, and usage", () => {

@@ -5,16 +5,25 @@ import os from "node:os";
 import path from "node:path";
 import { execSync } from "node:child_process";
 import {
+  BUGHUNTER_HUNTER_STATIC_INSTRUCTIONS,
+  BUGHUNTER_REFEREE_STATIC_INSTRUCTIONS,
+  BUGHUNTER_SKEPTIC_STATIC_INSTRUCTIONS,
   BudgetExceededError,
   BudgetTracker,
   IMPLEMENTER_STATIC_INSTRUCTIONS,
   REVIEWER_STATIC_INSTRUCTIONS,
   TESTER_STATIC_INSTRUCTIONS,
+  buildBughunterHunterPrompt,
+  buildBughunterRefereePrompt,
+  buildBughunterSkepticPrompt,
   buildImplementerPrompt,
   buildReviewerLensPrompt,
   buildTesterPrompt,
+  formatBughunterFindings,
   formatOpenReviewFindings,
   formatPipelineResult,
+  parseBughunterVerdict,
+  runBughunterPass,
   runPipeline,
   runReviewLenses,
 } from "../src/pipeline.ts";
@@ -476,4 +485,123 @@ test("runPipeline injects readMemory(repoDir) at end of implementer prompt and r
     fs.rmSync(repoDir, { recursive: true, force: true });
     fs.rmSync(memDir, { recursive: true, force: true });
   }
+});
+
+test("parseBughunterVerdict parses structured Referee findings and filters rejected false positives", () => {
+  const mixed = [
+    "- `FINDING BUG-1 | CONFIRMED | CRITICAL | src/auth.ts:42 | API -> DB | Missing tenantId filter allows cross-tenant read`",
+    "- FINDING BUG-2 | REJECTED | MEDIUM | src/cache.ts:19 | Worker -> Cache | Guarded by caller lock",
+    "VERDICT: OPEN",
+  ].join("\n");
+
+  const openParsed = parseBughunterVerdict(mixed);
+  assert.equal(openParsed.verdict, "OPEN");
+  assert.equal(openParsed.findings.length, 2);
+  assert.equal(openParsed.findings[0].status, "CONFIRMED");
+  assert.equal(openParsed.findings[0].severity, "CRITICAL");
+  assert.equal(openParsed.findings[0].location, "src/auth.ts:42");
+  assert.equal(openParsed.findings[1].status, "REJECTED");
+
+  const formatted = formatBughunterFindings(openParsed.findings);
+  assert.match(formatted, /BUG-1 \[CRITICAL\]/);
+  assert.ok(!formatted.includes("BUG-2"));
+
+  const allRejected = [
+    "FINDING BUG-1 | REJECTED | HIGH | src/api.ts:10 | Route -> Service | False positive; validated by schema",
+    "VERDICT: CLEAN",
+  ].join("\n");
+  const cleanParsed = parseBughunterVerdict(allRejected);
+  assert.equal(cleanParsed.verdict, "CLEAN");
+  assert.equal(cleanParsed.findings.length, 1);
+  assert.equal(cleanParsed.findings[0].status, "REJECTED");
+});
+
+test("runBughunterPass runs Hunter -> Skeptic -> Referee with bughunter role and short-circuits on NO_HYPOTHESES", async () => {
+  const calls: Array<{ session: string; role: string; text: string }> = [];
+  let sid = 0;
+
+  const runner: PipelineRunner = {
+    async createSession(title: string) {
+      return `${title}-${++sid}`;
+    },
+    async prompt(sessionId, role, text) {
+      calls.push({ session: sessionId, role, text });
+      if (sessionId.startsWith("Bughunter: Hunter")) {
+        return {
+          text: "BUG-1: Unchecked null\n- Location: src/a.ts:12\n- Boundary: a -> b",
+          usageSummary: "in=100 out=40 cache_read=0 | $0.0100",
+        };
+      }
+      if (sessionId.startsWith("Bughunter: Skeptic")) {
+        return {
+          text: "CHALLENGE BUG-1: CONCEDE\n- Evidence: src/b.ts dereferences without guard",
+          usageSummary: "in=120 out=30 cache_read=0 | $0.0100",
+        };
+      }
+      return {
+        text: "FINDING BUG-1 | CONFIRMED | HIGH | src/a.ts:12 | a -> b | Null dereference across boundary\nVERDICT: OPEN",
+        usageSummary: "in=80 out=25 cache_read=0 | $0.0050",
+      };
+    },
+    close() {},
+  };
+
+  const usageLog: string[] = [];
+  const budget = new BudgetTracker({ maxTaskCostUsd: 5, maxTaskTokens: 100000 });
+  const res = await runBughunterPass({
+    task: "Add handler",
+    diff: "+ const x = foo();",
+    runner,
+    usageLog,
+    budget,
+  });
+
+  assert.equal(calls.length, 3);
+  assert.ok(calls.every((c) => c.role === "bughunter"));
+  assert.ok(calls[0].text.startsWith(BUGHUNTER_HUNTER_STATIC_INSTRUCTIONS));
+  assert.ok(calls[1].text.startsWith(BUGHUNTER_SKEPTIC_STATIC_INSTRUCTIONS));
+  assert.ok(calls[2].text.startsWith(BUGHUNTER_REFEREE_STATIC_INSTRUCTIONS));
+  assert.equal(res.verdict, "OPEN");
+  assert.equal(res.findings.length, 1);
+  assert.equal(res.findings[0].status, "CONFIRMED");
+  assert.equal(usageLog.length, 3);
+
+  // Verify static prefixes for prompt-cache safety
+  assert.ok(
+    buildBughunterHunterPrompt({ task: "T", diff: "D" }).startsWith(
+      BUGHUNTER_HUNTER_STATIC_INSTRUCTIONS
+    )
+  );
+  assert.ok(
+    buildBughunterSkepticPrompt({ hunterFindings: "H", diff: "D" }).startsWith(
+      BUGHUNTER_SKEPTIC_STATIC_INSTRUCTIONS
+    )
+  );
+  assert.ok(
+    buildBughunterRefereePrompt({ hunterFindings: "H", skepticChallenges: "S" }).startsWith(
+      BUGHUNTER_REFEREE_STATIC_INSTRUCTIONS
+    )
+  );
+
+  // Verify short-circuit when Hunter emits NO_HYPOTHESES
+  const shortCalls: string[] = [];
+  const cleanRunner: PipelineRunner = {
+    async createSession(title: string) {
+      return title;
+    },
+    async prompt(sessionId, role) {
+      shortCalls.push(`${role}:${sessionId}`);
+      return { text: "NO_HYPOTHESES\nVERDICT: CLEAN", usageSummary: "in=50 out=10 | $0.0020" };
+    },
+    close() {},
+  };
+  const cleanRes = await runBughunterPass({
+    task: "Safe change",
+    diff: "+ const y = 1;",
+    runner: cleanRunner,
+    usageLog: [],
+  });
+  assert.deepEqual(shortCalls, ["bughunter:Bughunter: Hunter"]);
+  assert.equal(cleanRes.verdict, "CLEAN");
+  assert.deepEqual(cleanRes.findings, []);
 });

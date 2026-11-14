@@ -7,9 +7,11 @@
   "maxTaskTokens": 2000000,
   "securityScan": true,
   "safetyCheck": true,
+  "bughunter": true,
   "implementerModel": { "providerID": "deepseek", "id": "deepseek-chat" },
   "testerModel": { "providerID": "parasail", "id": "Qwen/Qwen2.5-Coder-32B-Instruct" },
   "reviewerModel": { "providerID": "deepseek", "id": "deepseek-reasoner" },
+  "bughunterModel": { "providerID": "deepseek", "id": "deepseek-reasoner" },
   "providers": {
     "deepseek": {
       "npm": "@ai-sdk/openai-compatible",

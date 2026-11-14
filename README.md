@@ -59,3 +59,20 @@ Example `.ai-ship.json`:
   "maxTaskTokens": 500000
 }
 ```
+
+### Prompt Caching & Context Limits
+To reduce token burn and preserve provider KV cache hits across both CLI (`runPipeline`) and plugin runs:
+- Prompts place byte-identical static instructions first (including diff/patch-only edit guidance for `implementer`) and append dynamic task descriptions, repo memory (`readMemory(repoDir)`), and diffs at the end.
+- Per-stage truncation limits are configurable via `contextLimits` in `.ai-ship.json` (defaults: `testDiffMaxChars: 40000`, `reviewDiffMaxChars: 60000`, `verifyOutputMaxChars: 6000`, `memoryMaxLines: 120`).
+
+Example `.ai-ship.json` with `contextLimits`:
+```json
+{
+  "contextLimits": {
+    "testDiffMaxChars": 25000,
+    "reviewDiffMaxChars": 45000,
+    "verifyOutputMaxChars": 4000,
+    "memoryMaxLines": 80
+  }
+}
+```

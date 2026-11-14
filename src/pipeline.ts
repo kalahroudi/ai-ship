@@ -1,7 +1,12 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createOpencode, createOpencodeClient } from "@opencode-ai/sdk";
-import { loadRepoConfig, type ModelRef, type RepoConfig } from "./config.ts";
+import {
+  DEFAULT_CONTEXT_LIMITS,
+  loadRepoConfig,
+  type ModelRef,
+  type RepoConfig,
+} from "./config.ts";
 import {
   abortRebase,
   commitAll,
@@ -291,6 +296,65 @@ function recordUsage(
   budget?.record(stageKey ?? label, res);
 }
 
+export const IMPLEMENTER_STATIC_INSTRUCTIONS = [
+  "Instructions:",
+  "- Work inside the current repository.",
+  "- Read AGENTS.md if it exists.",
+  "- Make clean, minimal, production-ready changes.",
+  "- Prefer minimal, targeted diff/patch edits rather than full-file rewrites.",
+  "- Never hardcode or commit deployment config IDs (e.g. wrangler account_id, database_id, zone_id, kv id), secrets, API keys, emails, or real account/org/user IDs.",
+  "- Run relevant local checks before finishing.",
+].join("\n");
+
+export const TESTER_STATIC_INSTRUCTIONS = [
+  "You are an independent adversarial tester. You did NOT write the implementation.",
+  "Review the diff below and write focused tests covering:",
+  "1. Security & auth/tenant isolation (IDOR, missing auth, input validation, injection).",
+  "2. Edge cases, failure modes, and race conditions.",
+  "3. Performance regressions (e.g., unbounded queries, N+1 loops).",
+  "",
+  "Only create or update test files. Do NOT modify production source files.",
+].join("\n");
+
+export const REVIEWER_STATIC_INSTRUCTIONS = [
+  "Read .ai-ship-shared-context.txt in the repo root.",
+  "Report ONLY concrete, reproducible high/critical issues with exact file paths, line numbers, and how to reproduce.",
+  "End with `VERDICT: CLEAN` or `VERDICT: OPEN`.",
+].join("\n");
+
+/** Builds a prompt-cache-safe implementer prompt with static instructions first and dynamic task/memory at the end. */
+export function buildImplementerPrompt(task: string, memory?: string): string {
+  const parts = [IMPLEMENTER_STATIC_INSTRUCTIONS, "", `Task: ${task}`];
+  if (memory?.trim()) {
+    parts.push("", `## Persistent Repository Memory\n${memory.trim()}`);
+  }
+  return parts.join("\n");
+}
+
+/** Builds a prompt-cache-safe tester prompt with static instructions first and dynamic context at the end. */
+export function buildTesterPrompt(opts: {
+  task: string;
+  diff: string;
+  memory?: string;
+}): string {
+  const parts = [TESTER_STATIC_INSTRUCTIONS, "", `Task Intent: ${opts.task}`];
+  if (opts.memory?.trim()) {
+    parts.push("", `## Persistent Repository Memory\n${opts.memory.trim()}`);
+  }
+  parts.push("", "Diff:", "```diff", opts.diff, "```");
+  return parts.join("\n");
+}
+
+/** Builds a prompt-cache-safe reviewer lens prompt with static instructions first and lens focus at the end. */
+export function buildReviewerLensPrompt(lens: ReviewLens): string {
+  return [
+    REVIEWER_STATIC_INSTRUCTIONS,
+    "",
+    `Review lens: ${lens.name}`,
+    `Focus strictly on: ${lens.focus}.`,
+  ].join("\n");
+}
+
 export interface ReviewLens {
   name: string;
   focus: string;
@@ -361,13 +425,7 @@ export async function runReviewLenses(opts: {
       const r = await opts.runner.prompt(
         sid,
         "reviewer",
-        [
-          `Review lens: ${item.lens.name}`,
-          `Focus strictly on: ${item.lens.focus}.`,
-          `Read .ai-ship-shared-context.txt in the repo root.`,
-          "Report ONLY concrete, reproducible high/critical issues with exact file paths, line numbers, and how to reproduce.",
-          "End with `VERDICT: CLEAN` or `VERDICT: OPEN`.",
-        ].join("\n"),
+        buildReviewerLensPrompt(item.lens),
         item.modelOverride ? { modelOverride: item.modelOverride } : undefined
       );
       recordUsage(opts.usageLog, `Stage 4: ${item.lens.name} Lens`, r, opts.budget, "Stage 4: Review");
@@ -384,6 +442,8 @@ async function runDeterministicVerify(
   config: RepoConfig
 ): Promise<{ ok: boolean; failedCommand?: string; output: string }> {
   const logs: string[] = [];
+  const verifyOutputMaxChars =
+    config.contextLimits?.verifyOutputMaxChars ?? DEFAULT_CONTEXT_LIMITS.verifyOutputMaxChars;
 
   if (config.safetyCheck !== false) {
     console.log("  -> running: ai-ship safety-check (secrets, deployment config, keys, emails, IDs)");
@@ -397,7 +457,7 @@ async function runDeterministicVerify(
       return {
         ok: false,
         failedCommand: "ai-ship safety-check",
-        output: safetyOut.slice(-6000),
+        output: safetyOut.slice(-verifyOutputMaxChars),
       };
     }
   }
@@ -413,7 +473,7 @@ async function runDeterministicVerify(
       return {
         ok: false,
         failedCommand: cmd,
-        output: res.output.slice(-6000),
+        output: res.output.slice(-verifyOutputMaxChars),
       };
     }
   }
@@ -489,6 +549,13 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
     maxTaskCostUsd: config.maxTaskCostUsd,
     maxTaskTokens: config.maxTaskTokens,
   });
+  const testDiffMaxChars =
+    config.contextLimits?.testDiffMaxChars ?? DEFAULT_CONTEXT_LIMITS.testDiffMaxChars;
+  const reviewDiffMaxChars =
+    config.contextLimits?.reviewDiffMaxChars ?? DEFAULT_CONTEXT_LIMITS.reviewDiffMaxChars;
+  const memoryMaxLines =
+    config.contextLimits?.memoryMaxLines ?? DEFAULT_CONTEXT_LIMITS.memoryMaxLines;
+  const memory = readMemory(repoDir, memoryMaxLines);
   let reviewVerdicts: Array<{ lens: string; verdict: "CLEAN" | "OPEN" }> = [];
   let prUrl: string | undefined;
 
@@ -503,16 +570,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
     const implRes = await runner.prompt(
       implSessionId,
       "implementer",
-      [
-        `Task: ${opts.task}`,
-        "",
-        "Instructions:",
-        "- Work inside the current repository.",
-        "- Read AGENTS.md if it exists.",
-        "- Make clean, minimal, production-ready changes.",
-        "- Never hardcode or commit deployment config IDs (e.g. wrangler account_id, database_id, zone_id, kv id), secrets, API keys, emails, or real account/org/user IDs.",
-        "- Run relevant local checks before finishing.",
-      ].join("\n")
+      buildImplementerPrompt(opts.task, memory)
     );
     recordUsage(usageLog, "Stage 1: Implement", implRes, budget, "Stage 1: Implement");
 
@@ -530,22 +588,11 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
         const testRes = await runner.prompt(
           testSessionId,
           "tester",
-          [
-            `Task Intent: ${opts.task}`,
-            "",
-            "You are an independent adversarial tester. You did NOT write the implementation.",
-            "Review the diff below and write focused tests covering:",
-            "1. Security & auth/tenant isolation (IDOR, missing auth, input validation, injection).",
-            "2. Edge cases, failure modes, and race conditions.",
-            "3. Performance regressions (e.g., unbounded queries, N+1 loops).",
-            "",
-            "Only create or update test files. Do NOT modify production source files.",
-            "",
-            "Diff:",
-            "```diff",
-            diff.slice(0, 40000),
-            "```",
-          ].join("\n")
+          buildTesterPrompt({
+            task: opts.task,
+            diff: diff.slice(0, testDiffMaxChars),
+            memory,
+          })
         );
         recordUsage(usageLog, "Stage 2: Adversarial Tests", testRes, budget, "Stage 2: Adversarial Tests");
       }
@@ -573,8 +620,9 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
         implSessionId,
         "implementer",
         [
-          `Verification command failed: ${verify.failedCommand}`,
           "Fix the root cause in the implementation (do NOT weaken or delete tests).",
+          "",
+          `Verification command failed: ${verify.failedCommand}`,
           "",
           "Output:",
           "```",
@@ -614,11 +662,13 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
         }
 
         const sharedContextPath = path.join(worktree.worktreeDir, ".ai-ship-shared-context.txt");
-        fs.writeFileSync(
-          sharedContextPath,
-          `Task: ${opts.task}\n\nDiff:\n${diff.slice(0, 60000)}\n`,
-          "utf8"
-        );
+        const sharedContextParts = [
+          `Task: ${opts.task}`,
+          ...(memory ? ["", `## Persistent Repository Memory\n${memory}`] : []),
+          "",
+          `Diff:\n${diff.slice(0, reviewDiffMaxChars)}`,
+        ];
+        fs.writeFileSync(sharedContextPath, `${sharedContextParts.join("\n")}\n`, "utf8");
 
         opts.onProgress?.(`Stage 4/4: Parallel 3-lens review (round ${round}/${config.maxReviewRounds})`);
         budget.assertWithinBudget(`Stage 4: Review (round ${round})`);
@@ -700,12 +750,12 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
           implSessionId,
           "implementer",
           [
-            `Rebase onto ${rebase.targetRef} hit merge conflicts in:`,
-            ...rebase.conflictedFiles.map((f) => `- ${f}`),
-            "",
             "Instructions:",
             "- Resolve all conflict markers while preserving both upstream changes and your task implementation.",
             "- Stage resolved files with `git add` and complete the rebase with `GIT_EDITOR=true git rebase --continue`.",
+            "",
+            `Rebase onto ${rebase.targetRef} hit merge conflicts in:`,
+            ...rebase.conflictedFiles.map((f) => `- ${f}`),
           ].join("\n")
         );
         recordUsage(usageLog, "Pre-PR Rebase", resolveRes, budget, "Pre-PR Rebase");

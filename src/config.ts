@@ -20,6 +20,20 @@ export interface ModelRef {
   id: string;
 }
 
+export interface ContextLimits {
+  testDiffMaxChars: number;
+  reviewDiffMaxChars: number;
+  verifyOutputMaxChars: number;
+  memoryMaxLines: number;
+}
+
+export const DEFAULT_CONTEXT_LIMITS: ContextLimits = {
+  testDiffMaxChars: 40_000,
+  reviewDiffMaxChars: 60_000,
+  verifyOutputMaxChars: 6_000,
+  memoryMaxLines: 120,
+};
+
 export interface RepoConfig {
   baseBranch: string;
   verify: string[];
@@ -41,6 +55,7 @@ export interface RepoConfig {
   maxReviewRounds: number;
   maxTaskCostUsd?: number;
   maxTaskTokens?: number;
+  contextLimits?: Partial<ContextLimits>;
   securityScan: boolean;
   safetyCheck: boolean;
   safetyAllowlist?: string[];
@@ -78,6 +93,7 @@ const DEFAULT_CONFIG: RepoConfig = {
   maxReviewRounds: 2,
   maxTaskCostUsd: 5,
   maxTaskTokens: 2_000_000,
+  contextLimits: { ...DEFAULT_CONTEXT_LIMITS },
   securityScan: true,
   safetyCheck: true,
 };
@@ -211,6 +227,28 @@ export function loadRepoConfig(repoDir: string): RepoConfig {
   };
   const maxTaskCostUsd = resolveBudgetLimit(userConfig.maxTaskCostUsd, DEFAULT_CONFIG.maxTaskCostUsd);
   const maxTaskTokens = resolveBudgetLimit(userConfig.maxTaskTokens, DEFAULT_CONFIG.maxTaskTokens);
+  const resolvePositiveInt = (override: number | undefined, fallback: number): number =>
+    typeof override === "number" && Number.isFinite(override) && override > 0
+      ? Math.floor(override)
+      : fallback;
+  const contextLimits: ContextLimits = {
+    testDiffMaxChars: resolvePositiveInt(
+      userConfig.contextLimits?.testDiffMaxChars,
+      DEFAULT_CONTEXT_LIMITS.testDiffMaxChars
+    ),
+    reviewDiffMaxChars: resolvePositiveInt(
+      userConfig.contextLimits?.reviewDiffMaxChars,
+      DEFAULT_CONTEXT_LIMITS.reviewDiffMaxChars
+    ),
+    verifyOutputMaxChars: resolvePositiveInt(
+      userConfig.contextLimits?.verifyOutputMaxChars,
+      DEFAULT_CONTEXT_LIMITS.verifyOutputMaxChars
+    ),
+    memoryMaxLines: resolvePositiveInt(
+      userConfig.contextLimits?.memoryMaxLines,
+      DEFAULT_CONTEXT_LIMITS.memoryMaxLines
+    ),
+  };
   if (securityScan && hasCommand("semgrep") && !verify.some((c) => c.startsWith("semgrep"))) {
     verify.push("semgrep --error --config p/security-audit --quiet .");
   }
@@ -224,6 +262,7 @@ export function loadRepoConfig(repoDir: string): RepoConfig {
     providers: mergeProviders(DEFAULT_PROVIDERS, userConfig.providers),
     maxTaskCostUsd,
     maxTaskTokens,
+    contextLimits,
     securityScan,
     safetyCheck,
   };

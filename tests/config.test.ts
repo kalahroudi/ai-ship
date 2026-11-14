@@ -219,3 +219,34 @@ test("loadRepoConfig sets default budget thresholds and supports overrides or di
 
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+test("loadRepoConfig sets default contextLimits and supports partial overrides", () => {
+  const dir = makeTempRepo();
+  const defaults = loadRepoConfig(dir);
+  assert.deepEqual(defaults.contextLimits, {
+    testDiffMaxChars: 40_000,
+    reviewDiffMaxChars: 60_000,
+    verifyOutputMaxChars: 6_000,
+    memoryMaxLines: 120,
+  });
+
+  fs.writeFileSync(
+    path.join(dir, ".ai-ship.json"),
+    JSON.stringify({
+      contextLimits: {
+        testDiffMaxChars: 15000,
+        verifyOutputMaxChars: 2500,
+        memoryMaxLines: -5,
+      },
+    })
+  );
+  const custom = loadRepoConfig(dir);
+  assert.deepEqual(custom.contextLimits, {
+    testDiffMaxChars: 15000,
+    reviewDiffMaxChars: 60_000,
+    verifyOutputMaxChars: 2500,
+    memoryMaxLines: 120,
+  });
+
+  fs.rmSync(dir, { recursive: true, force: true });
+});

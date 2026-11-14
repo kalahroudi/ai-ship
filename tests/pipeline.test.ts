@@ -7,11 +7,18 @@ import { execSync } from "node:child_process";
 import {
   BudgetExceededError,
   BudgetTracker,
+  IMPLEMENTER_STATIC_INSTRUCTIONS,
+  REVIEWER_STATIC_INSTRUCTIONS,
+  TESTER_STATIC_INSTRUCTIONS,
+  buildImplementerPrompt,
+  buildReviewerLensPrompt,
+  buildTesterPrompt,
   formatOpenReviewFindings,
   formatPipelineResult,
   runPipeline,
   runReviewLenses,
 } from "../src/pipeline.ts";
+import { appendMemory } from "../src/memory.ts";
 import type { RepoConfig } from "../src/config.ts";
 import type { OpencodeClient, PipelineRunner, PromptOptions } from "../src/runner.ts";
 import { resolveShipTaskInput } from "../plugin/index.ts";
@@ -381,5 +388,92 @@ test("runPipeline includes per-stage and task totals in result and usageLog on s
     assert.ok(result.usageLog.some((l) => l.includes("[Task Total] in=100 out=40 cache_read=10 total=150 | $0.0250")));
   } finally {
     fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test("prompt builders keep static prefixes byte-identical and append dynamic context at the end", () => {
+  const implA = buildImplementerPrompt("Task A");
+  const implB = buildImplementerPrompt("Task B", "- [testing] Always run npm test");
+
+  assert.ok(implA.startsWith(IMPLEMENTER_STATIC_INSTRUCTIONS));
+  assert.ok(implB.startsWith(IMPLEMENTER_STATIC_INSTRUCTIONS));
+  assert.match(IMPLEMENTER_STATIC_INSTRUCTIONS, /Prefer minimal, targeted diff\/patch edits/);
+  assert.ok(implA.endsWith("Task: Task A"));
+  assert.ok(implB.endsWith("## Persistent Repository Memory\n- [testing] Always run npm test"));
+  assert.ok(implB.indexOf("Task: Task B") < implB.indexOf("## Persistent Repository Memory"));
+
+  const testerA = buildTesterPrompt({ task: "Task A", diff: "diff-a" });
+  const testerB = buildTesterPrompt({ task: "Task B", diff: "diff-b", memory: "- [sec] Check IDOR" });
+  assert.ok(testerA.startsWith(TESTER_STATIC_INSTRUCTIONS));
+  assert.ok(testerB.startsWith(TESTER_STATIC_INSTRUCTIONS));
+  assert.ok(testerB.indexOf("Task Intent: Task B") < testerB.indexOf("## Persistent Repository Memory"));
+  assert.ok(testerB.indexOf("## Persistent Repository Memory") < testerB.indexOf("```diff\ndiff-b\n```"));
+
+  const rev = buildReviewerLensPrompt({ name: "Security", focus: "auth and IDOR" });
+  assert.ok(rev.startsWith(REVIEWER_STATIC_INSTRUCTIONS));
+  assert.ok(rev.endsWith("Review lens: Security\nFocus strictly on: auth and IDOR."));
+});
+
+test("runPipeline injects readMemory(repoDir) at end of implementer prompt and respects contextLimits", async () => {
+  const memDir = fs.mkdtempSync(path.join(os.tmpdir(), "ai-ship-mem-"));
+  const prevMemDir = process.env.OPENCODE_MEMORY_DIR;
+  process.env.OPENCODE_MEMORY_DIR = memDir;
+
+  const repoDir = initTempGitRepo({
+    baseBranch: "main",
+    verify: [],
+    maxFixRetries: 1,
+    maxReviewRounds: 1,
+    securityScan: false,
+    safetyCheck: false,
+    contextLimits: {
+      memoryMaxLines: 4,
+    },
+  });
+
+  appendMemory(repoDir, "Invariant one: use parameterized queries.", "security");
+  appendMemory(repoDir, "Invariant two: never rewrite whole files.", "style");
+
+  const capturedPrompts: string[] = [];
+  let sessionIdx = 0;
+  const fakeClient = {
+    session: {
+      async create() {
+        return { data: { id: `sess-${++sessionIdx}` } };
+      },
+      async prompt(input: { body: { parts: Array<{ text: string }> } }) {
+        capturedPrompts.push(input.body.parts.map((p) => p.text).join("\n"));
+        return {
+          data: {
+            parts: [{ type: "text", text: "Implemented minimal patch." }],
+            info: { cost: 0.01, tokens: { input: 50, output: 20 } },
+          },
+        };
+      },
+    },
+  } as unknown as OpencodeClient;
+
+  try {
+    await runPipeline({
+      repoDir,
+      task: "Fix subtle bug",
+      openPr: false,
+      skipTests: true,
+      skipReview: true,
+      client: fakeClient,
+    });
+
+    assert.equal(capturedPrompts.length, 1);
+    const prompt = capturedPrompts[0];
+    assert.ok(prompt.startsWith(IMPLEMENTER_STATIC_INSTRUCTIONS));
+    assert.ok(prompt.includes("Task: Fix subtle bug"));
+    assert.ok(prompt.includes("## Persistent Repository Memory"));
+    assert.ok(prompt.includes("Invariant one: use parameterized queries."));
+    assert.ok(prompt.indexOf("Task: Fix subtle bug") < prompt.indexOf("## Persistent Repository Memory"));
+  } finally {
+    if (prevMemDir === undefined) delete process.env.OPENCODE_MEMORY_DIR;
+    else process.env.OPENCODE_MEMORY_DIR = prevMemDir;
+    fs.rmSync(repoDir, { recursive: true, force: true });
+    fs.rmSync(memDir, { recursive: true, force: true });
   }
 });

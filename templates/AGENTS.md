@@ -10,7 +10,8 @@ Keep this file short (<100 lines). Link to deeper docs instead of pasting rules 
 ## Non-Negotiable Invariants
 - Never trust client-supplied `userId`, `orgId`, or role claims; derive them from the verified server session.
 - Validate all external inputs at route/action boundaries.
-- Never read or log `.env*`, private keys, or credentials.
+- Never read or log `.env*`, `.dev.vars*`, private keys, or credentials.
+- Never commit or hardcode deployment config IDs (e.g. `wrangler.toml` `account_id`, `database_id`, `zone_id`, KV `id`), secrets, API keys, emails, or real account/org/user IDs.
 - Never weaken or delete existing tests to make a check pass.
 
 ## Local Verification Commands

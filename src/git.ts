@@ -1,7 +1,8 @@
 import { execSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { detectDefaultBaseBranch, detectPackageManager } from "./config.ts";
+import { detectDefaultBaseBranch, detectPackageManager, loadRepoConfig } from "./config.ts";
+import { assertWorktreeSafe } from "./safety.ts";
 
 export interface WorktreeHandle {
   repoDir: string;
@@ -87,6 +88,31 @@ export function createWorktree(repoDir: string, baseBranch: string, task: string
   setupWorktreeDependencies(repoDir, worktreeDir);
 
   return { repoDir, worktreeDir, branch, baseBranch };
+}
+
+/** Opens an existing ai-ship worktree directory so follow-up iterations can reuse its branch. */
+export function openExistingWorktree(
+  repoDir: string,
+  baseBranch: string,
+  worktreeDir: string
+): WorktreeHandle {
+  const resolved = path.resolve(worktreeDir);
+  if (!fs.existsSync(resolved)) {
+    throw new Error(`Worktree directory does not exist: ${resolved}`);
+  }
+  const branchRes = spawnSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], {
+    cwd: resolved,
+    encoding: "utf8",
+  });
+  if (branchRes.status !== 0) {
+    throw new Error(`Not a valid git worktree: ${resolved}`);
+  }
+  const branch = branchRes.stdout.trim();
+  if (!branch || branch === "HEAD") {
+    throw new Error(`Worktree ${resolved} is in detached HEAD state; expected a feature branch.`);
+  }
+  setupWorktreeDependencies(repoDir, resolved);
+  return { repoDir, worktreeDir: resolved, branch, baseBranch };
 }
 
 function resolveDiffBaseRef(worktreeDir: string, baseBranch: string): string {
@@ -212,16 +238,41 @@ export function rebaseOntoBase(worktree: WorktreeHandle): RebaseResult {
   return { updated: true, conflicted: true, targetRef, conflictedFiles };
 }
 
-export function pushAndOpenPR(worktree: WorktreeHandle, title: string, body: string): string | undefined {
+function assertSafeToPush(worktree: WorktreeHandle): void {
+  const cfg = loadRepoConfig(worktree.worktreeDir);
+  if (cfg.safetyCheck !== false) {
+    assertWorktreeSafe(worktree.worktreeDir, {
+      baseBranch: worktree.baseBranch,
+      allowlist: cfg.safetyAllowlist,
+    });
+  }
+}
+
+export function pushAndOpenPR(
+  worktree: WorktreeHandle,
+  title: string,
+  body: string,
+  opts: { draft?: boolean } = {}
+): string | undefined {
+  assertSafeToPush(worktree);
   execSync(`git push -u origin "${worktree.branch}"`, {
     cwd: worktree.worktreeDir,
     stdio: inheritStdio(),
   });
-  const res = spawnSync(
-    "gh",
-    ["pr", "create", "--base", worktree.baseBranch, "--head", worktree.branch, "--title", title, "--body", body],
-    { cwd: worktree.worktreeDir, encoding: "utf8" }
-  );
+  const ghArgs = [
+    "pr",
+    "create",
+    "--base",
+    worktree.baseBranch,
+    "--head",
+    worktree.branch,
+    "--title",
+    title,
+    "--body",
+    body,
+    ...(opts.draft ? ["--draft"] : []),
+  ];
+  const res = spawnSync("gh", ghArgs, { cwd: worktree.worktreeDir, encoding: "utf8" });
   const out = (res.stdout || "").trim();
   const err = (res.stderr || "").trim();
   if (out) console.log(out);
@@ -231,6 +282,175 @@ export function pushAndOpenPR(worktree: WorktreeHandle, title: string, body: str
   }
   const match = out.match(/https:\/\/github\.com\/\S+/);
   return match ? match[0] : out || undefined;
+}
+
+export interface OpenPrResult {
+  prUrl?: string;
+  branch: string;
+  baseBranch: string;
+  worktreeDir: string;
+  rebasedOnto?: string;
+  draft: boolean;
+}
+
+/** Parses an explicit PR title and optional inline `--draft` flag. */
+export function parseOpenPrArgs(
+  rawTitle: string,
+  opts: { draft?: boolean } = {}
+): { title: string; draft: boolean } {
+  let draft = Boolean(opts.draft);
+  const tokens = rawTitle.trim().split(/\s+/).filter(Boolean);
+  const kept: string[] = [];
+  for (const tok of tokens) {
+    if (tok === "--draft") {
+      draft = true;
+    } else {
+      kept.push(tok);
+    }
+  }
+  const title = kept.join(" ").split(/\r?\n/)[0]?.trim() ?? "";
+  return { title, draft };
+}
+
+/** Resolves an existing ai-ship worktree from an explicit path, branch name, or single active worktree. */
+export function resolveWorktreeForPr(
+  repoDir: string,
+  opts: { worktreeDir?: string; branch?: string; baseBranch?: string } = {}
+): WorktreeHandle {
+  const resolvedRepoDir = safeRealpath(repoDir);
+  const baseBranch = opts.baseBranch?.trim() || detectDefaultBaseBranch(resolvedRepoDir);
+  const targets = listCleanupTargets(resolvedRepoDir, baseBranch);
+  const registeredWorktrees = targets.worktrees.filter((w) => w.registered && w.branch);
+
+  const rawWorktreeDir = opts.worktreeDir?.trim();
+  if (rawWorktreeDir) {
+    const candidate = safeRealpath(path.resolve(resolvedRepoDir, rawWorktreeDir));
+    if (candidate !== safeRealpath(targets.worktreeRoot) && candidate !== resolvedRepoDir) {
+      if (!fs.existsSync(candidate)) {
+        throw new Error(`Worktree directory does not exist: ${candidate}`);
+      }
+      const branchRes = spawnSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], {
+        cwd: candidate,
+        encoding: "utf8",
+      });
+      if (branchRes.status !== 0) {
+        throw new Error(`Not a valid git worktree: ${candidate}`);
+      }
+      const branch = branchRes.stdout.trim();
+      if (!branch || branch === "HEAD") {
+        throw new Error(`Worktree ${candidate} is in detached HEAD state; expected a feature branch.`);
+      }
+      return { repoDir: resolvedRepoDir, worktreeDir: candidate, branch, baseBranch };
+    }
+  }
+
+  const requestedBranch = opts.branch?.trim();
+  if (requestedBranch) {
+    const match = registeredWorktrees.find((w) => w.branch === requestedBranch);
+    if (match) {
+      return {
+        repoDir: resolvedRepoDir,
+        worktreeDir: match.path,
+        branch: requestedBranch,
+        baseBranch,
+      };
+    }
+    throw new Error(
+      `No active worktree found for branch "${requestedBranch}".` +
+        (registeredWorktrees.length
+          ? ` Available: ${registeredWorktrees.map((w) => `${w.branch} (${w.path})`).join(", ")}`
+          : "")
+    );
+  }
+
+  if (registeredWorktrees.length === 1) {
+    const only = registeredWorktrees[0]!;
+    return {
+      repoDir: resolvedRepoDir,
+      worktreeDir: only.path,
+      branch: only.branch!,
+      baseBranch,
+    };
+  }
+
+  if (registeredWorktrees.length === 0) {
+    throw new Error("No active ai-ship worktree found. Pass `worktreeDir` or `branch`.");
+  }
+
+  throw new Error(
+    `Multiple active ai-ship worktrees found; specify \`worktreeDir\` or \`branch\`: ${registeredWorktrees
+      .map((w) => `${w.branch} (${w.path})`)
+      .join(", ")}`
+  );
+}
+
+/** Rebases an existing ai-ship worktree onto its base branch, pushes it, and opens a GitHub PR. */
+export function openPrFromWorktree(
+  opts: {
+    repoDir: string;
+    title: string;
+    body?: string;
+    worktreeDir?: string;
+    branch?: string;
+    baseBranch?: string;
+    draft?: boolean;
+  },
+  deps: {
+    rebase?: typeof rebaseOntoBase;
+    pushAndOpen?: typeof pushAndOpenPR;
+  } = {}
+): OpenPrResult {
+  const parsed = parseOpenPrArgs(opts.title, { draft: opts.draft });
+  if (!parsed.title) {
+    throw new Error("PR title is required.");
+  }
+
+  const worktree = resolveWorktreeForPr(opts.repoDir, {
+    worktreeDir: opts.worktreeDir,
+    branch: opts.branch,
+    baseBranch: opts.baseBranch,
+  });
+
+  if (isWorktreeDirty(worktree.worktreeDir)) {
+    throw new Error(
+      `Worktree ${worktree.worktreeDir} has uncommitted changes. Commit or stash them before opening a PR.`
+    );
+  }
+
+  const rebaseFn = deps.rebase ?? rebaseOntoBase;
+  const rebase = rebaseFn(worktree);
+  if (rebase.conflicted) {
+    abortRebase(worktree.worktreeDir);
+    throw new Error(
+      `Rebase onto ${rebase.targetRef} hit merge conflicts in: ${rebase.conflictedFiles.join(", ") || "(unknown)"}`
+    );
+  }
+
+  let body = opts.body?.trim() ?? "";
+  if (!body) {
+    const logRes = spawnSync("git", ["log", "-1", "--pretty=%B"], {
+      cwd: worktree.worktreeDir,
+      encoding: "utf8",
+    });
+    body =
+      logRes.status === 0 && logRes.stdout.trim()
+        ? logRes.stdout.trim()
+        : `Automated PR for branch \`${worktree.branch}\`.`;
+  }
+
+  assertSafeToPush(worktree);
+
+  const pushAndOpenFn = deps.pushAndOpen ?? pushAndOpenPR;
+  const prUrl = pushAndOpenFn(worktree, parsed.title, body, { draft: parsed.draft });
+
+  return {
+    prUrl,
+    branch: worktree.branch,
+    baseBranch: worktree.baseBranch,
+    worktreeDir: worktree.worktreeDir,
+    ...(rebase.updated ? { rebasedOnto: rebase.targetRef } : {}),
+    draft: parsed.draft,
+  };
 }
 
 export interface WorktreeCleanupItem {

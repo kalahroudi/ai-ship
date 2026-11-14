@@ -9,13 +9,16 @@ import {
   getDiff,
   getDiffStat,
   isRebaseInProgress,
+  openExistingWorktree,
   pushAndOpenPR,
   rebaseOntoBase,
   runShell,
   type WorktreeHandle,
 } from "./git.ts";
 import { buildDreamPrompt, getMemoryPath, readMemory, writeConsolidatedMemory } from "./memory.ts";
+import { assertWorktreeSafe, formatSafetyFindings, scanWorktreeSafety } from "./safety.ts";
 import {
+  buildOpencodeProviderConfig,
   collectRecentTranscripts,
   createOpencodeClientRunner,
   createRunner,
@@ -28,6 +31,8 @@ export interface PipelineOptions {
   repoDir: string;
   task: string;
   openPr: boolean;
+  draft?: boolean;
+  worktreeDir?: string;
   skipTests?: boolean;
   skipReview?: boolean;
   provider?: ProviderName;
@@ -44,6 +49,8 @@ export interface PipelineResult {
   baseBranch: string;
   provider: ProviderName;
   committed: boolean;
+  diffStat?: string;
+  implSummary?: string;
   verifyCommands: string[];
   reviewVerdicts: Array<{ lens: string; verdict: "CLEAN" | "OPEN" }>;
   prUrl?: string;
@@ -112,10 +119,28 @@ async function runDeterministicVerify(
   worktreeDir: string,
   config: RepoConfig
 ): Promise<{ ok: boolean; failedCommand?: string; output: string }> {
-  if (config.verify.length === 0) {
-    return { ok: true, output: "No verify commands configured or detected." };
-  }
   const logs: string[] = [];
+
+  if (config.safetyCheck !== false) {
+    console.log("  -> running: ai-ship safety-check (secrets, deployment config, keys, emails, IDs)");
+    const safety = scanWorktreeSafety(worktreeDir, {
+      baseBranch: config.baseBranch,
+      allowlist: config.safetyAllowlist,
+    });
+    const safetyOut = formatSafetyFindings(safety.findings);
+    logs.push(`$ ai-ship safety-check\n${safetyOut}`);
+    if (!safety.ok) {
+      return {
+        ok: false,
+        failedCommand: "ai-ship safety-check",
+        output: safetyOut.slice(-6000),
+      };
+    }
+  }
+
+  if (config.verify.length === 0) {
+    return { ok: true, output: logs.join("\n\n") || "No verify commands configured or detected." };
+  }
   for (const cmd of config.verify) {
     console.log(`  -> running: ${cmd}`);
     const res = runShell(cmd, worktreeDir);
@@ -139,14 +164,20 @@ function parseVerdict(text: string): "CLEAN" | "OPEN" {
     : "CLEAN";
 }
 
-export function resolveCloudflareGatewayUrl(): string | undefined {
+export function resolveCloudflareGatewayUrl(provider?: string): string | undefined {
+  const normalizedProvider = provider?.trim().replace(/^\/+|\/+$/g, "");
   if (process.env.CF_AI_GATEWAY_URL) {
-    return process.env.CF_AI_GATEWAY_URL.replace(/\/+$/, "");
+    const base = process.env.CF_AI_GATEWAY_URL.replace(/\/+$/, "");
+    if (!normalizedProvider) return base;
+    const isBareGateway = /^https:\/\/gateway\.ai\.cloudflare\.com\/v1\/[^/]+\/[^/]+$/i.test(base);
+    return isBareGateway ? `${base}/${normalizedProvider}` : base;
   }
   const accountId = process.env.CF_ACCOUNT_ID;
   const gatewayId = process.env.CF_GATEWAY_ID;
   if (accountId && gatewayId) {
-    return `https://gateway.ai.cloudflare.com/v1/${accountId}/${gatewayId}/openrouter`;
+    const base = `https://gateway.ai.cloudflare.com/v1/${accountId}/${gatewayId}`;
+    const suffix = normalizedProvider || process.env.CF_GATEWAY_PROVIDER?.trim().replace(/^\/+|\/+$/g, "");
+    return suffix ? `${base}/${suffix}` : base;
   }
   return undefined;
 }
@@ -168,8 +199,10 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
   if (provider === "opencode" && cfGatewayUrl) console.log(`[ai-ship] Cloudflare AI Gateway: ${cfGatewayUrl}`);
   console.log(`[ai-ship] Verify pipeline: ${config.verify.length ? config.verify.join(" && ") : "(none detected)"}`);
 
-  opts.onProgress?.("Creating isolated worktree");
-  const worktree: WorktreeHandle = createWorktree(repoDir, config.baseBranch, opts.task);
+  opts.onProgress?.(opts.worktreeDir ? "Opening existing worktree" : "Creating isolated worktree");
+  const worktree: WorktreeHandle = opts.worktreeDir
+    ? openExistingWorktree(repoDir, config.baseBranch, opts.worktreeDir)
+    : createWorktree(repoDir, config.baseBranch, opts.task);
   console.log(`[ai-ship] Worktree: ${worktree.worktreeDir} (branch: ${worktree.branch})`);
 
   const runner = opts.client
@@ -209,6 +242,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
         "- Work inside the current repository.",
         "- Read AGENTS.md if it exists.",
         "- Make clean, minimal, production-ready changes.",
+        "- Never hardcode or commit deployment config IDs (e.g. wrangler account_id, database_id, zone_id, kv id), secrets, API keys, emails, or real account/org/user IDs.",
         "- Run relevant local checks before finishing.",
       ].join("\n")
     );
@@ -289,7 +323,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
       const lenses = [
         {
           name: "Security",
-          focus: "auth, RBAC/tenant isolation (IDOR), input validation, SQLi/XSS/SSRF, secret handling, rate limiting, and webhook/billing integrity",
+          focus: "auth, RBAC/tenant isolation (IDOR), input validation, SQLi/XSS/SSRF, secret handling, leaked deployment config IDs/keys/emails/PII, rate limiting, and webhook/billing integrity",
         },
         {
           name: "Performance",
@@ -349,19 +383,20 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
           break;
         }
 
+        const findingsText = formatOpenReviewFindings(openFindings);
+
         if (round === config.maxReviewRounds) {
           console.log("\n[ai-ship] Review findings remain open after max rounds:");
           for (const f of openFindings) {
             console.log(`\n--- ${f.lens} ---\n${f.text}`);
           }
-          throw new Error("Review findings remain OPEN. Inspect the worktree before pushing.");
+          throw new Error(
+            `Review findings remain OPEN after ${config.maxReviewRounds} round(s). Inspect the worktree (${worktree.worktreeDir}) before pushing.\n\n${findingsText}`
+          );
         }
 
         opts.onProgress?.(`Stage 4/4: Addressing review findings (round ${round})`);
         console.log("  -> Sending OPEN findings back to implementer...");
-        const findingsText = openFindings
-          .map((f) => `### ${f.lens} Review\n${f.text}`)
-          .join("\n\n");
         const fixReviewRes = await runner.prompt(
           implSessionId,
           "implementer",
@@ -379,6 +414,12 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
     // -------------------------------------------------------------------------
     // Commit & Optional PR
     // -------------------------------------------------------------------------
+    if (config.safetyCheck !== false) {
+      assertWorktreeSafe(worktree.worktreeDir, {
+        baseBranch: worktree.baseBranch,
+        allowlist: config.safetyAllowlist,
+      });
+    }
     const committed = commitAll(worktree.worktreeDir, `feat: ${opts.task.slice(0, 72)}`);
     console.log(`\n[ai-ship] Done! Branch: ${worktree.branch} (${committed ? "committed" : "no changes"})`);
     console.log(`[ai-ship] Worktree: ${worktree.worktreeDir}`);
@@ -422,7 +463,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
       }
 
       console.log("\n[ai-ship] Pushing branch and opening PR...");
-      opts.onProgress?.("Pushing branch and opening PR");
+      opts.onProgress?.(opts.draft ? "Pushing branch and opening draft PR" : "Pushing branch and opening PR");
       const prTitle = opts.task.split(/\r?\n/)[0].trim().slice(0, 72);
       const prBody = buildPrBody({
         task: opts.task,
@@ -433,8 +474,10 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
         adversarialTestsRan: !opts.skipTests,
         reviewVerdicts,
       });
-      prUrl = pushAndOpenPR(worktree, prTitle, prBody);
+      prUrl = pushAndOpenPR(worktree, prTitle, prBody, { draft: opts.draft });
     }
+
+    const diffStat = getDiffStat(worktree.worktreeDir, worktree.baseBranch);
 
     return {
       repoDir,
@@ -443,6 +486,8 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
       baseBranch: worktree.baseBranch,
       provider,
       committed,
+      diffStat,
+      implSummary: implRes.text,
       verifyCommands: config.verify,
       reviewVerdicts,
       prUrl,
@@ -477,15 +522,10 @@ export async function runDreamConsolidation(opts: {
       client = createOpencodeClient({ baseUrl: opts.serverUrl });
     } else {
       const cfGatewayUrl = resolveCloudflareGatewayUrl();
+      const providerConfig = buildOpencodeProviderConfig(config, cfGatewayUrl);
       const started = await createOpencode({
         port: 0,
-        ...(cfGatewayUrl
-          ? {
-              config: {
-                provider: { openrouter: { options: { baseURL: cfGatewayUrl } } },
-              },
-            }
-          : {}),
+        ...(providerConfig ? { config: { provider: providerConfig as never } } : {}),
       });
       client = started.client;
       closeServer = () => started.server.close();
@@ -506,7 +546,7 @@ export async function runDreamConsolidation(opts: {
       client,
       worktreeDir: repoDir,
       config,
-      model: opts.model ?? "openrouter/google/gemini-2.5-flash",
+      model: opts.model,
     });
 
     const sessionId = await runner.createSession(`Dream: ${repoName}`);
@@ -521,4 +561,45 @@ export async function runDreamConsolidation(opts: {
   } finally {
     closeServer?.();
   }
+}
+
+/** Formats open review-lens findings into readable markdown sections. */
+export function formatOpenReviewFindings(
+  openFindings: Array<{ lens: string; text: string }>
+): string {
+  return openFindings.map((f) => `### ${f.lens} Review\n${f.text}`).join("\n\n");
+}
+
+/** Formats a PipelineResult for MCP and plugin tool responses. */
+export function formatPipelineResult(
+  result: PipelineResult,
+  label: string,
+  openPrRequested: boolean
+): string {
+  const reviewSummary = result.reviewVerdicts.length
+    ? result.reviewVerdicts.map((r) => `${r.lens}: ${r.verdict}`).join(", ")
+    : "(skipped)";
+  const verifySummary = result.verifyCommands.length
+    ? `${result.verifyCommands.join(" && ")} (passed)`
+    : "(none)";
+  const lines = [
+    `ai-ship pipeline completed for "${label}"`,
+    `- Repo: ${result.repoDir}`,
+    `- Branch: ${result.branch} (base: ${result.baseBranch}, ${result.committed ? "committed" : "no changes"})`,
+    `- Worktree: ${result.worktreeDir}`,
+    `- Provider: ${result.provider}`,
+    `- Verify: ${verifySummary}`,
+    `- Review: ${reviewSummary}`,
+    `- PR: ${result.prUrl ?? (openPrRequested ? "(not created — no changes or gh failed)" : "(not requested)")}`,
+  ];
+  if (result.diffStat?.trim()) {
+    lines.push("- Changed files:", "```text", result.diffStat.trim(), "```");
+  }
+  if (result.implSummary?.trim()) {
+    lines.push("- Implementation summary:", truncateCleanly(result.implSummary, 2500));
+  }
+  if (result.usageLog.length) {
+    lines.push("- Usage:", ...result.usageLog);
+  }
+  return lines.join("\n");
 }

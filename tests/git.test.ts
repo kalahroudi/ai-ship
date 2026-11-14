@@ -10,8 +10,11 @@ import {
   createWorktree,
   isRebaseInProgress,
   listCleanupTargets,
+  openPrFromWorktree,
+  parseOpenPrArgs,
   rebaseOntoBase,
   removeCleanupTargets,
+  resolveWorktreeForPr,
   setupWorktreeDependencies,
 } from "../src/git.ts";
 
@@ -196,4 +199,75 @@ test("rebaseOntoBase cleanly rebases non-conflicting upstream changes and report
   assert.equal(isRebaseInProgress(handle.worktreeDir), false);
 
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("parseOpenPrArgs extracts title and inline --draft flag", () => {
+  assert.deepEqual(parseOpenPrArgs("  M2: Restrict owner access --draft  "), {
+    title: "M2: Restrict owner access",
+    draft: true,
+  });
+  assert.deepEqual(parseOpenPrArgs("Fix bug", { draft: true }), {
+    title: "Fix bug",
+    draft: true,
+  });
+});
+
+test("resolveWorktreeForPr and openPrFromWorktree resolve by branch, single worktree, or explicit path", () => {
+  const repoDir = makeCommittedRepo({ "README.md": "hello\n" });
+  const wt1 = createWorktree(repoDir, "main", "m2-task");
+  fs.writeFileSync(path.join(wt1.worktreeDir, "README.md"), "updated\n");
+  commitAll(wt1.worktreeDir, "feat: m2");
+
+  // Resolves automatically when only 1 active worktree exists
+  const autoResolved = resolveWorktreeForPr(repoDir);
+  assert.equal(autoResolved.branch, wt1.branch);
+
+  // Resolves by branch even when worktreeDir is just the .ai-ship-worktrees/ root
+  const byBranch = resolveWorktreeForPr(repoDir, {
+    worktreeDir: ".ai-ship-worktrees/",
+    branch: wt1.branch,
+  });
+  assert.equal(byBranch.worktreeDir, fs.realpathSync(wt1.worktreeDir));
+
+  // openPrFromWorktree passes title, body, and draft to pushAndOpen
+  let captured: any;
+  const prRes = openPrFromWorktree(
+    {
+      repoDir,
+      title: "M2: Restrict break-glass owner access --draft",
+      body: "**What changed**\n- Break-glass route removed",
+      worktreeDir: ".ai-ship-worktrees/",
+      branch: wt1.branch,
+    },
+    {
+      rebase: () => ({ updated: false, conflicted: false, targetRef: "main", conflictedFiles: [] }),
+      pushAndOpen: (wt, title, body, opts) => {
+        captured = { wt, title, body, opts };
+        return "https://github.com/org/repo/pull/42";
+      },
+    }
+  );
+  assert.equal(prRes.prUrl, "https://github.com/org/repo/pull/42");
+  assert.equal(prRes.draft, true);
+  assert.equal(captured.title, "M2: Restrict break-glass owner access");
+  assert.match(captured.body, /Break-glass route removed/);
+  assert.equal(captured.opts.draft, true);
+
+  // Rejects dirty worktree
+  fs.writeFileSync(path.join(wt1.worktreeDir, "dirty.txt"), "uncommitted\n");
+  assert.throws(
+    () => openPrFromWorktree({ repoDir, title: "Dirty PR", branch: wt1.branch }),
+    /uncommitted changes/
+  );
+  fs.rmSync(path.join(wt1.worktreeDir, "dirty.txt"));
+
+  // Ambiguous when multiple worktrees exist without branch or worktreeDir
+  const wt2 = createWorktree(repoDir, "main", "m3-task");
+  assert.throws(
+    () => resolveWorktreeForPr(repoDir),
+    /Multiple active ai-ship worktrees found/
+  );
+  assert.equal(resolveWorktreeForPr(repoDir, { worktreeDir: wt2.worktreeDir }).branch, wt2.branch);
+
+  fs.rmSync(repoDir, { recursive: true, force: true });
 });

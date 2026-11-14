@@ -15,6 +15,7 @@ export const AiShipPlugin: Plugin = createAiShipPlugin(tool);
 
 ## Features
 - `/ship` (`ship_task` tool): Runs the 4-stage worktree pipeline using OpenCode's live client with stage progress updates.
+- `/pr <title>` (`open_pr` tool): Rebases, pushes, and opens a GitHub PR for an existing `ai-ship` worktree/branch using the summary from your previous response.
 - `/remember <text>`: Immediately saves a highlighted/copied note to repo memory (`~/.local/share/opencode/memory/`) across Desktop, Web, Mobile, and TUI.
 - `/dream` (`dream_consolidate` tool): Consolidates repo-scoped memory against recent session transcripts.
 - `/cleanup` (`cleanup_worktrees` tool): Lists or removes leftover `.ai-ship-worktrees/*` and `ai/*` branches.
@@ -28,6 +29,7 @@ export const AiShipPlugin: Plugin = createAiShipPlugin(tool);
 |---|---|
 | `/ship <task>` | `/ship Add rate limiting to /api/login --pr` |
 | `/ship noty://item/<id> --pr` | `/ship noty://item/D282FF5A-FCE0-4034-8DFF-5694B8A29F99 --pr` |
+| `/pr <title>` | `/pr M2: Restrict and audit break-glass tenant owner access` |
 | `/remember <note>` | `/remember Always pin target.pathname in gateway.ts` |
 | `/dream` | `/dream` |
 | `/cleanup` | `/cleanup` (lists worktrees/branches; ask to confirm deletion to remove them) |

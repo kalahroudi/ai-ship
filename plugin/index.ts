@@ -1,7 +1,7 @@
-import { listCleanupTargets, removeCleanupTargets } from "../src/git.ts";
+import { listCleanupTargets, openPrFromWorktree, removeCleanupTargets } from "../src/git.ts";
 import { appendMemory, forgetMemory, readMemory } from "../src/memory.ts";
 import { parseNotyAddress, resolveNotyTask } from "../src/noty.ts";
-import { runDreamConsolidation, runPipeline } from "../src/pipeline.ts";
+import { formatPipelineResult, runDreamConsolidation, runPipeline } from "../src/pipeline.ts";
 import type { OpencodeClient } from "../src/runner.ts";
 
 export interface ToolExecContext {
@@ -33,12 +33,30 @@ function notifyProgress(
   tui?.showToast?.({ body: { title: "ai-ship", message: title, variant } }).catch(() => undefined);
 }
 
-/** Parses inline CLI-style flags (`--pr`, `--skip-tests`, `--skip-review`, `--provider`) and resolves `noty://item/...` URIs. */
+/** Parses inline CLI-style flags (`--pr`, `--draft`, `--worktree`, `--skip-tests`, `--skip-review`, `--provider`) and resolves `noty://item/...` URIs. */
 export function resolveShipTaskInput(
   rawTask: string,
-  opts: { openPr?: boolean; skipTests?: boolean; skipReview?: boolean; provider?: string } = {}
-): { task: string; openPr: boolean; skipTests: boolean; skipReview: boolean; provider?: string; title?: string } {
-  let openPr = Boolean(opts.openPr);
+  opts: {
+    openPr?: boolean;
+    draft?: boolean;
+    worktreeDir?: string;
+    skipTests?: boolean;
+    skipReview?: boolean;
+    provider?: string;
+  } = {}
+): {
+  task: string;
+  openPr: boolean;
+  draft: boolean;
+  worktreeDir?: string;
+  skipTests: boolean;
+  skipReview: boolean;
+  provider?: string;
+  title?: string;
+} {
+  let openPr = Boolean(opts.openPr || opts.draft);
+  let draft = Boolean(opts.draft);
+  let worktreeDir = opts.worktreeDir;
   let skipTests = Boolean(opts.skipTests);
   let skipReview = Boolean(opts.skipReview);
   let provider = opts.provider;
@@ -48,6 +66,11 @@ export function resolveShipTaskInput(
   for (let i = 0; i < tokens.length; i++) {
     const tok = tokens[i];
     if (tok === "--pr") openPr = true;
+    else if (tok === "--draft") {
+      draft = true;
+      openPr = true;
+    } else if (tok === "--worktree" && tokens[i + 1]) worktreeDir = tokens[++i];
+    else if (tok.startsWith("--worktree=")) worktreeDir = tok.slice("--worktree=".length);
     else if (tok === "--skip-tests") skipTests = true;
     else if (tok === "--skip-review") skipReview = true;
     else if (tok === "--provider" && tokens[i + 1]) provider = tokens[++i];
@@ -63,7 +86,7 @@ export function resolveShipTaskInput(
     title = note.title || note.id;
   }
 
-  return { task, openPr, skipTests, skipReview, provider, title };
+  return { task, openPr, draft, worktreeDir, skipTests, skipReview, provider, title };
 }
 
 /**
@@ -98,6 +121,11 @@ export function createAiShipPlugin(tool: ToolHelper) {
           description: "List or remove leftover ai-ship worktrees and ai/* branches",
           template:
             "Use `cleanup_worktrees` to inspect leftover ai-ship worktrees and branches (pass `confirm: true` only if the user asked to delete them): $ARGUMENTS",
+        };
+        cfg.command.pr = {
+          description: "Open a GitHub PR for an ai-ship worktree/branch using your previous response",
+          template:
+            "Use the `open_pr` tool to rebase, push, and open a GitHub PR. Pass the PR title from the arguments below, the summary/comment from your previous response as `body`, and the `worktreeDir` and/or `branch` from your previous response.\n\nArguments: $ARGUMENTS",
         };
       },
 
@@ -137,6 +165,8 @@ export function createAiShipPlugin(tool: ToolHelper) {
           args: {
             task: z.string().describe("Task description to implement and verify"),
             openPr: z.boolean().optional().describe("Rebase, push branch, and open a PR after all stages pass"),
+            draft: z.boolean().optional().describe("Open the PR as a GitHub Draft PR (implies openPr)"),
+            worktreeDir: z.string().optional().describe("Existing ai-ship worktree path to iterate on instead of creating a new one"),
             skipTests: z.boolean().optional().describe("Skip Stage 2 independent adversarial test generation"),
             skipReview: z.boolean().optional().describe("Skip Stage 4 parallel multi-lens review"),
             model: z.string().optional().describe("Optional model override (provider/model)"),
@@ -145,16 +175,20 @@ export function createAiShipPlugin(tool: ToolHelper) {
             const targetRepo = toolCtx.worktree || toolCtx.directory || repoRoot;
             const resolved = resolveShipTaskInput(args.task, {
               openPr: args.openPr,
+              draft: args.draft,
+              worktreeDir: args.worktreeDir,
               skipTests: args.skipTests,
               skipReview: args.skipReview,
             });
             if (resolved.title) {
               notifyProgress(ctx.client, toolCtx, `Resolved Noty: ${resolved.title}`);
             }
-            await runPipeline({
+            const result = await runPipeline({
               repoDir: targetRepo,
               task: resolved.task,
               openPr: resolved.openPr,
+              draft: resolved.draft,
+              worktreeDir: resolved.worktreeDir,
               skipTests: resolved.skipTests,
               skipReview: resolved.skipReview,
               model: args.model,
@@ -162,7 +196,10 @@ export function createAiShipPlugin(tool: ToolHelper) {
               onProgress: (stage) => notifyProgress(ctx.client, toolCtx, stage),
             });
             notifyProgress(ctx.client, toolCtx, `Completed: ${(resolved.title || resolved.task).slice(0, 50)}`, "success");
-            return `ai-ship pipeline completed for "${resolved.title || args.task}" in ${targetRepo}.`;
+            const label = resolved.title || args.task;
+            return result
+              ? formatPipelineResult(result, label, resolved.openPr)
+              : `ai-ship pipeline completed for "${label}" in ${targetRepo}.`;
           },
         }),
 
@@ -244,6 +281,56 @@ export function createAiShipPlugin(tool: ToolHelper) {
               "success"
             );
             return `Removed ${removed.removedWorktrees.length} worktree(s) and ${removed.removedBranches.length} branch(es).`;
+          },
+        }),
+
+        open_pr: tool({
+          description:
+            "Rebase an existing ai-ship worktree/branch onto its base branch, push it, and open a GitHub PR with the provided title and comment body.",
+          args: {
+            title: z.string().describe("PR title (supports inline --draft flag)"),
+            body: z
+              .string()
+              .optional()
+              .describe("PR description/comment (e.g. summary from the previous response)"),
+            worktreeDir: z
+              .string()
+              .optional()
+              .describe("Path to the ai-ship worktree directory"),
+            branch: z
+              .string()
+              .optional()
+              .describe("Feature branch name (e.g. ai/...) if worktreeDir is not specified"),
+            baseBranch: z
+              .string()
+              .optional()
+              .describe("Base branch (defaults to repository default branch)"),
+            draft: z.boolean().optional().describe("Open the PR as a GitHub Draft PR"),
+          },
+          async execute(args, toolCtx) {
+            const targetRepo = toolCtx.worktree || toolCtx.directory || repoRoot;
+            notifyProgress(ctx.client, toolCtx, "Rebasing, pushing, and opening PR");
+            const res = openPrFromWorktree({
+              repoDir: targetRepo,
+              title: args.title,
+              body: args.body,
+              worktreeDir: args.worktreeDir,
+              branch: args.branch,
+              baseBranch: args.baseBranch,
+              draft: args.draft,
+            });
+            notifyProgress(
+              ctx.client,
+              toolCtx,
+              res.prUrl ? `PR opened: ${res.prUrl}` : `PR opened for ${res.branch}`,
+              "success"
+            );
+            return [
+              `Opened ${res.draft ? "draft PR" : "PR"} for branch \`${res.branch}\` (base: \`${res.baseBranch}\`)`,
+              `- Worktree: ${res.worktreeDir}`,
+              ...(res.rebasedOnto ? [`- Rebased onto: ${res.rebasedOnto}`] : []),
+              `- PR: ${res.prUrl ?? "(created)"}`,
+            ].join("\n");
           },
         }),
       },

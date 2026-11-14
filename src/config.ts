@@ -2,6 +2,19 @@ import fs from "node:fs";
 import path from "node:path";
 import { execSync } from "node:child_process";
 
+export interface ProviderConfig {
+  npm?: string;
+  name?: string;
+  baseURL?: string;
+  options?: {
+    baseURL?: string;
+    apiKey?: string;
+    headers?: Record<string, string>;
+    [key: string]: unknown;
+  };
+  models?: Record<string, unknown>;
+}
+
 export interface RepoConfig {
   baseBranch: string;
   verify: string[];
@@ -9,22 +22,79 @@ export interface RepoConfig {
   implementerModel?: { providerID: string; id: string };
   testerModel?: { providerID: string; id: string };
   reviewerModel?: { providerID: string; id: string };
+  providers?: Record<string, ProviderConfig>;
+  defaultProvider?: string;
   maxFixRetries: number;
   maxReviewRounds: number;
   securityScan: boolean;
+  safetyCheck: boolean;
+  safetyAllowlist?: string[];
 }
+
+export const DEFAULT_PROVIDERS: Record<string, ProviderConfig> = {
+  deepseek: {
+    npm: "@ai-sdk/openai-compatible",
+    name: "DeepSeek Direct",
+    options: {
+      baseURL: "https://api.deepseek.com/v1",
+      apiKey: "{env:DEEPSEEK_API_KEY}",
+    },
+  },
+  parasail: {
+    npm: "@ai-sdk/openai-compatible",
+    name: "Parasail.io",
+    options: {
+      baseURL: "https://api.parasail.io/v1",
+      apiKey: "{env:PARASAIL_API_KEY}",
+    },
+  },
+};
 
 const DEFAULT_CONFIG: RepoConfig = {
   baseBranch: "main",
   verify: [],
   testCommand: null,
-  implementerModel: { providerID: "openrouter", id: "anthropic/claude-sonnet-4" },
-  testerModel: { providerID: "openrouter", id: "openai/gpt-4.1" },
-  reviewerModel: { providerID: "openrouter", id: "google/gemini-2.5-pro" },
+  implementerModel: { providerID: "deepseek", id: "deepseek-chat" },
+  testerModel: { providerID: "parasail", id: "Qwen/Qwen2.5-Coder-32B-Instruct" },
+  reviewerModel: { providerID: "deepseek", id: "deepseek-reasoner" },
+  providers: DEFAULT_PROVIDERS,
+  defaultProvider: "deepseek",
   maxFixRetries: 3,
   maxReviewRounds: 2,
   securityScan: true,
+  safetyCheck: true,
 };
+
+function mergeProviders(
+  base: Record<string, ProviderConfig>,
+  overrides?: Record<string, ProviderConfig>
+): Record<string, ProviderConfig> {
+  const merged: Record<string, ProviderConfig> = {};
+  const keys = new Set([...Object.keys(base), ...Object.keys(overrides ?? {})]);
+  for (const key of keys) {
+    const baseCfg = base[key] ?? {};
+    const userCfg = overrides?.[key] ?? {};
+    const userOptions = {
+      ...(userCfg.baseURL ? { baseURL: userCfg.baseURL } : {}),
+      ...(userCfg.options ?? {}),
+    };
+    const baseOptions = {
+      ...(baseCfg.baseURL ? { baseURL: baseCfg.baseURL } : {}),
+      ...(baseCfg.options ?? {}),
+    };
+    const { baseURL: _b, ...baseRest } = baseCfg;
+    const { baseURL: _u, ...userRest } = userCfg;
+    merged[key] = {
+      ...baseRest,
+      ...userRest,
+      options: {
+        ...baseOptions,
+        ...userOptions,
+      },
+    };
+  }
+  return merged;
+}
 
 function hasCommand(cmd: string): boolean {
   try {
@@ -96,6 +166,9 @@ export function loadRepoConfig(repoDir: string): RepoConfig {
           if (scripts[name]) verify.push(`${run} ${name}`);
         }
       }
+      if (scripts.pentest && !(scripts.verify ?? "").includes("pentest")) {
+        verify.push(`${run} pentest`);
+      }
       if (!testCommand && scripts.test) testCommand = `${run} test`;
     } else if (fs.existsSync(path.join(repoDir, "Package.swift"))) {
       verify.push("swift test");
@@ -113,6 +186,7 @@ export function loadRepoConfig(repoDir: string): RepoConfig {
   }
 
   const securityScan = userConfig.securityScan ?? DEFAULT_CONFIG.securityScan;
+  const safetyCheck = userConfig.safetyCheck ?? DEFAULT_CONFIG.safetyCheck;
   if (securityScan && hasCommand("semgrep") && !verify.some((c) => c.startsWith("semgrep"))) {
     verify.push("semgrep --error --config p/security-audit --quiet .");
   }
@@ -123,6 +197,8 @@ export function loadRepoConfig(repoDir: string): RepoConfig {
     baseBranch,
     verify,
     testCommand,
+    providers: mergeProviders(DEFAULT_PROVIDERS, userConfig.providers),
     securityScan,
+    safetyCheck,
   };
 }

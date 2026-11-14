@@ -4,53 +4,72 @@ import os from "node:os";
 import path from "node:path";
 import readline from "node:readline/promises";
 import { listCleanupTargets, removeCleanupTargets } from "../src/git.ts";
+import { loadRepoConfig } from "../src/config.ts";
 import { startMcpServer } from "../src/mcp.ts";
 import { parseNotyAddress, resolveNotyTask } from "../src/noty.ts";
 import { runDreamConsolidation, runPipeline } from "../src/pipeline.ts";
 import { normalizeProvider } from "../src/runner.ts";
+import { formatSafetyFindings, scanWorktreeSafety } from "../src/safety.ts";
 
 function printHelp() {
   console.log(`ai-ship — project-agnostic OpenCode & Claude Code delivery pipeline
 
 Usage:
-  ai-ship "<task description or noty://item/...>" [--repo <dir>] [--provider <name>] [--model <id>] [--server <url>] [--pr] [--skip-tests] [--skip-review]
+  ai-ship "<task description or noty://item/...>" [--repo <dir>] [--worktree <dir>] [--provider <name>] [--model <id>] [--server <url>] [--pr] [--draft] [--skip-tests] [--skip-review]
   ai-ship --noty <noty://item/...> [--noty-dir <dir>] [--repo <dir>] [options]
   ai-ship --dream [--repo <dir>] [--server <url>] [--model <id>]
   ai-ship --init [--repo <dir>]
   ai-ship --cleanup [--repo <dir>] [--yes]
-  ai-ship --cf <account_id> <gateway_id>
+  ai-ship --safety-check [--repo <dir>]
+  ai-ship --cf <account_id> <gateway_id> [provider]
   ai-ship --mcp
 
 Options:
   --repo <dir>       Target git repository (default: current directory)
   --noty <uri>       Resolve task description from a Noty item URI (noty://item/<uuid>)
   --noty-dir <dir>   Override Noty markdown directory (or set NOTY_DIR)
-  --provider <name>  Runner provider: opencode (default, openrouter/cloudflare) or claude-code
+  --provider <name>  Runner provider: opencode (default, deepseek/parasail/telnyx/openrouter/cloudflare) or claude-code
   --model <id>       Model ID override (defaults to sonnet-5-5 for claude-code)
   --server <url>     Attach to a running \`opencode serve\` URL (visible on mobile/web)
   --dream            Consolidate repo memory from recent OpenCode transcripts
   --pr               Push branch and open GitHub PR after all 4 stages pass
+  --draft            Open the PR as a GitHub Draft PR (implies --pr)
+  --worktree <dir>   Reuse an existing ai-ship worktree to iterate on its branch
   --skip-tests       Skip Stage 2 independent adversarial test generation
   --skip-review      Skip Stage 4 parallel multi-lens review
   --init             Copy starter AGENTS.md and .ai-ship.json into target repo
   --cleanup          List and remove leftover ai-ship worktrees and ai/* branches (prompts for confirmation)
+  --safety-check     Scan repo/worktree diff and untracked files for leaked deployment config, secrets, keys, emails, and IDs
   -y, --yes          Skip confirmation prompt when running --cleanup
-  --cf <acct> <gw>   Point ~/.config/opencode/opencode.json at Cloudflare AI Gateway
+  --cf <acct> <gw> [provider]  Point ~/.config/opencode/opencode.json at Cloudflare AI Gateway
   -h, --help         Show this help
 `);
 }
 
-function configureCloudflareGateway(accountId, gatewayId) {
+function configureCloudflareGateway(accountId, gatewayId, targetProvider) {
   const configPath = path.join(os.homedir(), ".config", "opencode", "opencode.json");
-  const cfg = JSON.parse(fs.readFileSync(configPath, "utf8"));
-  const baseURL = `https://gateway.ai.cloudflare.com/v1/${accountId}/${gatewayId}/openrouter`;
+  fs.mkdirSync(path.dirname(configPath), { recursive: true });
+  const cfg = fs.existsSync(configPath)
+    ? JSON.parse(fs.readFileSync(configPath, "utf8"))
+    : {};
   cfg.provider = cfg.provider ?? {};
-  cfg.provider.openrouter = cfg.provider.openrouter ?? {};
-  cfg.provider.openrouter.options = cfg.provider.openrouter.options ?? {};
-  cfg.provider.openrouter.options.baseURL = baseURL;
-  fs.writeFileSync(configPath, JSON.stringify(cfg, null, 2) + "\n", "utf8");
+
+  const providersToUpdate = targetProvider
+    ? [targetProvider]
+    : Object.keys(cfg.provider).length > 0
+      ? Object.keys(cfg.provider)
+      : ["deepseek"];
+
   console.log(`[ai-ship] Updated ${configPath}`);
-  console.log(`[ai-ship] OpenRouter requests now route via: ${baseURL}`);
+  for (const providerId of providersToUpdate) {
+    const baseURL = `https://gateway.ai.cloudflare.com/v1/${accountId}/${gatewayId}/${providerId}`;
+    cfg.provider[providerId] = cfg.provider[providerId] ?? {};
+    cfg.provider[providerId].options = cfg.provider[providerId].options ?? {};
+    cfg.provider[providerId].options.baseURL = baseURL;
+    console.log(`[ai-ship] ${providerId} requests now route via: ${baseURL}`);
+  }
+
+  fs.writeFileSync(configPath, JSON.stringify(cfg, null, 2) + "\n", "utf8");
 }
 
 function initRepo(repoDir) {
@@ -155,10 +174,13 @@ if (args.length === 0 || args.includes("-h") || args.includes("--help")) {
 
 let repoDir = process.cwd();
 let openPr = false;
+let draft = false;
+let worktreeDir;
 let skipTests = false;
 let skipReview = false;
 let doInit = false;
 let doCleanup = false;
+let doSafetyCheck = false;
 let doDream = false;
 let skipConfirm = false;
 let notyAddress;
@@ -198,6 +220,13 @@ for (let i = 0; i < args.length; i++) {
     doDream = true;
   } else if (arg === "--pr") {
     openPr = true;
+  } else if (arg === "--draft") {
+    draft = true;
+    openPr = true;
+  } else if (arg === "--worktree" && args[i + 1]) {
+    worktreeDir = path.resolve(args[++i]);
+  } else if (arg.startsWith("--worktree=")) {
+    worktreeDir = path.resolve(arg.slice("--worktree=".length));
   } else if (arg === "--skip-tests") {
     skipTests = true;
   } else if (arg === "--skip-review") {
@@ -206,10 +235,13 @@ for (let i = 0; i < args.length; i++) {
     doInit = true;
   } else if (arg === "--cleanup") {
     doCleanup = true;
+  } else if (arg === "--safety-check") {
+    doSafetyCheck = true;
   } else if (arg === "--yes" || arg === "-y") {
     skipConfirm = true;
   } else if ((arg === "--cf" || arg === "-cf") && args[i + 1] && args[i + 2]) {
-    configureCloudflareGateway(args[i + 1], args[i + 2]);
+    const cfProvider = args[i + 3] && !args[i + 3].startsWith("-") ? args[i + 3] : undefined;
+    configureCloudflareGateway(args[i + 1], args[i + 2], cfProvider);
     process.exit(0);
   } else if (arg.startsWith("-")) {
     console.error(`Error: unknown or incomplete option "${arg}".`);
@@ -228,6 +260,16 @@ if (doInit) {
 if (doCleanup) {
   await cleanupRepo(repoDir, skipConfirm);
   process.exit(0);
+}
+
+if (doSafetyCheck) {
+  const cfg = loadRepoConfig(repoDir);
+  const res = scanWorktreeSafety(repoDir, {
+    baseBranch: cfg.baseBranch,
+    allowlist: cfg.safetyAllowlist,
+  });
+  console.log(formatSafetyFindings(res.findings));
+  process.exit(res.ok ? 0 : 1);
 }
 
 if (doDream) {
@@ -251,5 +293,5 @@ if (!task) {
   process.exit(1);
 }
 
-await runPipeline({ repoDir, task, openPr, skipTests, skipReview, provider, model, serverUrl });
+await runPipeline({ repoDir, worktreeDir, task, openPr, draft, skipTests, skipReview, provider, model, serverUrl });
 }

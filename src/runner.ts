@@ -68,17 +68,29 @@ interface ClaudeJsonResult {
 export function normalizeProvider(raw?: string): ProviderName {
   if (!raw) return "opencode";
   const value = raw.trim().toLowerCase();
-  if (value === "opencode" || value === "openrouter" || value === "cloudflare") {
+  if (
+    value === "opencode" ||
+    value === "openrouter" ||
+    value === "cloudflare" ||
+    value === "deepseek" ||
+    value === "parasail" ||
+    value === "telnyx"
+  ) {
     return "opencode";
   }
   if (value === "claude-code") {
     return "claude-code";
   }
-  throw new Error(`Unknown provider "${raw}". Supported providers: opencode (default, openrouter/cloudflare), claude-code.`);
+  throw new Error(
+    `Unknown provider "${raw}". Supported providers: opencode (default, deepseek/parasail/telnyx/openrouter/cloudflare), claude-code.`
+  );
 }
 
 /** Parses an optional `--model` string into OpenCode's `{ providerID, modelID }` shape. */
-export function parseOpencodeModel(model?: string): { providerID: string; modelID: string } | undefined {
+export function parseOpencodeModel(
+  model?: string,
+  defaultProvider = "deepseek"
+): { providerID: string; modelID: string } | undefined {
   if (!model) return undefined;
   const slash = model.indexOf("/");
   if (slash > 0) {
@@ -87,7 +99,7 @@ export function parseOpencodeModel(model?: string): { providerID: string; modelI
       modelID: model.slice(slash + 1),
     };
   }
-  return { providerID: "openrouter", modelID: model };
+  return { providerID: defaultProvider, modelID: model };
 }
 
 function extractOpencodeText(data: PromptResponseData | undefined): string {
@@ -257,7 +269,9 @@ export function createOpencodeClientRunner(opts: {
   model?: string;
   onClose?: () => void;
 }): PipelineRunner {
-  const cliModel = parseOpencodeModel(opts.model);
+  const defaultProvider =
+    opts.config.defaultProvider ?? opts.config.implementerModel?.providerID ?? "deepseek";
+  const cliModel = parseOpencodeModel(opts.model, defaultProvider);
 
   const modelForRole = (role: AgentRole) => {
     if (cliModel) return cliModel;
@@ -339,6 +353,77 @@ export async function collectRecentTranscripts(
   return sections.join("\n\n").slice(0, 24000);
 }
 
+const CF_NATIVE_GATEWAY_PROVIDERS = new Set([
+  "deepseek",
+  "openrouter",
+  "openai",
+  "anthropic",
+  "groq",
+  "mistral",
+  "perplexity-ai",
+  "google-ai-studio",
+  "workers-ai",
+]);
+
+const CF_BARE_GATEWAY_RE = /^https:\/\/gateway\.ai\.cloudflare\.com\/v1\/[^/]+\/[^/]+$/i;
+
+/** Builds OpenCode `config.provider` entries from `.ai-ship.json` and optional Cloudflare AI Gateway URL. */
+export function buildOpencodeProviderConfig(
+  config: RepoConfig,
+  cfGatewayUrl?: string
+): Record<string, Record<string, unknown>> | undefined {
+  const providers: Record<string, Record<string, unknown>> = {};
+  for (const [id, pCfg] of Object.entries(config.providers ?? {})) {
+    const options = {
+      ...(pCfg.baseURL ? { baseURL: pCfg.baseURL } : {}),
+      ...(pCfg.options ?? {}),
+    };
+    providers[id] = {
+      ...(pCfg.npm ? { npm: pCfg.npm } : {}),
+      ...(pCfg.name ? { name: pCfg.name } : {}),
+      ...(Object.keys(options).length > 0 ? { options } : {}),
+      ...(pCfg.models ? { models: pCfg.models } : {}),
+    };
+  }
+
+  if (cfGatewayUrl) {
+    const trimmed = cfGatewayUrl.replace(/\/+$/, "");
+    if (CF_BARE_GATEWAY_RE.test(trimmed)) {
+      for (const id of Object.keys(providers)) {
+        if (!CF_NATIVE_GATEWAY_PROVIDERS.has(id)) continue;
+        const existingOpts = (providers[id].options as Record<string, unknown> | undefined) ?? {};
+        providers[id].options = {
+          ...existingOpts,
+          baseURL: `${trimmed}/${id}`,
+        };
+      }
+    } else {
+      const targetProvider =
+        trimmed.split("/").pop()?.toLowerCase() === "compat"
+          ? undefined
+          : trimmed.split("/").pop()?.toLowerCase();
+      if (targetProvider && CF_NATIVE_GATEWAY_PROVIDERS.has(targetProvider)) {
+        const prev = providers[targetProvider] ?? {};
+        const existingOpts = (prev.options as Record<string, unknown> | undefined) ?? {};
+        providers[targetProvider] = {
+          ...prev,
+          options: { ...existingOpts, baseURL: trimmed },
+        };
+      } else {
+        const fallbackId = config.defaultProvider ?? config.implementerModel?.providerID ?? "deepseek";
+        const prev = providers[fallbackId] ?? {};
+        const existingOpts = (prev.options as Record<string, unknown> | undefined) ?? {};
+        providers[fallbackId] = {
+          ...prev,
+          options: { ...existingOpts, baseURL: trimmed },
+        };
+      }
+    }
+  }
+
+  return Object.keys(providers).length > 0 ? providers : undefined;
+}
+
 async function createOpencodeRunner(opts: {
   worktreeDir: string;
   config: RepoConfig;
@@ -356,21 +441,10 @@ async function createOpencodeRunner(opts: {
     });
   }
 
+  const providerConfig = buildOpencodeProviderConfig(opts.config, opts.cfGatewayUrl);
   const { client, server } = await createOpencode({
     port: 0,
-    ...(opts.cfGatewayUrl
-      ? {
-          config: {
-            provider: {
-              openrouter: {
-                options: {
-                  baseURL: opts.cfGatewayUrl,
-                },
-              },
-            },
-          },
-        }
-      : {}),
+    ...(providerConfig ? { config: { provider: providerConfig as never } } : {}),
   });
 
   return createOpencodeClientRunner({

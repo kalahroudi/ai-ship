@@ -78,6 +78,8 @@ test("createAiShipPlugin registers commands, injects memory, and executes memory
     assert.ok(cfg.command.dream);
     assert.ok(cfg.command.remember);
     assert.ok(cfg.command.cleanup);
+    assert.ok(cfg.command.pr);
+    assert.ok(hooks.tool.open_pr);
 
     const cmdOut = { parts: [] as Array<{ type: string; text?: string }> };
     await hooks["command.execute.before"](

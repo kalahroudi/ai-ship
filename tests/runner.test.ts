@@ -2,32 +2,45 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   buildClaudeArgs,
+  buildOpencodeProviderConfig,
   DEFAULT_CLAUDE_MODEL,
   normalizeProvider,
   parseClaudeJsonOutput,
   parseOpencodeModel,
   parseOpencodePromptResponse,
 } from "../src/runner.ts";
+import { DEFAULT_PROVIDERS, type RepoConfig } from "../src/config.ts";
 import { resolveCloudflareGatewayUrl } from "../src/pipeline.ts";
 
-test("normalizeProvider defaults to opencode and accepts aliases", () => {
+test("normalizeProvider defaults to opencode and accepts provider aliases", () => {
   assert.equal(normalizeProvider(undefined), "opencode");
   assert.equal(normalizeProvider("opencode"), "opencode");
+  assert.equal(normalizeProvider("deepseek"), "opencode");
+  assert.equal(normalizeProvider("parasail"), "opencode");
+  assert.equal(normalizeProvider("telnyx"), "opencode");
   assert.equal(normalizeProvider("openrouter"), "opencode");
   assert.equal(normalizeProvider("cloudflare"), "opencode");
   assert.equal(normalizeProvider("claude-code"), "claude-code");
   assert.throws(() => normalizeProvider("unknown-provider"), /Unknown provider/);
 });
 
-test("parseOpencodeModel splits provider/model or defaults to openrouter", () => {
+test("parseOpencodeModel splits provider/model and uses configurable default provider", () => {
   assert.equal(parseOpencodeModel(undefined), undefined);
   assert.deepEqual(parseOpencodeModel("anthropic/claude-sonnet-4.5"), {
     providerID: "anthropic",
     modelID: "claude-sonnet-4.5",
   });
-  assert.deepEqual(parseOpencodeModel("sonnet-5-5"), {
-    providerID: "openrouter",
-    modelID: "sonnet-5-5",
+  assert.deepEqual(parseOpencodeModel("parasail/Qwen/Qwen2.5-Coder-32B-Instruct"), {
+    providerID: "parasail",
+    modelID: "Qwen/Qwen2.5-Coder-32B-Instruct",
+  });
+  assert.deepEqual(parseOpencodeModel("deepseek-chat"), {
+    providerID: "deepseek",
+    modelID: "deepseek-chat",
+  });
+  assert.deepEqual(parseOpencodeModel("my-model", "parasail"), {
+    providerID: "parasail",
+    modelID: "my-model",
   });
 });
 
@@ -129,17 +142,39 @@ test("parseOpencodePromptResponse throws on transport error, assistant error, or
   );
 });
 
-test("resolveCloudflareGatewayUrl uses gateway.ai.cloudflare.com", () => {
+test("resolveCloudflareGatewayUrl supports bare gateway URLs and per-provider suffixes", () => {
   const prevUrl = process.env.CF_AI_GATEWAY_URL;
   const prevAcct = process.env.CF_ACCOUNT_ID;
   const prevGw = process.env.CF_GATEWAY_ID;
+  const prevProv = process.env.CF_GATEWAY_PROVIDER;
   try {
     delete process.env.CF_AI_GATEWAY_URL;
+    delete process.env.CF_GATEWAY_PROVIDER;
     process.env.CF_ACCOUNT_ID = "acct123";
     process.env.CF_GATEWAY_ID = "gw456";
     assert.equal(
       resolveCloudflareGatewayUrl(),
-      "https://gateway.ai.cloudflare.com/v1/acct123/gw456/openrouter"
+      "https://gateway.ai.cloudflare.com/v1/acct123/gw456"
+    );
+    assert.equal(
+      resolveCloudflareGatewayUrl("deepseek"),
+      "https://gateway.ai.cloudflare.com/v1/acct123/gw456/deepseek"
+    );
+
+    process.env.CF_GATEWAY_PROVIDER = "compat";
+    assert.equal(
+      resolveCloudflareGatewayUrl(),
+      "https://gateway.ai.cloudflare.com/v1/acct123/gw456/compat"
+    );
+
+    process.env.CF_AI_GATEWAY_URL = "https://gateway.ai.cloudflare.com/v1/acct123/gw456/";
+    assert.equal(
+      resolveCloudflareGatewayUrl(),
+      "https://gateway.ai.cloudflare.com/v1/acct123/gw456"
+    );
+    assert.equal(
+      resolveCloudflareGatewayUrl("deepseek"),
+      "https://gateway.ai.cloudflare.com/v1/acct123/gw456/deepseek"
     );
   } finally {
     if (prevUrl === undefined) delete process.env.CF_AI_GATEWAY_URL;
@@ -148,5 +183,38 @@ test("resolveCloudflareGatewayUrl uses gateway.ai.cloudflare.com", () => {
     else process.env.CF_ACCOUNT_ID = prevAcct;
     if (prevGw === undefined) delete process.env.CF_GATEWAY_ID;
     else process.env.CF_GATEWAY_ID = prevGw;
+    if (prevProv === undefined) delete process.env.CF_GATEWAY_PROVIDER;
+    else process.env.CF_GATEWAY_PROVIDER = prevProv;
   }
+});
+
+test("buildOpencodeProviderConfig configures DeepSeek Direct, Parasail.io, and Cloudflare gateway routing", () => {
+  const baseCfg: RepoConfig = {
+    baseBranch: "main",
+    verify: [],
+    testCommand: null,
+    providers: DEFAULT_PROVIDERS,
+    defaultProvider: "deepseek",
+    maxFixRetries: 3,
+    maxReviewRounds: 2,
+    securityScan: true,
+    safetyCheck: true,
+  };
+
+  const direct = buildOpencodeProviderConfig(baseCfg);
+  assert.equal((direct?.deepseek?.options as Record<string, unknown>)?.baseURL, "https://api.deepseek.com/v1");
+  assert.equal((direct?.parasail?.options as Record<string, unknown>)?.baseURL, "https://api.parasail.io/v1");
+
+  const viaBareCf = buildOpencodeProviderConfig(
+    baseCfg,
+    "https://gateway.ai.cloudflare.com/v1/acct123/gw456"
+  );
+  assert.equal(
+    (viaBareCf?.deepseek?.options as Record<string, unknown>)?.baseURL,
+    "https://gateway.ai.cloudflare.com/v1/acct123/gw456/deepseek"
+  );
+  assert.equal(
+    (viaBareCf?.parasail?.options as Record<string, unknown>)?.baseURL,
+    "https://api.parasail.io/v1"
+  );
 });

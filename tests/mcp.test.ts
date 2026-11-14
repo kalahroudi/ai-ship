@@ -3,7 +3,13 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { handleMcpRequest, MCP_TOOLS, type McpToolDeps } from "../src/mcp.ts";
+import {
+  handleMcpRequest,
+  hasOpencodeProviderAuth,
+  MCP_TOOLS,
+  resolveMcpProvider,
+  type McpToolDeps,
+} from "../src/mcp.ts";
 import { buildPrBody } from "../src/pipeline.ts";
 
 test("handleMcpRequest handles initialize, notifications, ping, and tools/list", async () => {
@@ -26,6 +32,7 @@ test("handleMcpRequest handles initialize, notifications, ping, and tools/list",
   const listResp = await handleMcpRequest({ jsonrpc: "2.0", id: 3, method: "tools/list" });
   assert.equal(listResp?.result.tools.length, MCP_TOOLS.length);
   assert.ok(listResp?.result.tools.some((t: any) => t.name === "ship_task"));
+  assert.ok(listResp?.result.tools.some((t: any) => t.name === "open_pr"));
 });
 
 test("handleMcpRequest executes ship_task with inline flags, noty resolution, and progress notifications", async () => {
@@ -160,4 +167,96 @@ test("buildPrBody includes task summary, implementation notes, diff stat, verify
   assert.match(body, /pnpm verify/);
   assert.match(body, /Independent adversarial tests \(Stage 2\)/);
   assert.match(body, /\*\*Security:\*\* CLEAN/);
+});
+
+test("resolveMcpProvider keeps opencode when non-OpenRouter providers are configured", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ai-ship-mcp-auth-"));
+  const missingAuth = path.join(dir, "missing-auth.json");
+  const missingCfg = path.join(dir, "missing-opencode.json");
+
+  try {
+    // 1. No env, no files, claude CLI available -> falls back to claude-code
+    assert.equal(
+      hasOpencodeProviderAuth({ authPath: missingAuth, opencodeConfigPath: missingCfg, env: {} }),
+      false
+    );
+    assert.equal(
+      resolveMcpProvider(undefined, {
+        authPath: missingAuth,
+        opencodeConfigPath: missingCfg,
+        env: {},
+        hasClaude: () => true,
+      }),
+      "claude-code"
+    );
+
+    // 2. DEEPSEEK_API_KEY or PARASAIL_API_KEY in env -> stays on opencode
+    assert.equal(
+      resolveMcpProvider(undefined, {
+        authPath: missingAuth,
+        opencodeConfigPath: missingCfg,
+        env: { DEEPSEEK_API_KEY: "sk-ds-test" },
+        hasClaude: () => true,
+      }),
+      "opencode"
+    );
+    assert.equal(
+      resolveMcpProvider(undefined, {
+        authPath: missingAuth,
+        opencodeConfigPath: missingCfg,
+        env: { PARASAIL_API_KEY: "sk-ps-test" },
+        hasClaude: () => true,
+      }),
+      "opencode"
+    );
+
+    // 3. Non-OpenRouter entry in auth.json -> stays on opencode
+    const authPath = path.join(dir, "auth.json");
+    fs.writeFileSync(authPath, JSON.stringify({ deepseek: { type: "api", key: "test" } }));
+    assert.equal(
+      resolveMcpProvider(undefined, {
+        authPath,
+        opencodeConfigPath: missingCfg,
+        env: {},
+        hasClaude: () => true,
+      }),
+      "opencode"
+    );
+
+    // 4. Provider configured in opencode.json -> stays on opencode
+    const opencodeConfigPath = path.join(dir, "opencode.json");
+    fs.writeFileSync(
+      opencodeConfigPath,
+      JSON.stringify({ provider: { parasail: { options: { baseURL: "https://api.parasail.io/v1" } } } })
+    );
+    assert.equal(
+      resolveMcpProvider(undefined, {
+        authPath: missingAuth,
+        opencodeConfigPath,
+        env: {},
+        hasClaude: () => true,
+      }),
+      "opencode"
+    );
+
+    // 5. Provider configured in repo .ai-ship.json -> stays on opencode
+    const repoDir = path.join(dir, "repo");
+    fs.mkdirSync(repoDir);
+    fs.writeFileSync(
+      path.join(repoDir, ".ai-ship.json"),
+      JSON.stringify({ providers: { deepseek: { baseURL: "https://api.deepseek.com/v1" } } })
+    );
+    assert.equal(
+      resolveMcpProvider(undefined, {
+        repoDir,
+        authPath: missingAuth,
+        opencodeConfigPath: missingCfg,
+        env: {},
+        hasClaude: () => true,
+      }),
+      "opencode"
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

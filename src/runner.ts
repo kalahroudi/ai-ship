@@ -17,9 +17,17 @@ export interface FallbackActivation {
   reason: string;
 }
 
+export interface PromptUsage {
+  input: number;
+  output: number;
+  cacheRead: number;
+  costUsd: number;
+}
+
 export interface PromptResult {
   text: string;
   usageSummary: string;
+  usage?: PromptUsage;
   fallback?: FallbackActivation;
 }
 
@@ -154,6 +162,36 @@ export function parseOpencodePromptResponse(
   return {
     text: extractOpencodeText(res.data),
     usageSummary: formatOpencodeUsage(res.data),
+    usage: extractOpencodeUsage(res.data),
+  };
+}
+
+function extractOpencodeUsage(data: PromptResponseData | undefined): PromptUsage | undefined {
+  const t = data?.info?.tokens;
+  const cost = data?.info?.cost;
+  if (!t && typeof cost !== "number") return undefined;
+  return {
+    input: t?.input ?? 0,
+    output: t?.output ?? 0,
+    cacheRead: t?.cache?.read ?? 0,
+    costUsd: typeof cost === "number" ? cost : 0,
+  };
+}
+
+/** Parses a formatted `in=... out=... cache_read=... | $...` usage summary string into structured counts. */
+export function parseUsageSummary(summary: string): PromptUsage | undefined {
+  const inMatch = summary.match(/\bin=(\d+)\b/);
+  const outMatch = summary.match(/\bout=(\d+)\b/);
+  const cacheMatch = summary.match(/\bcache_read=(\d+)\b/);
+  const costMatch = summary.match(/\$(\d+(?:\.\d+)?)/);
+  if (!inMatch && !outMatch && !cacheMatch && !costMatch) {
+    return undefined;
+  }
+  return {
+    input: inMatch ? Number(inMatch[1]) : 0,
+    output: outMatch ? Number(outMatch[1]) : 0,
+    cacheRead: cacheMatch ? Number(cacheMatch[1]) : 0,
+    costUsd: costMatch ? Number(costMatch[1]) : 0,
   };
 }
 
@@ -194,6 +232,7 @@ export function parseClaudeJsonOutput(stdout: string): {
   text: string;
   sessionId?: string;
   usageSummary: string;
+  usage?: PromptUsage;
 } {
   const trimmed = stdout.trim();
   if (!trimmed) {
@@ -224,10 +263,21 @@ export function parseClaudeJsonOutput(stdout: string): {
     ? `in=${u.input_tokens ?? 0} out=${u.output_tokens ?? 0} cache_read=${u.cache_read_input_tokens ?? 0}${costStr}`
     : `completed${costStr}`;
 
+  const usage: PromptUsage | undefined =
+    u || typeof item.total_cost_usd === "number"
+      ? {
+          input: u?.input_tokens ?? 0,
+          output: u?.output_tokens ?? 0,
+          cacheRead: u?.cache_read_input_tokens ?? 0,
+          costUsd: typeof item.total_cost_usd === "number" ? item.total_cost_usd : 0,
+        }
+      : undefined;
+
   return {
     text,
     sessionId: item.session_id,
     usageSummary,
+    usage,
   };
 }
 
@@ -693,6 +743,7 @@ function createClaudeCodeRunner(opts: {
           return {
             text: parsed.text,
             usageSummary: parsed.usageSummary,
+            usage: parsed.usage,
           };
         },
       });

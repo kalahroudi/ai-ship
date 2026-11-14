@@ -23,9 +23,11 @@ import {
   createOpencodeClientRunner,
   createRunner,
   DEFAULT_CLAUDE_MODEL,
+  parseUsageSummary,
   type OpencodeClient,
   type PipelineRunner,
   type PromptResult,
+  type PromptUsage,
   type ProviderName,
 } from "./runner.ts";
 
@@ -57,6 +59,162 @@ export interface PipelineResult {
   reviewVerdicts: Array<{ lens: string; verdict: "CLEAN" | "OPEN" }>;
   prUrl?: string;
   usageLog: string[];
+  stageUsage?: StageUsageSummary[];
+  totalUsage?: UsageTotals;
+}
+
+export interface UsageTotals {
+  input: number;
+  output: number;
+  cacheRead: number;
+  totalTokens: number;
+  costUsd: number;
+}
+
+export interface StageUsageSummary extends UsageTotals {
+  stage: string;
+  calls: number;
+}
+
+export class BudgetExceededError extends Error {
+  readonly totals: UsageTotals;
+  readonly stageBreakdown: StageUsageSummary[];
+  readonly nextStage: string;
+
+  constructor(
+    message: string,
+    details: {
+      totals: UsageTotals;
+      stageBreakdown: StageUsageSummary[];
+      nextStage: string;
+    }
+  ) {
+    super(message);
+    this.name = "BudgetExceededError";
+    this.totals = details.totals;
+    this.stageBreakdown = details.stageBreakdown;
+    this.nextStage = details.nextStage;
+  }
+}
+
+/** Tracks per-stage and per-task token/USD usage and trips when configured thresholds are reached. */
+export class BudgetTracker {
+  private readonly maxTaskCostUsd?: number;
+  private readonly maxTaskTokens?: number;
+  private readonly totals: UsageTotals = {
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    totalTokens: 0,
+    costUsd: 0,
+  };
+  private readonly stages = new Map<string, StageUsageSummary>();
+
+  constructor(limits: { maxTaskCostUsd?: number; maxTaskTokens?: number }) {
+    this.maxTaskCostUsd =
+      typeof limits.maxTaskCostUsd === "number" && limits.maxTaskCostUsd > 0
+        ? limits.maxTaskCostUsd
+        : undefined;
+    this.maxTaskTokens =
+      typeof limits.maxTaskTokens === "number" && limits.maxTaskTokens > 0
+        ? limits.maxTaskTokens
+        : undefined;
+  }
+
+  record(stage: string, res: PromptResult): void {
+    const u: PromptUsage = res.usage ??
+      parseUsageSummary(res.usageSummary) ?? {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        costUsd: 0,
+      };
+    const tokens = u.input + u.output + u.cacheRead;
+
+    this.totals.input += u.input;
+    this.totals.output += u.output;
+    this.totals.cacheRead += u.cacheRead;
+    this.totals.totalTokens += tokens;
+    this.totals.costUsd += u.costUsd;
+
+    const existing = this.stages.get(stage);
+    if (existing) {
+      existing.input += u.input;
+      existing.output += u.output;
+      existing.cacheRead += u.cacheRead;
+      existing.totalTokens += tokens;
+      existing.costUsd += u.costUsd;
+      existing.calls += 1;
+    } else {
+      this.stages.set(stage, {
+        stage,
+        input: u.input,
+        output: u.output,
+        cacheRead: u.cacheRead,
+        totalTokens: tokens,
+        costUsd: u.costUsd,
+        calls: 1,
+      });
+    }
+  }
+
+  assertWithinBudget(nextStage: string): void {
+    const costExceeded =
+      this.maxTaskCostUsd !== undefined && this.totals.costUsd >= this.maxTaskCostUsd;
+    const tokensExceeded =
+      this.maxTaskTokens !== undefined && this.totals.totalTokens >= this.maxTaskTokens;
+    if (!costExceeded && !tokensExceeded) return;
+
+    const reasons: string[] = [];
+    if (costExceeded && this.maxTaskCostUsd !== undefined) {
+      reasons.push(
+        `task cost $${this.totals.costUsd.toFixed(4)} >= maxTaskCostUsd $${this.maxTaskCostUsd.toFixed(4)}`
+      );
+    }
+    if (tokensExceeded && this.maxTaskTokens !== undefined) {
+      reasons.push(`task tokens ${this.totals.totalTokens} >= maxTaskTokens ${this.maxTaskTokens}`);
+    }
+
+    const stageBreakdown = this.getStageSummaries();
+    const breakdownLines = stageBreakdown.map(
+      (s) =>
+        `  - ${s.stage}: $${s.costUsd.toFixed(4)} (in=${s.input} out=${s.output} cache_read=${s.cacheRead} total=${s.totalTokens}, calls=${s.calls})`
+    );
+    const message = [
+      `Budget exceeded before "${nextStage}": ${reasons.join(" and ")}.`,
+      ...(breakdownLines.length ? ["Per-stage totals:", ...breakdownLines] : []),
+    ].join("\n");
+
+    throw new BudgetExceededError(message, {
+      totals: this.getTotals(),
+      stageBreakdown,
+      nextStage,
+    });
+  }
+
+  getTotals(): UsageTotals {
+    return { ...this.totals };
+  }
+
+  getStageSummaries(): StageUsageSummary[] {
+    return Array.from(this.stages.values()).map((s) => ({ ...s }));
+  }
+
+  formatSummaryLines(): string[] {
+    const stages = this.getStageSummaries();
+    if (stages.length === 0) return [];
+    const lines = ["  [Stage Totals]"];
+    for (const s of stages) {
+      const callLabel = s.calls === 1 ? "1 call" : `${s.calls} calls`;
+      lines.push(
+        `    ${s.stage}: in=${s.input} out=${s.output} cache_read=${s.cacheRead} total=${s.totalTokens} | $${s.costUsd.toFixed(4)} (${callLabel})`
+      );
+    }
+    lines.push(
+      `  [Task Total] in=${this.totals.input} out=${this.totals.output} cache_read=${this.totals.cacheRead} total=${this.totals.totalTokens} | $${this.totals.costUsd.toFixed(4)}`
+    );
+    return lines;
+  }
 }
 
 function truncateCleanly(text: string, maxChars: number): string {
@@ -117,13 +275,20 @@ function formatUsage(label: string, summary: string): string {
   return `  [${label}] ${summary}`;
 }
 
-function recordUsage(usageLog: string[], label: string, res: PromptResult): void {
+function recordUsage(
+  usageLog: string[],
+  label: string,
+  res: PromptResult,
+  budget?: BudgetTracker,
+  stageKey?: string
+): void {
   usageLog.push(formatUsage(label, res.usageSummary));
   if (res.fallback) {
     const line = `  [${label} Fallback] ${res.fallback.from} -> ${res.fallback.to} (${res.fallback.reason})`;
     console.log(line);
     usageLog.push(line);
   }
+  budget?.record(stageKey ?? label, res);
 }
 
 export interface ReviewLens {
@@ -152,6 +317,7 @@ export async function runReviewLenses(opts: {
   config: RepoConfig;
   runner: PipelineRunner;
   usageLog: string[];
+  budget?: BudgetTracker;
   sleep?: (ms: number) => Promise<void>;
 }): Promise<Array<{ lens: string; text: string; verdict: "CLEAN" | "OPEN" }>> {
   const staggerMs = Math.max(0, opts.config.reviewStaggerMs ?? 250);
@@ -187,6 +353,7 @@ export async function runReviewLenses(opts: {
     while (nextIdx < launchPlan.length) {
       const idx = nextIdx++;
       const item = launchPlan[idx];
+      opts.budget?.assertWithinBudget(`Stage 4: ${item.lens.name} Lens`);
       if (item.delayMs > 0) {
         await sleepFn(item.delayMs);
       }
@@ -203,7 +370,7 @@ export async function runReviewLenses(opts: {
         ].join("\n"),
         item.modelOverride ? { modelOverride: item.modelOverride } : undefined
       );
-      recordUsage(opts.usageLog, `Stage 4: ${item.lens.name} Lens`, r);
+      recordUsage(opts.usageLog, `Stage 4: ${item.lens.name} Lens`, r, opts.budget, "Stage 4: Review");
       results[idx] = { lens: item.lens.name, text: r.text, verdict: parseVerdict(r.text) };
     }
   };
@@ -318,6 +485,10 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
         serverUrl: opts.serverUrl,
       });
   const usageLog: string[] = [];
+  const budget = new BudgetTracker({
+    maxTaskCostUsd: config.maxTaskCostUsd,
+    maxTaskTokens: config.maxTaskTokens,
+  });
   let reviewVerdicts: Array<{ lens: string; verdict: "CLEAN" | "OPEN" }> = [];
   let prUrl: string | undefined;
 
@@ -343,7 +514,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
         "- Run relevant local checks before finishing.",
       ].join("\n")
     );
-    recordUsage(usageLog, "Stage 1: Implement", implRes);
+    recordUsage(usageLog, "Stage 1: Implement", implRes, budget, "Stage 1: Implement");
 
     // -------------------------------------------------------------------------
     // Stage 2: Independent Adversarial Test Session (Separate Session & Model)
@@ -353,6 +524,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
       console.log("\n[Stage 2/4] Independent adversarial test generation (separate session)...");
       const diff = getDiff(worktree.worktreeDir, worktree.baseBranch);
       if (diff.trim()) {
+        budget.assertWithinBudget("Stage 2: Adversarial Tests");
         const testSessionId = await runner.createSession(`Adversarial Tests: ${opts.task.slice(0, 50)}`);
 
         const testRes = await runner.prompt(
@@ -375,7 +547,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
             "```",
           ].join("\n")
         );
-        recordUsage(usageLog, "Stage 2: Adversarial Tests", testRes);
+        recordUsage(usageLog, "Stage 2: Adversarial Tests", testRes, budget, "Stage 2: Adversarial Tests");
       }
     }
 
@@ -396,6 +568,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
         throw new Error(`Deterministic verify failed after ${config.maxFixRetries} fix attempts:\n${verify.output}${agentNote}`);
       }
       console.log(`  -> Verify failed (${verify.failedCommand}). Sending failure back to implementer (attempt ${attempt}/${config.maxFixRetries})...`);
+      budget.assertWithinBudget(`Stage 3: Fix #${attempt}`);
       const fixRes = await runner.prompt(
         implSessionId,
         "implementer",
@@ -410,7 +583,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
         ].join("\n")
       );
       lastAgentText = fixRes.text;
-      recordUsage(usageLog, `Stage 3: Fix #${attempt}`, fixRes);
+      recordUsage(usageLog, `Stage 3: Fix #${attempt}`, fixRes, budget, "Stage 3: Fix");
     }
 
     // -------------------------------------------------------------------------
@@ -448,11 +621,13 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
         );
 
         opts.onProgress?.(`Stage 4/4: Parallel 3-lens review (round ${round}/${config.maxReviewRounds})`);
+        budget.assertWithinBudget(`Stage 4: Review (round ${round})`);
         const reviews = await runReviewLenses({
           lenses,
           config,
           runner,
           usageLog,
+          budget,
         });
 
         fs.rmSync(sharedContextPath, { force: true });
@@ -482,12 +657,13 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
 
         opts.onProgress?.(`Stage 4/4: Addressing review findings (round ${round})`);
         console.log("  -> Sending OPEN findings back to implementer...");
+        budget.assertWithinBudget(`Stage 4: Review Fix #${round}`);
         const fixReviewRes = await runner.prompt(
           implSessionId,
           "implementer",
           `Address these review findings, then re-run local checks:\n\n${findingsText}`
         );
-        recordUsage(usageLog, `Stage 4: Review Fix #${round}`, fixReviewRes);
+        recordUsage(usageLog, `Stage 4: Review Fix #${round}`, fixReviewRes, budget, "Stage 4: Review");
 
         const reverify = await runDeterministicVerify(worktree.worktreeDir, config);
         if (!reverify.ok) {
@@ -519,6 +695,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
         console.log(
           `  -> Rebase onto ${rebase.targetRef} hit conflicts in: ${rebase.conflictedFiles.join(", ")}. Asking implementer to resolve...`
         );
+        budget.assertWithinBudget("Pre-PR Rebase");
         const resolveRes = await runner.prompt(
           implSessionId,
           "implementer",
@@ -531,7 +708,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
             "- Stage resolved files with `git add` and complete the rebase with `GIT_EDITOR=true git rebase --continue`.",
           ].join("\n")
         );
-        recordUsage(usageLog, "Pre-PR Rebase", resolveRes);
+        recordUsage(usageLog, "Pre-PR Rebase", resolveRes, budget, "Pre-PR Rebase");
 
         if (isRebaseInProgress(worktree.worktreeDir)) {
           abortRebase(worktree.worktreeDir);
@@ -563,6 +740,14 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
     }
 
     const diffStat = getDiffStat(worktree.worktreeDir, worktree.baseBranch);
+    const stageUsage = budget.getStageSummaries();
+    const totalUsage = budget.getTotals();
+    const summaryLines = budget.formatSummaryLines();
+    if (summaryLines.length) {
+      usageLog.push(...summaryLines);
+      console.log("\n[ai-ship] Per-Stage & Task Totals:");
+      for (const line of summaryLines) console.log(line);
+    }
 
     return {
       repoDir,
@@ -577,6 +762,8 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
       reviewVerdicts,
       prUrl,
       usageLog,
+      stageUsage,
+      totalUsage,
     };
   } finally {
     runner.close();

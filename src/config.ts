@@ -39,6 +39,8 @@ export interface RepoConfig {
   defaultProvider?: string;
   maxFixRetries: number;
   maxReviewRounds: number;
+  maxTaskCostUsd?: number;
+  maxTaskTokens?: number;
   securityScan: boolean;
   safetyCheck: boolean;
   safetyAllowlist?: string[];
@@ -74,6 +76,8 @@ const DEFAULT_CONFIG: RepoConfig = {
   defaultProvider: "deepseek",
   maxFixRetries: 3,
   maxReviewRounds: 2,
+  maxTaskCostUsd: 5,
+  maxTaskTokens: 2_000_000,
   securityScan: true,
   safetyCheck: true,
 };
@@ -200,6 +204,13 @@ export function loadRepoConfig(repoDir: string): RepoConfig {
 
   const securityScan = userConfig.securityScan ?? DEFAULT_CONFIG.securityScan;
   const safetyCheck = userConfig.safetyCheck ?? DEFAULT_CONFIG.safetyCheck;
+  const resolveBudgetLimit = (override: number | null | undefined, fallback: number | undefined): number | undefined => {
+    if (override === null) return undefined;
+    if (typeof override === "number") return override > 0 ? override : undefined;
+    return fallback;
+  };
+  const maxTaskCostUsd = resolveBudgetLimit(userConfig.maxTaskCostUsd, DEFAULT_CONFIG.maxTaskCostUsd);
+  const maxTaskTokens = resolveBudgetLimit(userConfig.maxTaskTokens, DEFAULT_CONFIG.maxTaskTokens);
   if (securityScan && hasCommand("semgrep") && !verify.some((c) => c.startsWith("semgrep"))) {
     verify.push("semgrep --error --config p/security-audit --quiet .");
   }
@@ -211,6 +222,8 @@ export function loadRepoConfig(repoDir: string): RepoConfig {
     verify,
     testCommand,
     providers: mergeProviders(DEFAULT_PROVIDERS, userConfig.providers),
+    maxTaskCostUsd,
+    maxTaskTokens,
     securityScan,
     safetyCheck,
   };

@@ -188,3 +188,34 @@ test("loadRepoConfig appends pentest script to verify unless verify already incl
 
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+test("loadRepoConfig sets default budget thresholds and supports overrides or disabling", () => {
+  const dir = makeTempRepo();
+  const defaults = loadRepoConfig(dir);
+  assert.equal(defaults.maxTaskCostUsd, 5);
+  assert.equal(defaults.maxTaskTokens, 2_000_000);
+
+  fs.writeFileSync(
+    path.join(dir, ".ai-ship.json"),
+    JSON.stringify({
+      maxTaskCostUsd: 1.25,
+      maxTaskTokens: 250000,
+    })
+  );
+  const custom = loadRepoConfig(dir);
+  assert.equal(custom.maxTaskCostUsd, 1.25);
+  assert.equal(custom.maxTaskTokens, 250000);
+
+  fs.writeFileSync(
+    path.join(dir, ".ai-ship.json"),
+    JSON.stringify({
+      maxTaskCostUsd: null,
+      maxTaskTokens: 0,
+    })
+  );
+  const disabled = loadRepoConfig(dir);
+  assert.equal(disabled.maxTaskCostUsd, undefined);
+  assert.equal(disabled.maxTaskTokens, undefined);
+
+  fs.rmSync(dir, { recursive: true, force: true });
+});

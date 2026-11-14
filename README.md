@@ -46,3 +46,16 @@ For OpenCode Desktop/TUI/Mobile plugin usage, see [plugin/README.md](./plugin/RE
 ## Configuration
 - Global models & zero-friction permissions: `~/.config/opencode/opencode.json`
 - Per-repo verify commands & overrides: `<repo>/.ai-ship.json` (auto-detects `package.json`, `Package.swift`, `Cargo.toml`, `go.mod`, `pyproject.toml`, and `semgrep` when omitted).
+
+### Budget Circuit Breaker
+`ai-ship` tracks `input`, `output`, `cache_read` tokens and USD cost across all stages and retries, and aborts cleanly before launching the next stage/retry if thresholds are reached. Defaults are `maxTaskCostUsd: 5` and `maxTaskTokens: 2000000` (set to `null` or `0` to disable).
+
+Example `.ai-ship.json`:
+```json
+{
+  "maxFixRetries": 3,
+  "maxReviewRounds": 2,
+  "maxTaskCostUsd": 2.5,
+  "maxTaskTokens": 500000
+}
+```

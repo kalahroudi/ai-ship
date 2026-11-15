@@ -5,6 +5,7 @@ import {
   addUsage,
   applyPricing,
   assertNonEmptyReadOnlyReply,
+  classifyProviderError,
   formatUsageSummary,
   isReadOnlyRole,
   resolveRoleModelLabels,
@@ -46,7 +47,7 @@ export function createOc2Runner(opts: {
   let shipId = opts.parentSessionId;
   let shipCreating: Promise<string> | undefined;
   let agentNames: string[] | undefined;
-  const sessions = new Map<string, { title: string; realId?: string; creating?: Promise<string> }>();
+  const sessions = new Map<string, { title: string; realId?: string; creating?: Promise<string>; turns: number }>();
   let nextLocal = 1;
   const emit = opts.onEvent ?? (() => undefined);
   let cancelled = false;
@@ -134,45 +135,36 @@ export function createOc2Runner(opts: {
     if (usage) usage.costSource = anyCost ? "provider" : "unknown";
     const model = [...assistants].reverse().find((m) => m.model)?.model;
     const outcome = after.find((m) => m.type === "idle")?.outcome;
+    const errMsg = after
+      .map((m) => m.error)
+      .filter((e) => e !== undefined && e !== null)
+      .map((e) => (typeof e === "string" ? e : JSON.stringify(e)))
+      .join("; ")
+      .slice(0, 500);
     return {
       text: last ? textOf(last).trim() : "",
       usage,
       model: model ? `${model.providerID}/${model.id}` : undefined,
       outcome,
+      ...(errMsg ? { error: errMsg } : {}),
       assistants,
     };
   };
 
-  return {
-    shipSessionId: () => shipId,
-    isCancelled: () => cancelled,
-    /** Stops the run: interrupts every agent session and makes further prompts fail. */
-    async cancel(): Promise<void> {
-      cancelled = true;
-      const ids = [...sessions.values()].map((s) => s.realId).filter((id): id is string => Boolean(id));
-      await Promise.all(
-        ids.map(async (id) => {
-          try {
-            await opts.api.interrupt?.(id, opts.worktreeDir);
-          } catch {
-            // ignore
-          }
-        })
-      );
-      emit({ ts: Date.now(), kind: "error", agent: "ship", text: `cancelled (${ids.length} agent session(s) interrupted)` });
-    },
-    async createSession(title: string): Promise<string> {
-      const id = `oc2-local-${nextLocal++}`;
-      sessions.set(id, { title });
-      return id;
-    },
-    async prompt(localId: string, role: AgentRole, text: string, promptOpts?: PromptOptions): Promise<PromptResult> {
+  const fallbackFor = (role: AgentRole): Oc2ModelRef | undefined => {
+    const ref =
+      role === "implementer"
+        ? opts.config.implementerFallbackModel
+        : role === "tester"
+          ? opts.config.testerFallbackModel
+          : role === "bughunter"
+            ? opts.config.bughunterFallbackModel
+            : opts.config.reviewerFallbackModel;
+    return ref ? { providerID: ref.providerID, id: ref.id } : undefined;
+  };
+
+  const runTurn = async (sessionID: string, role: AgentRole, title: string, text: string, model?: Oc2ModelRef): Promise<PromptResult> => {
       if (cancelled) throw new Error("ai-ship run was cancelled");
-      const override = promptOpts?.modelOverride;
-      const model = override ? { providerID: override.providerID, id: override.modelID } : toRef(labels[role]);
-      const sessionID = await realSession(localId, role, model);
-      if (cancelled) throw new Error("ai-ship run was cancelled");
-      const title = sessions.get(localId)?.title ?? role;
       const user = await opts.api.prompt(sessionID, text, opts.worktreeDir);
 
       // Stream progress while waiting: report each new tool part once.
@@ -220,7 +212,9 @@ export function createOc2Runner(opts: {
       }
       const res = collect(all, user.id);
       if (res.outcome && res.outcome !== "succeeded") {
-        throw new Error(`OpenCode ${role} session ${sessionID} ended with outcome "${res.outcome}"`);
+        // Include the provider error so 429/5xx failures can be classified as transient.
+        const detail = res.error ? `: ${res.error}` : "";
+        throw new Error(`OpenCode ${role} session ${sessionID} ended with outcome "${res.outcome}"${detail}`);
       }
       const base: PromptResult = {
         text: res.text,
@@ -230,6 +224,62 @@ export function createOc2Runner(opts: {
       const priced = applyPricing(base, res.model ?? (model ? `${model.providerID}/${model.id}` : undefined), pricing);
       emit({ ts: Date.now(), kind: "done", role, sessionId: sessionID, agent: title, text: priced.usageSummary });
       return assertNonEmptyReadOnlyReply(role, priced);
+    };
+
+  return {
+    shipSessionId: () => shipId,
+    isCancelled: () => cancelled,
+    /** Stops the run: interrupts every agent session and makes further prompts fail. */
+    async cancel(): Promise<void> {
+      cancelled = true;
+      const ids = [...sessions.values()].map((s) => s.realId).filter((id): id is string => Boolean(id));
+      await Promise.all(
+        ids.map(async (id) => {
+          try {
+            await opts.api.interrupt?.(id, opts.worktreeDir);
+          } catch {
+            // ignore
+          }
+        })
+      );
+      emit({ ts: Date.now(), kind: "error", agent: "ship", text: `cancelled (${ids.length} agent session(s) interrupted)` });
+    },
+    async createSession(title: string): Promise<string> {
+      const id = `oc2-local-${nextLocal++}`;
+      sessions.set(id, { title, turns: 0 });
+      return id;
+    },
+    async prompt(localId: string, role: AgentRole, text: string, promptOpts?: PromptOptions): Promise<PromptResult> {
+      if (cancelled) throw new Error("ai-ship run was cancelled");
+      const override = promptOpts?.modelOverride;
+      const model = override ? { providerID: override.providerID, id: override.modelID } : toRef(labels[role]);
+      const sessionID = await realSession(localId, role, model);
+      const entry = sessions.get(localId);
+      const title = entry?.title ?? role;
+      const firstTurn = (entry?.turns ?? 0) === 0;
+      if (entry) entry.turns += 1;
+      try {
+        return await runTurn(sessionID, role, title, text, model);
+      } catch (err) {
+        // 2.x sessions have a fixed model, so failover = a fresh child session on the role's fallback model.
+        const info = classifyProviderError(err);
+        const fb = fallbackFor(role);
+        const same = fb && model && fb.providerID === model.providerID && fb.id === model.id;
+        if (cancelled || override || !info.transient || !fb || same || !entry) throw err;
+        const from = model ? `${model.providerID}/${model.id}` : "(default)";
+        const to = `${fb.providerID}/${fb.id}`;
+        emit({ ts: Date.now(), kind: "error", role, sessionId: sessionID, agent: title, text: `${info.reason} on ${from}; failing over to ${to}` });
+        entry.realId = undefined;
+        entry.creating = undefined;
+        entry.title = `${title} (fallback)`;
+        const fbSession = await realSession(localId, role, fb);
+        // The fallback session has no history: point a mid-conversation handover at the current worktree state.
+        const handover = firstTurn
+          ? text
+          : `You are taking over from another agent whose model failed. Inspect the current worktree state (git status / git diff) before acting.\n\n${text}`;
+        const res = await runTurn(fbSession, role, entry.title, handover, fb);
+        return { ...res, fallback: { role, from, to, reason: info.reason } };
+      }
     },
     async compact(localId: string): Promise<boolean> {
       const real = sessions.get(localId)?.realId;

@@ -1,7 +1,7 @@
 /**
  * ai-ship native plugin for OpenCode 2.x (verified against opencode-cli 2.3.0).
  *
- * Install: `ai-ship plugin install` (or copy the built bundle to ~/.config/opencode/plugins/ai-ship.js).
+ * Install: `ai-ship --plugin-install` (or copy the built bundle to ~/.config/opencode/plugins/ai-ship.js).
  * 2.x plugins must default-export `{ id, setup(ctx) }`; the 1.x `Plugin` function format is rejected.
  *
  * Commands run inside the OpenCode server process. `/ship` starts the pipeline in the background and returns
@@ -16,6 +16,8 @@ import { createLazyRunner, createOc2Runner } from "../../src/oc2/runner.ts";
 import { formatPipelineResult, runPipeline } from "../../src/pipeline.ts";
 import { formatProgressEvent, type ProgressEvent } from "../../src/progress.ts";
 import { formatSafetyFindings, scanWorktreeSafety } from "../../src/safety.ts";
+import { formatDoctor, initRepo, isSupportedOpencodeVersion, runDoctor } from "../../src/doctor.ts";
+import path from "node:path";
 
 export interface PluginCommandInput {
   sessionID: string;
@@ -24,6 +26,7 @@ export interface PluginCommandInput {
 
 export interface PluginCtx extends Oc2PluginCtxLike {
   location?: { directory?: string };
+  app?: { name?: string; version?: string };
   command: {
     transform(fn: (reg: { add(cmd: { name: string; description: string; execute: (i: PluginCommandInput) => Promise<string> }): void }) => void): Promise<unknown> | unknown;
   };
@@ -32,12 +35,14 @@ export interface PluginCtx extends Oc2PluginCtxLike {
 export interface ShipJob {
   id: string;
   task: string;
-  status: "running" | "succeeded" | "failed";
+  status: "running" | "succeeded" | "failed" | "cancelled";
+  cancelled?: boolean;
   startedAt: number;
   events: ProgressEvent[];
   result?: string;
   error?: string;
   shipSessionId?: string;
+  cancel?: () => Promise<void>;
 }
 
 const MAX_EVENTS = 200;
@@ -61,6 +66,9 @@ export function createAiShipV2Plugin(deps: {
 
   const setup = async (ctx: PluginCtx) => {
     const repoDir = () => ctx.location?.directory ?? process.cwd();
+    if (ctx.app?.version && !isSupportedOpencodeVersion(ctx.app.version)) {
+      console.warn(`[ai-ship] OpenCode ${ctx.app.version} is outside the supported range (>=2.3 <3); run /ship-doctor.`);
+    }
 
     const ship = async (input: PluginCommandInput): Promise<string> => {
       const parsed = parseCliArgs(splitArgs(input.prompt.text), repoDir());
@@ -105,8 +113,14 @@ export function createAiShipV2Plugin(deps: {
           },
           onEvent,
         });
+        if (job.cancelled) void oc2.cancel();
         return oc2;
       });
+      job.cancel = async () => {
+        // Job-level flag: stops the pipeline between stages (incl. before commit/PR) even when no agent is running.
+        job.cancelled = true;
+        if (oc2) await oc2.cancel();
+      };
 
       // Fire and forget: the command returns immediately; progress lives in the child sessions.
       void run({
@@ -125,6 +139,7 @@ export function createAiShipV2Plugin(deps: {
         runner: lazy.runner,
         onWorktree: lazy.onWorktree,
         onEvent,
+        isCancelled: () => Boolean(job.cancelled),
       })
         .then(async (result) => {
           job.status = "succeeded";
@@ -132,7 +147,7 @@ export function createAiShipV2Plugin(deps: {
           await notify(`ai-ship ${job.id} finished\n\n${job.result}`);
         })
         .catch(async (err: unknown) => {
-          job.status = "failed";
+          job.status = job.cancelled ? "cancelled" : "failed";
           job.error = err instanceof Error ? err.message : String(err);
           await notify(`ai-ship ${job.id} failed: ${job.error.slice(0, 2000)}`);
         })
@@ -170,6 +185,29 @@ export function createAiShipV2Plugin(deps: {
     const commands: Array<{ name: string; description: string; execute: (i: PluginCommandInput) => Promise<string> }> = [
       { name: "ship", description: "Run the ai-ship pipeline (worktree → implement → independent tests → verify → reviews) in the background", execute: ship },
       { name: "ship-status", description: "Show ai-ship job status and recent per-agent progress", execute: status },
+      {
+        name: "ship-cancel",
+        description: "Cancel a running ai-ship job: interrupts its agent sessions and keeps the worktree",
+        execute: async (i) => {
+          const id = i.prompt.text.trim() || [...jobs.values()].reverse().find((j) => j.status === "running")?.id;
+          const job = id ? jobs.get(id) : undefined;
+          if (!job) return "ai-ship: no running job to cancel";
+          if (job.status !== "running") return `ai-ship ${job.id} is already ${job.status}`;
+          await job.cancel?.();
+          return `ai-ship ${job.id}: cancel requested (agent sessions interrupted; the worktree is kept).`;
+        },
+      },
+      {
+        name: "ship-init",
+        description: "Copy starter AGENTS.md and .ai-ship.json into this repo (never overwrites)",
+        execute: async () => initRepo(repoDir(), path.resolve(import.meta.dirname, "..", "..", "templates")).join("\n"),
+      },
+      {
+        name: "ship-doctor",
+        description: "Check the ai-ship native-plugin setup; --fix removes a duplicate ai-ship MCP server (with backup)",
+        execute: async (i) =>
+          formatDoctor(runDoctor({ opencodeVersion: ctx.app?.version, fix: splitArgs(i.prompt.text).includes("--fix") })),
+      },
       {
         name: "remember",
         description: "Save a note to ai-ship repo memory",

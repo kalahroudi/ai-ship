@@ -9,10 +9,12 @@ import { startMcpServer } from "../src/mcp.ts";
 import { parseNotyAddress, resolveNotyTask } from "../src/noty.ts";
 import { runDreamConsolidation, runPipeline } from "../src/pipeline.ts";
 import { normalizeProvider } from "../src/runner.ts";
-import { createRestApi, discoverDesktopService } from "../src/oc2/api.ts";
+import { createRestApi, discoverDesktopService, findDesktopCli } from "../src/oc2/api.ts";
+import { spawnSync } from "node:child_process";
 import { createLazyRunner, createOc2Runner } from "../src/oc2/runner.ts";
 import { formatProgressEvent, throttleSink } from "../src/progress.ts";
 import { formatSafetyFindings, scanWorktreeSafety } from "../src/safety.ts";
+import { formatDoctor, initRepo as initRepoFiles, installPlugin, runDoctor, uninstallPlugin } from "../src/doctor.ts";
 
 function printHelp() {
   console.log(`ai-ship — project-agnostic OpenCode & Claude Code delivery pipeline
@@ -48,6 +50,9 @@ Options:
   --skip-bughunter   Skip Stage 4b adversarial Hunter -> Skeptic -> Referee pass
   --allow-config-change  Let agents change protected verify/config files (.ai-ship.json, package.json scripts, CI, test config)
   --init             Copy starter AGENTS.md and .ai-ship.json into target repo
+  --doctor [--fix]   Check the OpenCode 2.x native-plugin setup (--fix removes a duplicate ai-ship MCP entry, with backup)
+  --plugin-install   Install the native OpenCode 2.x plugin (~/.config/opencode/plugins/ai-ship.ts)
+  --plugin-uninstall Remove the native plugin file created by --plugin-install
   --cleanup          List and remove leftover ai-ship worktrees and ai/* branches (prompts for confirmation)
   --safety-check     Scan repo/worktree diff and untracked files for leaked deployment config, secrets, keys, emails, and IDs
   -y, --yes          Skip confirmation prompt when running --cleanup
@@ -90,15 +95,8 @@ function configureCloudflareGateway(accountId, gatewayId, targetProvider) {
 
 /** @param {string} repoDir */
 function initRepo(repoDir) {
-  const templatesDir = path.resolve(import.meta.dirname, "..", "templates");
-  for (const file of ["AGENTS.md", ".ai-ship.json"]) {
-    const dest = path.join(repoDir, file);
-    if (fs.existsSync(dest)) {
-      console.log(`[ai-ship] Skipping ${file} (already exists at ${dest})`);
-    } else {
-      fs.copyFileSync(path.join(templatesDir, file), dest);
-      console.log(`[ai-ship] Created ${dest}`);
-    }
+  for (const line of initRepoFiles(repoDir, path.resolve(import.meta.dirname, "..", "templates"))) {
+    console.log(`[ai-ship] ${line}`);
   }
 }
 
@@ -248,6 +246,24 @@ const {
 if (doInit) {
   initRepo(repoDir);
   process.exit(0);
+}
+
+if (parsed.pluginAction === "install") {
+  const file = installPlugin({ pluginEntry: path.resolve(import.meta.dirname, "..", "plugin", "v2", "index.ts") });
+  console.log(`[ai-ship] Installed native plugin: ${file}\n[ai-ship] Restart OpenCode Desktop, then run /ship-doctor.`);
+  process.exit(0);
+}
+if (parsed.pluginAction === "uninstall") {
+  const file = uninstallPlugin();
+  console.log(file ? `[ai-ship] Removed ${file}` : "[ai-ship] Native plugin not installed.");
+  process.exit(0);
+}
+if (parsed.doDoctor) {
+  const cli = findDesktopCli();
+  const version = cli ? (spawnSync(cli, ["--version"], { encoding: "utf8", timeout: 10_000 }).stdout ?? "").trim() : undefined;
+  const res = runDoctor({ fix: parsed.doFix, ...(version ? { opencodeVersion: version } : {}) });
+  console.log(formatDoctor(res));
+  process.exit(res.checks.every((c) => c.ok) ? 0 : 1);
 }
 
 if (doCleanup) {

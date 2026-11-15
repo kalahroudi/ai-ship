@@ -27,10 +27,13 @@ function makeWorktree() {
   return { repo, wt: handle.worktreeDir, cleanup: () => fs.rmSync(repo, { recursive: true, force: true }) };
 }
 
-test("getDiff survives the node_modules symlink and commitAll does not commit it", () => {
+test("getDiff survives a cloned-or-symlinked node_modules and commitAll does not commit it", () => {
   const { wt, cleanup } = makeWorktree();
   try {
-    assert.equal(fs.lstatSync(path.join(wt, "node_modules")).isSymbolicLink(), true);
+    // Either a private copy-on-write clone (real directory) or the symlink fallback.
+    const st = fs.lstatSync(path.join(wt, "node_modules"));
+    assert.ok(st.isDirectory() || st.isSymbolicLink());
+    assert.ok(fs.existsSync(path.join(wt, "node_modules", "pkg", "index.js")));
     fs.writeFileSync(path.join(wt, "feature.ts"), "export const feature = 42;\n");
 
     const diff = getDiff(wt, "main");

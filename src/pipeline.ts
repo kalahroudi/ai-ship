@@ -36,6 +36,9 @@ import {
   restoreTamperedFiles,
   snapshotFiles,
   snapshotIgnoredProtectedFiles,
+  snapshotBinTools,
+  findTamperedBinTools,
+  findScriptInvokedPaths,
   squashCheckpoints,
   isTesterPath,
   revertAllChangesSince,
@@ -1266,7 +1269,21 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
 
   // Gate integrity: track this run's starting point, checkpoint each agent's work, and make sure no agent
   // weakens the verify config or edits the tester's tests.
-  const protectedPaths = config.protectedPaths ?? DEFAULT_PROTECTED_PATHS;
+  // Files the verify commands invoke (e.g. scripts/test.sh behind `npm test`) are gates too.
+  const scriptInvoked = findScriptInvokedPaths(worktree.worktreeDir, config.verify);
+  const protectedPaths = [...(config.protectedPaths ?? DEFAULT_PROTECTED_PATHS), ...scriptInvoked];
+  if (scriptInvoked.length > 0) console.log(`[ai-ship] Protected verify-invoked files: ${scriptInvoked.join(", ")}`);
+  // Tool binaries the verify commands run (tsc, vitest, eslint, ...) must not be rewritten mid-run.
+  const binBaseline = snapshotBinTools(worktree.worktreeDir);
+  const verifyGate = async () => {
+    const tampered = findTamperedBinTools(worktree.worktreeDir, binBaseline);
+    if (tampered.length > 0) {
+      throw new Error(
+        `node_modules tool binaries changed during the run (${tampered.join(", ")}); refusing to trust the verify gate.`
+      );
+    }
+    return runDeterministicVerify(worktree.worktreeDir, config);
+  };
   const startRef = resolveRunStartRef(worktree.worktreeDir);
   const excludeDigest = excludeFileDigest(worktree.worktreeDir);
   const ignoredBaseline = snapshotIgnoredProtectedFiles(worktree.worktreeDir, protectedPaths);
@@ -1404,7 +1421,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
       // per tester-owned file) and do not consume implementer attempts.
       let implementerAttempts = 0;
       for (;;) {
-        const verify = await runDeterministicVerify(worktree.worktreeDir, config);
+        const verify = await verifyGate();
         if (verify.ok) {
           console.log(`  -> Local verify gate PASSED${context ? ` (${context})` : ""}.`);
           return;
@@ -1653,7 +1670,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
 
       if (rebase.updated) {
         console.log(`  -> Rebased onto ${rebase.targetRef}. Re-running verify gate...`);
-        const postRebaseVerify = await runDeterministicVerify(worktree.worktreeDir, config);
+        const postRebaseVerify = await verifyGate();
         if (!postRebaseVerify.ok) {
           throw new Error(`Verify failed after rebasing onto ${rebase.targetRef}:\n${postRebaseVerify.output}`);
         }

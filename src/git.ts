@@ -93,8 +93,35 @@ export function setupWorktreeDependencies(
 
   const mainModules = path.join(repoDir, "node_modules");
   if (fs.existsSync(mainModules)) {
-    fs.symlinkSync(mainModules, path.join(worktreeDir, "node_modules"), "dir");
+    const target = path.join(worktreeDir, "node_modules");
+    // Prefer a private copy-on-write clone so an agent cannot alter the MAIN repo's tools through the
+    // worktree; fall back to a symlink (tools are then hash-checked before every verify run).
+    if (cloneDirCopyOnWrite(mainModules, target)) return;
+    console.log("[ai-ship] Copy-on-write clone of node_modules unavailable; symlinking it (verify tools are hash-checked).");
+    fs.symlinkSync(mainModules, target, "dir");
   }
+}
+
+export type CloneRunner = (args: string[]) => number | null;
+
+const defaultCloneRunner: CloneRunner = (args) => spawnSync("cp", args, { stdio: "ignore" }).status;
+
+/**
+ * Clones `src` to `dest` with copy-on-write only (APFS clonefile via `cp -c`, Linux `--reflink=always`).
+ * Never falls back to a full byte copy. Returns false (and leaves no partial `dest`) when unsupported.
+ */
+export function cloneDirCopyOnWrite(
+  src: string,
+  dest: string,
+  run: CloneRunner = defaultCloneRunner,
+  platform: NodeJS.Platform = process.platform
+): boolean {
+  const args = platform === "darwin" ? ["-c", "-R", src, dest] : ["--reflink=always", "-R", src, dest];
+  if (platform !== "darwin" && platform !== "linux") return false;
+  const status = run(args);
+  if (status === 0 && fs.existsSync(dest)) return true;
+  fs.rmSync(dest, { recursive: true, force: true });
+  return false;
 }
 
 export function resolveFreshBaseRef(repoDir: string, baseBranch: string): string {

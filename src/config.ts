@@ -64,6 +64,8 @@ export interface RepoConfig {
   maxFixRetries: number;
   maxReviewRounds: number;
   maxTaskCostUsd?: number;
+  /** True when maxTaskCostUsd came from the user's config rather than the default. */
+  maxTaskCostUsdExplicit?: boolean;
   maxTaskTokens?: number;
   /** Per-model USD-per-million-token prices (`provider/model` keys), merged over ~/.config/ai-ship/models.json. */
   pricing?: Record<string, { in: number; out: number; cacheRead?: number; cacheWrite?: number; checked?: string }>;
@@ -292,6 +294,7 @@ export function loadRepoConfig(repoDir: string): RepoConfig {
     testCommand,
     providers: mergeProviders(DEFAULT_PROVIDERS, userConfig.providers),
     maxTaskCostUsd,
+    maxTaskCostUsdExplicit: typeof userConfig.maxTaskCostUsd === "number",
     maxTaskTokens,
     contextLimits,
     securityScan,

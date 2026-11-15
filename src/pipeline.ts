@@ -1437,12 +1437,15 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
   // Subscription-billed calls (claude-code without an API key) are not cash spend: the governor's £ task cap
   // does not apply to them unless the user counts subscription usage. An explicit maxTaskCostUsd still does.
   const subscriptionBilled = isSubscriptionBilled(provider) && !budgetConfig.countSubscription;
+  // On a subscription, the default $ cap (a guard against metered spend) does not apply either; a cap the user
+  // set explicitly does, and maxTaskTokens still bounds runaway work.
+  const baseTaskCapUsd = subscriptionBilled && config.maxTaskCostUsdExplicit === false ? undefined : config.maxTaskCostUsd;
   const effectiveMaxTaskCostUsd =
     governorTaskCapUsd === undefined || subscriptionBilled
-      ? config.maxTaskCostUsd
+      ? baseTaskCapUsd
       : Math.min(config.maxTaskCostUsd ?? Number.POSITIVE_INFINITY, governorTaskCapUsd);
   const budget = new BudgetTracker({
-    maxTaskCostUsd: Number.isFinite(effectiveMaxTaskCostUsd ?? Number.NaN) ? effectiveMaxTaskCostUsd : config.maxTaskCostUsd,
+    maxTaskCostUsd: Number.isFinite(effectiveMaxTaskCostUsd ?? Number.NaN) ? effectiveMaxTaskCostUsd : baseTaskCapUsd,
     maxTaskTokens: config.maxTaskTokens,
     failOnUnknownCost: config.requirePricing === true,
     onRecord: (stage, res, u) =>

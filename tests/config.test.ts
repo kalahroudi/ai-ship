@@ -313,3 +313,38 @@ test("loadRepoConfig loads contextLens option and parseCliArgs handles --context
 
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+test("loadRepoConfig: maxTaskCostUsdExplicit is false when maxTaskCostUsd is absent (default cap 5)", () => {
+  const dir = makeTempRepo();
+  const cfg = loadRepoConfig(dir);
+  assert.equal(cfg.maxTaskCostUsd, 5);
+  assert.equal(cfg.maxTaskCostUsdExplicit, false);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("loadRepoConfig: maxTaskCostUsdExplicit is true when maxTaskCostUsd is a number", () => {
+  const dir = makeTempRepo();
+  fs.writeFileSync(path.join(dir, ".ai-ship.json"), JSON.stringify({ maxTaskCostUsd: 2.5 }));
+  const cfg = loadRepoConfig(dir);
+  assert.equal(cfg.maxTaskCostUsd, 2.5);
+  assert.equal(cfg.maxTaskCostUsdExplicit, true);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("loadRepoConfig: maxTaskCostUsd null disables the cap and is not explicit", () => {
+  const dir = makeTempRepo();
+  fs.writeFileSync(path.join(dir, ".ai-ship.json"), JSON.stringify({ maxTaskCostUsd: null }));
+  const cfg = loadRepoConfig(dir);
+  assert.equal(cfg.maxTaskCostUsd, undefined);
+  assert.equal(cfg.maxTaskCostUsdExplicit, false);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("loadRepoConfig: maxTaskCostUsdExplicit stays false when only other budget keys are set", () => {
+  const dir = makeTempRepo();
+  fs.writeFileSync(path.join(dir, ".ai-ship.json"), JSON.stringify({ maxTaskTokens: 1000 }));
+  const cfg = loadRepoConfig(dir);
+  assert.equal(cfg.maxTaskCostUsd, 5);
+  assert.equal(cfg.maxTaskCostUsdExplicit, false);
+  fs.rmSync(dir, { recursive: true, force: true });
+});

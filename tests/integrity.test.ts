@@ -27,6 +27,15 @@ import { commitAll, createWorktree, openPrFromWorktree } from "../src/git.ts";
 import { runPipeline } from "../src/pipeline.ts";
 import type { OpencodeClient } from "../src/runner.ts";
 
+// Hermetic pricing: never read the developer's real ~/.config/ai-ship/models.json.
+const prevModelsFile = process.env.AI_SHIP_MODELS_FILE;
+process.env.AI_SHIP_MODELS_FILE = path.join(os.tmpdir(), `ai-ship-no-models-${process.pid}.json`);
+process.on("exit", () => {
+  if (prevModelsFile === undefined) delete process.env.AI_SHIP_MODELS_FILE;
+  else process.env.AI_SHIP_MODELS_FILE = prevModelsFile;
+});
+
+
 function git(dir: string, ...args: string[]): string {
   return execFileSync("git", ["-c", "user.email=t@example.com", "-c", "user.name=T", ...args], {
     cwd: dir,

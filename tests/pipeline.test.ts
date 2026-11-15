@@ -34,6 +34,15 @@ import type { RepoConfig } from "../src/config.ts";
 import type { OpencodeClient, PipelineRunner, PromptOptions } from "../src/runner.ts";
 import { resolveShipTaskInput } from "../plugin/index.ts";
 
+// Hermetic pricing: never read the developer's real ~/.config/ai-ship/models.json.
+const prevModelsFile = process.env.AI_SHIP_MODELS_FILE;
+process.env.AI_SHIP_MODELS_FILE = path.join(os.tmpdir(), `ai-ship-no-models-${process.pid}.json`);
+process.on("exit", () => {
+  if (prevModelsFile === undefined) delete process.env.AI_SHIP_MODELS_FILE;
+  else process.env.AI_SHIP_MODELS_FILE = prevModelsFile;
+});
+
+
 test("formatOpenReviewFindings formats each open lens into a markdown section", () => {
   const formatted = formatOpenReviewFindings([
     { lens: "Security", text: "Missing tenant check on line 42.\nVERDICT: OPEN" },

@@ -2,6 +2,7 @@ import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import { createOpencode, createOpencodeClient } from "@opencode-ai/sdk";
 import type { ModelRef, RepoConfig } from "./config.ts";
+import { loadPricingTable, resolveCost, toOpencodeCost, findPricing, type CostSource, type PricingTable } from "./pricing.ts";
 
 export type OpencodeClient = ReturnType<typeof createOpencodeClient>;
 
@@ -216,6 +217,11 @@ export interface PromptUsage {
   output: number;
   cacheRead: number;
   costUsd: number;
+  /** Reasoning tokens (billed as output by most providers). */
+  reasoning?: number;
+  cacheWrite?: number;
+  /** Where costUsd came from: provider-reported, computed from the pricing table, or unknown (no price). */
+  costSource?: CostSource;
 }
 
 export interface PromptResult {
@@ -223,6 +229,39 @@ export interface PromptResult {
   usageSummary: string;
   usage?: PromptUsage;
   fallback?: FallbackActivation;
+  /** `provider/model` that served this call, when known. */
+  model?: string;
+  /** Number of failed attempts (empty replies, transient errors) whose usage was folded into `usage`. */
+  wastedAttempts?: number;
+}
+
+/** Adds two usages (token counts and cost); the cost source degrades to the least reliable of the two. */
+export function addUsage(a: PromptUsage | undefined, b: PromptUsage | undefined): PromptUsage | undefined {
+  if (!a) return b;
+  if (!b) return a;
+  const rank: Record<CostSource, number> = { none: 0, provider: 1, computed: 2, unknown: 3 };
+  const sa = a.costSource ?? "provider";
+  const sb = b.costSource ?? "provider";
+  return {
+    input: a.input + b.input,
+    output: a.output + b.output,
+    cacheRead: a.cacheRead + b.cacheRead,
+    costUsd: a.costUsd + b.costUsd,
+    reasoning: (a.reasoning ?? 0) + (b.reasoning ?? 0),
+    cacheWrite: (a.cacheWrite ?? 0) + (b.cacheWrite ?? 0),
+    costSource: rank[sa] >= rank[sb] ? sa : sb,
+  };
+}
+
+/** Formats a usage as `in=… out=… cache_read=… [reasoning=… cache_write=…] | $… [(computed|cost unknown)]`. */
+export function formatUsageSummary(u: PromptUsage): string {
+  const extras = [
+    u.reasoning ? ` reasoning=${u.reasoning}` : "",
+    u.cacheWrite ? ` cache_write=${u.cacheWrite}` : "",
+  ].join("");
+  const source =
+    u.costSource === "computed" ? " (computed)" : u.costSource === "unknown" ? " (cost unknown: no pricing)" : "";
+  return `in=${u.input} out=${u.output} cache_read=${u.cacheRead}${extras} | $${u.costUsd.toFixed(4)}${source}`;
 }
 
 export interface PromptOptions {
@@ -255,6 +294,9 @@ interface PromptResponseData {
   info?: {
     error?: OpencodeMessageError;
     cost?: number;
+    providerID?: string;
+    modelID?: string;
+    parentID?: string;
     tokens?: {
       input?: number;
       output?: number;
@@ -369,7 +411,61 @@ function extractOpencodeUsage(data: PromptResponseData | undefined): PromptUsage
     output: t?.output ?? 0,
     cacheRead: t?.cache?.read ?? 0,
     costUsd: typeof cost === "number" ? cost : 0,
+    reasoning: t?.reasoning ?? 0,
+    cacheWrite: t?.cache?.write ?? 0,
+    costSource: typeof cost === "number" && cost > 0 ? "provider" : "unknown",
   };
+}
+
+interface StepMessage {
+  info?: {
+    role?: string;
+    parentID?: string;
+    cost?: number;
+    tokens?: { input?: number; output?: number; reasoning?: number; cache?: { read?: number; write?: number } };
+  };
+}
+
+/**
+ * OpenCode creates one assistant message per agent step, but `session.prompt` returns only the last one.
+ * Sums tokens/cost over every assistant message answering the same user message (same `parentID`), so
+ * tool-using turns are fully accounted for. Returns undefined when nothing matches.
+ */
+export function sumStepUsage(messages: StepMessage[], parentID: string): PromptUsage | undefined {
+  let total: PromptUsage | undefined;
+  let anyCost = false;
+  for (const m of messages) {
+    if (m.info?.role !== "assistant" || m.info.parentID !== parentID) continue;
+    const t = m.info.tokens;
+    const cost = typeof m.info.cost === "number" ? m.info.cost : 0;
+    if (cost > 0) anyCost = true;
+    total = addUsage(total, {
+      input: t?.input ?? 0,
+      output: t?.output ?? 0,
+      cacheRead: t?.cache?.read ?? 0,
+      cacheWrite: t?.cache?.write ?? 0,
+      reasoning: t?.reasoning ?? 0,
+      costUsd: cost,
+      costSource: "provider",
+    });
+  }
+  if (total) total.costSource = anyCost ? "provider" : "unknown";
+  return total;
+}
+
+/**
+ * Applies the pricing table to an OpenCode result: keeps a positive provider cost, otherwise computes the
+ * cost from tokens (source "computed") or marks it "unknown". Also records which model served the call.
+ */
+export function applyPricing(
+  result: PromptResult,
+  modelLabel: string | undefined,
+  table: PricingTable
+): PromptResult {
+  if (!result.usage) return { ...result, ...(modelLabel ? { model: modelLabel } : {}) };
+  const resolved = resolveCost(result.usage, result.usage.costUsd, modelLabel, table);
+  const usage: PromptUsage = { ...result.usage, costUsd: resolved.costUsd, costSource: resolved.costSource };
+  return { ...result, usage, usageSummary: formatUsageSummary(usage), ...(modelLabel ? { model: modelLabel } : {}) };
 }
 
 /** Parses a formatted `in=... out=... cache_read=... | $...` usage summary string into structured counts. */
@@ -464,6 +560,12 @@ export function parseClaudeJsonOutput(stdout: string): {
           output: u?.output_tokens ?? 0,
           cacheRead: u?.cache_read_input_tokens ?? 0,
           costUsd: typeof item.total_cost_usd === "number" ? item.total_cost_usd : 0,
+          costSource:
+            typeof item.total_cost_usd === "number"
+              ? "provider"
+              : (u?.input_tokens ?? 0) + (u?.output_tokens ?? 0) + (u?.cache_read_input_tokens ?? 0) > 0
+                ? "unknown"
+                : "none",
         }
       : undefined;
 
@@ -551,19 +653,31 @@ function extractNumericStatus(err: unknown): number | undefined {
 /** Thrown when a read-only role (reviewer/bughunter) gets an empty reply; classified as transient so retry/fallback runs. */
 export class EmptyModelResponseError extends Error {
   readonly role: AgentRole;
-  constructor(role: AgentRole) {
+  /** Tokens/cost spent on the empty reply, so retries still count against the budget. */
+  readonly usage?: PromptUsage;
+  constructor(role: AgentRole, usage?: PromptUsage) {
     super(`${role} returned an empty response`);
     this.name = "EmptyModelResponseError";
     this.role = role;
+    this.usage = usage;
   }
 }
 
 /** Throws EmptyModelResponseError when a read-only role's reply has no text. Writer roles may legitimately end with tool calls only. */
 export function assertNonEmptyReadOnlyReply(role: AgentRole, result: PromptResult): PromptResult {
   if (isReadOnlyRole(role) && !result.text.trim()) {
-    throw new EmptyModelResponseError(role);
+    throw new EmptyModelResponseError(role, result.usage);
   }
   return result;
+}
+
+/** Usage attached to a failed attempt (e.g. an empty reply), if any. */
+function usageOfError(err: unknown): PromptUsage | undefined {
+  if (err && typeof err === "object" && "usage" in err) {
+    const u = (err as { usage?: unknown }).usage;
+    if (u && typeof u === "object" && typeof (u as PromptUsage).input === "number") return u as PromptUsage;
+  }
+  return undefined;
 }
 
 /** Classifies whether a provider/transport error is a transient 429 or 5xx failure. */
@@ -653,20 +767,37 @@ export async function executeWithFailoverAndRetry(opts: {
   );
 
   let lastError: unknown;
+  let wasted: PromptUsage | undefined;
+  let wastedAttempts = 0;
+  const noteWasted = (err: unknown) => {
+    const u = usageOfError(err);
+    wastedAttempts += 1;
+    if (u) wasted = addUsage(wasted, u);
+  };
+  const withWasted = (res: PromptResult): PromptResult => {
+    if (wastedAttempts === 0) return res;
+    const usage = addUsage(res.usage, wasted);
+    return {
+      ...res,
+      ...(usage ? { usage, usageSummary: formatUsageSummary(usage) } : {}),
+      wastedAttempts,
+    };
+  };
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
-      return await opts.invoke(opts.primaryModel);
+      return withWasted(await opts.invoke(opts.primaryModel));
     } catch (primaryErr) {
       const primaryInfo = classifyProviderError(primaryErr);
       if (!primaryInfo.transient) {
         throw primaryErr;
       }
       lastError = primaryErr;
+      noteWasted(primaryErr);
 
       if (hasDistinctFallback && fallback) {
         try {
-          const fallbackRes = await opts.invoke(fallback);
+          const fallbackRes = withWasted(await opts.invoke(fallback));
           return {
             ...fallbackRes,
             fallback: {
@@ -682,6 +813,7 @@ export async function executeWithFailoverAndRetry(opts: {
             throw fallbackErr;
           }
           lastError = fallbackErr;
+          noteWasted(fallbackErr);
         }
       }
 
@@ -697,6 +829,9 @@ export async function executeWithFailoverAndRetry(opts: {
     }
   }
 
+  if (wasted && lastError && typeof lastError === "object") {
+    (lastError as { wastedUsage?: PromptUsage }).wastedUsage = wasted;
+  }
   throw lastError;
 }
 
@@ -713,8 +848,11 @@ export function createOpencodeClientRunner(opts: {
   model?: string;
   roleModels?: RoleModelOverrides;
   retry?: RetryOptions;
+  /** Pricing used when OpenCode reports no cost (defaults to ~/.config/ai-ship/models.json + config.pricing). */
+  pricing?: PricingTable;
   onClose?: () => void;
 }): PipelineRunner {
+  const pricing = opts.pricing ?? loadPricingTable(opts.config.pricing);
   const defaultProvider =
     opts.config.defaultProvider ?? opts.config.implementerModel?.providerID ?? "deepseek";
   const overrides: RoleModelOverrides = { ...opts.roleModels, ...(opts.model ? { implementer: opts.model } : {}) };
@@ -774,10 +912,30 @@ export function createOpencodeClientRunner(opts: {
               parts: [{ type: "text", text }],
             },
           });
-          return assertNonEmptyReadOnlyReply(
-            role,
-            parseOpencodePromptResponse(res as { data?: PromptResponseData; error?: unknown }, role)
-          );
+          const data = (res as { data?: PromptResponseData }).data;
+          const servedBy = model
+            ? `${model.providerID}/${model.modelID}`
+            : data?.info?.providerID && data?.info?.modelID
+              ? `${data.info.providerID}/${data.info.modelID}`
+              : undefined;
+          let parsed = parseOpencodePromptResponse(res as { data?: PromptResponseData; error?: unknown }, role);
+          const parentID = data?.info?.parentID;
+          if (parentID && opts.client.session.messages) {
+            try {
+              const list = await opts.client.session.messages({
+                path: { id: sessionId },
+                query: { directory: opts.worktreeDir },
+              });
+              const summed = sumStepUsage((list.data ?? []) as StepMessage[], parentID);
+              if (summed) parsed = { ...parsed, usage: summed, usageSummary: formatUsageSummary(summed) };
+            } catch (err) {
+              // keep last-step usage, but say so: multi-step turns may be undercounted
+              console.error(
+                `[ai-ship] Warning: could not list session messages to sum step usage (${(err as Error).message}); cost may be undercounted.`
+              );
+            }
+          }
+          return assertNonEmptyReadOnlyReply(role, applyPricing(parsed, servedBy, pricing));
         },
       });
     },
@@ -842,9 +1000,19 @@ const CF_BARE_GATEWAY_RE = /^https:\/\/gateway\.ai\.cloudflare\.com\/v1\/[^/]+\/
 export function buildOpencodeProviderConfig(
   config: RepoConfig,
   cfGatewayUrl?: string,
-  contextLensUrl?: string
+  contextLensUrl?: string,
+  pricing: PricingTable = loadPricingTable(config.pricing)
 ): Record<string, Record<string, unknown>> | undefined {
   const providers: Record<string, Record<string, unknown>> = {};
+  const withCost = (providerId: string, models: Record<string, unknown>): Record<string, unknown> => {
+    const out: Record<string, unknown> = {};
+    for (const [modelId, def] of Object.entries(models)) {
+      const price = findPricing(pricing, `${providerId}/${modelId}`);
+      const base = def && typeof def === "object" ? (def as Record<string, unknown>) : {};
+      out[modelId] = price && base.cost === undefined ? { ...base, cost: toOpencodeCost(price) } : base;
+    }
+    return out;
+  };
   for (const [id, pCfg] of Object.entries(config.providers ?? {})) {
     const options = {
       ...(pCfg.baseURL ? { baseURL: pCfg.baseURL } : {}),
@@ -854,7 +1022,7 @@ export function buildOpencodeProviderConfig(
       ...(pCfg.npm ? { npm: pCfg.npm } : {}),
       ...(pCfg.name ? { name: pCfg.name } : {}),
       ...(Object.keys(options).length > 0 ? { options } : {}),
-      ...(pCfg.models ? { models: pCfg.models } : {}),
+      ...(pCfg.models ? { models: withCost(id, pCfg.models) } : {}),
     };
   }
 

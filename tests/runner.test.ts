@@ -1,3 +1,5 @@
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
@@ -18,6 +20,15 @@ import {
 } from "../src/runner.ts";
 import { DEFAULT_PROVIDERS, type RepoConfig } from "../src/config.ts";
 import { resolveCloudflareGatewayUrl } from "../src/pipeline.ts";
+
+// Hermetic pricing: never read the developer's real ~/.config/ai-ship/models.json.
+const prevModelsFile = process.env.AI_SHIP_MODELS_FILE;
+process.env.AI_SHIP_MODELS_FILE = path.join(os.tmpdir(), `ai-ship-no-models-${process.pid}.json`);
+process.on("exit", () => {
+  if (prevModelsFile === undefined) delete process.env.AI_SHIP_MODELS_FILE;
+  else process.env.AI_SHIP_MODELS_FILE = prevModelsFile;
+});
+
 
 test("normalizeProvider defaults to opencode and accepts provider aliases", () => {
   assert.equal(normalizeProvider(undefined), "opencode");

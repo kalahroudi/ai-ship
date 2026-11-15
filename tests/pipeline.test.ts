@@ -187,7 +187,7 @@ test("runReviewLenses supports per-lens model routing, same-provider pacing, and
 });
 
 test("BudgetTracker accumulates structured and summary usage per stage and trips on USD or token limits", () => {
-  const tracker = new BudgetTracker({ maxTaskCostUsd: 0.05, maxTaskTokens: 1000 });
+  const tracker = new BudgetTracker({ maxTaskCostUsd: 0.05, maxTaskTokens: 850 });
   tracker.record("Stage 1: Implement", {
     text: "ok",
     usageSummary: "in=200 out=100 cache_read=50 | $0.0200",
@@ -229,11 +229,37 @@ test("BudgetTracker accumulates structured and summary usage per stage and trips
       assert.ok(err instanceof BudgetExceededError);
       assert.match(err.message, /Budget exceeded before "Stage 4: Review \(round 1\)"/);
       assert.match(err.message, /maxTaskCostUsd \$0\.0500/);
-      assert.match(err.message, /maxTaskTokens 1000/);
+      assert.match(err.message, /task tokens 865 \(cache reads at 10%; 1000 raw\) >= maxTaskTokens 850/);
       assert.match(err.message, /Stage 1: Implement: \$0\.0200/);
       assert.match(err.message, /Stage 3: Fix: \$0\.0350/);
       return true;
     }
+  );
+});
+
+test("BudgetTracker maxTaskTokens counts cache reads at 10%: cache-heavy runs do not trip, fresh input does", () => {
+  const heavy = new BudgetTracker({ maxTaskTokens: 2_000_000 });
+  heavy.record("Stage 1", { text: "ok", usageSummary: "", usage: { input: 25_000, output: 25_000, cacheRead: 1_900_000, costUsd: 0 } });
+  assert.equal(heavy.getTotals().totalTokens, 1_950_000);
+  assert.doesNotThrow(() => heavy.assertWithinBudget("Stage 2"));
+
+  const fresh = new BudgetTracker({ maxTaskTokens: 2_000_000 });
+  fresh.record("Stage 1", { text: "ok", usageSummary: "", usage: { input: 2_100_000, output: 0, cacheRead: 0, costUsd: 0 } });
+  assert.throws(
+    () => fresh.assertWithinBudget("Stage 2"),
+    (err: unknown) => {
+      assert.ok(err instanceof BudgetExceededError);
+      assert.match(err.message, /task tokens 2100000 \(cache reads at 10%; 2100000 raw\) >= maxTaskTokens 2000000/);
+      return true;
+    }
+  );
+
+  // Cache reads still count at 10%: 1.9M cached (=190k) + 1.9M fresh crosses 2M, and the message shows both numbers.
+  const mixed = new BudgetTracker({ maxTaskTokens: 2_000_000 });
+  mixed.record("Stage 1", { text: "ok", usageSummary: "", usage: { input: 1_900_000, output: 0, cacheRead: 1_900_000, costUsd: 0 } });
+  assert.throws(
+    () => mixed.assertWithinBudget("Stage 2"),
+    /task tokens 2090000 \(cache reads at 10%; 3800000 raw\) >= maxTaskTokens 2000000/
   );
 });
 

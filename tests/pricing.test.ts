@@ -327,7 +327,7 @@ test("BudgetTracker counts reasoning and cacheWrite tokens and unknown-cost call
   assert.match(lines, /\[WARNING\] 1 call\(s\) had no provider cost and no pricing entry/);
   assert.match(lines, /1 with UNKNOWN cost/);
 
-  tracker.record("Stage 2", { text: "ok", usageSummary: "", usage: { input: 0, output: 0, cacheRead: 0, reasoning: 98, costUsd: 0 } });
+  tracker.record("Stage 2", { text: "ok", usageSummary: "", usage: { input: 0, output: 0, cacheRead: 0, reasoning: 200, costUsd: 0 } });
   assert.throws(() => tracker.assertWithinBudget("Stage 3"), BudgetExceededError);
 
   const clean = new BudgetTracker({});

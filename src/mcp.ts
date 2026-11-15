@@ -8,6 +8,7 @@ import { listCleanupTargets, openPrFromWorktree, removeCleanupTargets } from "./
 import { appendMemory, forgetMemory } from "./memory.ts";
 import { formatPipelineResult, runDreamConsolidation, runPipeline } from "./pipeline.ts";
 import { normalizeProvider, type ProviderName } from "./runner.ts";
+import { formatProgressEvent } from "./progress.ts";
 
 interface JsonRpcRequest {
   jsonrpc?: string;
@@ -90,6 +91,8 @@ export const MCP_TOOLS = [
         testerModel: { type: "string", description: "Optional tester model override (must differ from the implementer)" },
         reviewerModel: { type: "string", description: "Optional reviewer model override (must differ from the implementer)" },
         bughunterModel: { type: "string", description: "Optional bughunter model override (must differ from the implementer)" },
+        skipBughunter: { type: "boolean", description: "Skip the Stage 4b Hunter -> Skeptic -> Referee pass" },
+        overrideBudget: { type: "boolean", description: "Run even when the monthly budget governor is in STOP state" },
         allowConfigChange: {
           type: "boolean",
           description:
@@ -97,6 +100,76 @@ export const MCP_TOOLS = [
         },
       },
       required: ["task"],
+    },
+  },
+  {
+    name: "ship_start",
+    description:
+      "Start the ai-ship pipeline in the background and return a job id immediately (use ship_status to follow progress and ship_cancel to stop). Same arguments as ship_task.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        task: { type: "string", description: "Task description or noty://item/<id> URI" },
+        repoDir: {
+          type: "string",
+          description: "Target git repository directory (defaults to current working directory)",
+        },
+        openPr: {
+          type: "boolean",
+          description: "Rebase, push branch, and open a PR after all stages pass",
+        },
+        draft: {
+          type: "boolean",
+          description: "Open the PR as a GitHub Draft PR (implies openPr)",
+        },
+        worktreeDir: {
+          type: "string",
+          description: "Existing ai-ship worktree path to iterate on instead of creating a new one",
+        },
+        skipTests: {
+          type: "boolean",
+          description: "Skip Stage 2 independent adversarial test generation",
+        },
+        skipReview: {
+          type: "boolean",
+          description: "Skip Stage 4 parallel multi-lens review",
+        },
+        provider: {
+          type: "string",
+          enum: ["opencode", "claude-code"],
+          description:
+            "Runner provider (defaults to opencode when any OpenCode provider is configured, otherwise claude-code if available)",
+        },
+        model: { type: "string", description: "Optional implementer model override (provider/model)" },
+        testerModel: { type: "string", description: "Optional tester model override (must differ from the implementer)" },
+        reviewerModel: { type: "string", description: "Optional reviewer model override (must differ from the implementer)" },
+        bughunterModel: { type: "string", description: "Optional bughunter model override (must differ from the implementer)" },
+        skipBughunter: { type: "boolean", description: "Skip the Stage 4b Hunter -> Skeptic -> Referee pass" },
+        overrideBudget: { type: "boolean", description: "Run even when the monthly budget governor is in STOP state" },
+        allowConfigChange: {
+          type: "boolean",
+          description:
+            "Allow agents to change protected verify/config files (.ai-ship.json, package.json scripts, CI, test config)",
+        },
+      },
+      required: ["task"],
+    },
+  },
+  {
+    name: "ship_status",
+    description: "Status, recent per-agent progress and the final summary of ai-ship background jobs.",
+    inputSchema: {
+      type: "object",
+      properties: { jobId: { type: "string", description: "Job id from ship_start (omit for the latest jobs)" } },
+    },
+  },
+  {
+    name: "ship_cancel",
+    description:
+      "Cancel a running ai-ship background job: it stops at the next stage boundary, before any commit or PR; the worktree is kept.",
+    inputSchema: {
+      type: "object",
+      properties: { jobId: { type: "string", description: "Job id (omit for the latest running job)" } },
     },
   },
   {
@@ -314,6 +387,88 @@ const skippedNote = (r: { skippedWorktrees?: string[]; skippedBranches: string[]
     .filter(Boolean)
     .join("\n");
 
+interface McpJob {
+  id: string;
+  label: string;
+  status: "running" | "succeeded" | "failed" | "cancelled";
+  startedAt: number;
+  worktreeDir?: string;
+  events: string[];
+  cancelled: boolean;
+  result?: string;
+  error?: string;
+}
+
+const mcpJobs = new Map<string, McpJob>();
+let nextJobId = 1;
+const MAX_JOBS = 20;
+/** Background pipelines that may run at once in one MCP server (each spawns agents and verify commands). */
+const MAX_RUNNING_JOBS = 4;
+
+/** Cancels every running job (e.g. when the MCP client disconnects). */
+export function cancelAllMcpJobs(): number {
+  let n = 0;
+  for (const j of mcpJobs.values()) {
+    if (j.status === "running" && !j.cancelled) {
+      j.cancelled = true;
+      n++;
+    }
+  }
+  return n;
+}
+
+/** Test helper: clears the in-process job store. */
+export function resetMcpJobs(): void {
+  mcpJobs.clear();
+  nextJobId = 1;
+}
+
+/** Shared ship_task / ship_start option parsing so both tools accept exactly the same arguments. */
+function buildShipOptions(
+  args: Record<string, unknown>,
+  targetRepo: string,
+  deps: McpToolDeps,
+  onProgress?: (stage: string) => void
+): { options: Parameters<typeof runPipeline>[0]; label: string; openPr: boolean } {
+  if (typeof args.task !== "string" || !args.task.trim()) {
+    throw new Error("`task` must be a non-empty string.");
+  }
+  const resolved = deps.resolveShipTaskInput(args.task, {
+    openPr: Boolean(args.openPr),
+    draft: Boolean(args.draft),
+    worktreeDir: typeof args.worktreeDir === "string" ? args.worktreeDir : undefined,
+    skipTests: Boolean(args.skipTests),
+    skipReview: Boolean(args.skipReview),
+    provider: typeof args.provider === "string" ? args.provider : undefined,
+  });
+  if (resolved.title) {
+    onProgress?.(`Resolved Noty: ${resolved.title}`);
+  }
+  const provider = resolveMcpProvider(resolved.provider ?? args.provider, { repoDir: targetRepo });
+  return {
+    label: resolved.title || resolved.task,
+    openPr: resolved.openPr,
+    options: {
+      repoDir: targetRepo,
+      task: resolved.task,
+      openPr: resolved.openPr,
+      ...(resolved.draft ? { draft: true } : {}),
+      ...(resolved.worktreeDir ? { worktreeDir: resolved.worktreeDir } : {}),
+      skipTests: resolved.skipTests,
+      skipReview: resolved.skipReview,
+      ...(args.skipBughunter === true ? { skipBughunter: true } : {}),
+      provider,
+      model: typeof args.model === "string" ? args.model : undefined,
+      ...(typeof args.testerModel === "string" ? { testerModel: args.testerModel } : {}),
+      ...(typeof args.reviewerModel === "string" ? { reviewerModel: args.reviewerModel } : {}),
+      ...(typeof args.bughunterModel === "string" ? { bughunterModel: args.bughunterModel } : {}),
+      ...(args.allowConfigChange === true ? { allowConfigChange: true } : {}),
+      ...(args.overrideBudget === true ? { overrideBudget: true } : {}),
+      onProgress,
+    },
+  };
+}
+
 async function executeTool(
   name: string,
   args: Record<string, unknown>,
@@ -326,41 +481,79 @@ async function executeTool(
 
   switch (name) {
     case "ship_task": {
-      if (typeof args.task !== "string" || !args.task.trim()) {
-        throw new Error("`task` must be a non-empty string.");
-      }
-      const resolved = deps.resolveShipTaskInput(args.task, {
-        openPr: Boolean(args.openPr),
-        draft: Boolean(args.draft),
-        worktreeDir: typeof args.worktreeDir === "string" ? args.worktreeDir : undefined,
-        skipTests: Boolean(args.skipTests),
-        skipReview: Boolean(args.skipReview),
-        provider: typeof args.provider === "string" ? args.provider : undefined,
-      });
-      if (resolved.title) {
-        onProgress?.(`Resolved Noty: ${resolved.title}`);
-      }
-      const provider = resolveMcpProvider(resolved.provider ?? args.provider, { repoDir: targetRepo });
-      const result = await deps.runPipeline({
-        repoDir: targetRepo,
-        task: resolved.task,
-        openPr: resolved.openPr,
-        ...(resolved.draft ? { draft: true } : {}),
-        ...(resolved.worktreeDir ? { worktreeDir: resolved.worktreeDir } : {}),
-        skipTests: resolved.skipTests,
-        skipReview: resolved.skipReview,
-        provider,
-        model: typeof args.model === "string" ? args.model : undefined,
-        ...(typeof args.testerModel === "string" ? { testerModel: args.testerModel } : {}),
-        ...(typeof args.reviewerModel === "string" ? { reviewerModel: args.reviewerModel } : {}),
-        ...(typeof args.bughunterModel === "string" ? { bughunterModel: args.bughunterModel } : {}),
-        ...(args.allowConfigChange === true ? { allowConfigChange: true } : {}),
-        onProgress,
-      });
+      const { options, label, openPr } = buildShipOptions(args, targetRepo, deps, onProgress);
+      const result = await deps.runPipeline(options);
       if (!result) {
-        return `ai-ship pipeline completed for "${resolved.title || resolved.task}" in ${targetRepo}.`;
+        return `ai-ship pipeline completed for "${label}" in ${targetRepo}.`;
       }
-      return formatPipelineResult(result, resolved.title || resolved.task, resolved.openPr);
+      return formatPipelineResult(result, label, openPr);
+    }
+    case "ship_start": {
+      const { options, label, openPr } = buildShipOptions(args, targetRepo, deps);
+      const running = [...mcpJobs.values()].filter((j) => j.status === "running");
+      if (running.length >= MAX_RUNNING_JOBS) {
+        throw new Error(`${running.length} ai-ship jobs are already running (max ${MAX_RUNNING_JOBS}); wait or ship_cancel one.`);
+      }
+      // Two pipelines must never edit, squash and commit in the same worktree at once.
+      const wt = options.worktreeDir ? path.resolve(options.worktreeDir) : undefined;
+      const clash = wt ? running.find((j) => j.worktreeDir === wt) : undefined;
+      if (clash) throw new Error(`${clash.id} is already running in ${wt}; wait for it or ship_cancel it first.`);
+      const job: McpJob = {
+        id: `job-${nextJobId++}`,
+        label,
+        status: "running",
+        startedAt: Date.now(),
+        events: [],
+        cancelled: false,
+        ...(wt ? { worktreeDir: wt } : {}),
+      };
+      mcpJobs.set(job.id, job);
+      for (const [id, j] of mcpJobs) {
+        if (mcpJobs.size <= MAX_JOBS) break;
+        if (j.status !== "running") mcpJobs.delete(id);
+      }
+      const push = (text: string) => {
+        job.events.push(`${new Date().toISOString().slice(11, 19)} ${text}`);
+        if (job.events.length > 100) job.events.splice(0, job.events.length - 100);
+      };
+      void deps
+        .runPipeline({
+          ...options,
+          onProgress: (stage) => push(stage),
+          onEvent: (e) => {
+            if (e.kind !== "stage") push(formatProgressEvent(e));
+          },
+          isCancelled: () => job.cancelled,
+        })
+        .then((result) => {
+          job.status = "succeeded";
+          job.result = result ? formatPipelineResult(result, label, openPr) : `completed for "${label}"`;
+        })
+        .catch((err: unknown) => {
+          job.status = job.cancelled ? "cancelled" : "failed";
+          const msg = err instanceof Error ? err.message : String(err);
+          job.error = msg.length > 4000 ? `…${msg.slice(-4000)}` : msg;
+        });
+      return `Started ${job.id} for "${label.slice(0, 80)}". Poll with ship_status {"jobId":"${job.id}"}; stop with ship_cancel.`;
+    }
+    case "ship_status": {
+      const id = typeof args.jobId === "string" ? args.jobId : undefined;
+      const list = id ? [mcpJobs.get(id)].filter((j): j is McpJob => Boolean(j)) : [...mcpJobs.values()].slice(-5);
+      if (list.length === 0) return id ? `No job ${id}.` : "No ai-ship jobs yet.";
+      return list
+        .map((j) => {
+          const body = j.status === "running" ? j.events.slice(-10).join("\n") : (j.result ?? j.error ?? "");
+          return `## ${j.id} — ${j.status} — ${j.label.slice(0, 80)} (${Math.round((Date.now() - j.startedAt) / 1000)}s)\n${body}`;
+        })
+        .join("\n\n");
+    }
+    case "ship_cancel": {
+      const id = typeof args.jobId === "string" ? args.jobId : [...mcpJobs.values()].reverse().find((j) => j.status === "running")?.id;
+      const job = id ? mcpJobs.get(id) : undefined;
+      if (!job) return "No running ai-ship job to cancel.";
+      if (job.status !== "running") return `${job.id} is already ${job.status}.`;
+      job.cancelled = true;
+      return `Cancel requested for ${job.id}: the pipeline stops at the next stage boundary (before any commit or PR); the worktree is kept.`;
     }
     case "memory_save": {
       if (typeof args.entry !== "string" || !args.entry.trim()) {
@@ -528,6 +721,11 @@ export function startMcpServer(): void {
   console.warn = (...args: unknown[]) => console.error(...args);
 
   const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+  // Client gone: stop background jobs at their next stage boundary (no commits/PRs after disconnect).
+  rl.on("close", () => {
+    const n = cancelAllMcpJobs();
+    if (n) console.error(`[ai-ship] MCP client disconnected; cancelled ${n} running job(s).`);
+  });
   rl.on("line", (line) => {
     const trimmed = line.trim();
     if (!trimmed) return;

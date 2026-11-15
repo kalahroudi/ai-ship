@@ -139,7 +139,8 @@ export function resolveFreshBaseRef(repoDir: string, baseBranch: string): string
 
 export function createWorktree(repoDir: string, baseBranch: string, task: string): WorktreeHandle {
   const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-  const slug = `${slugify(task)}-${stamp}`;
+  // Random suffix: the same task started twice within a second must not collide on branch/worktree names.
+  const slug = `${slugify(task)}-${stamp}-${Math.random().toString(36).slice(2, 6)}`;
   const branch = `ai/${slug}`;
   const root = path.join(repoDir, ".ai-ship-worktrees");
   const worktreeDir = path.join(root, slug);

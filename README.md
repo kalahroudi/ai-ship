@@ -59,6 +59,9 @@ For OpenCode Desktop/TUI/Mobile plugin usage, see [plugin/README.md](./plugin/RE
 - Re-running with an open PR updates its body; the title is left as is.
 - `--cleanup` keeps dirty worktrees, orphan directories and unmerged branches (squash-merged branches count as unmerged) unless you pass `--force`.
 
+## MCP (for clients other than OpenCode, e.g. Claude Code)
+`ai-ship --mcp` serves `ship_task` (blocking), plus **`ship_start`** (runs in the background and returns a job id immediately), **`ship_status`** (stage, recent per-agent progress, final summary) and **`ship_cancel`** (stops at the next stage boundary, before any commit/PR). Long runs no longer hit MCP client timeouts. Jobs live in the MCP server process (not persisted across restarts). Inside OpenCode use the native plugin instead.
+
 ## Configuration
 - Global models & zero-friction permissions: `~/.config/opencode/opencode.json`
 - Per-repo verify commands & overrides: `<repo>/.ai-ship.json` (auto-detects `package.json`, `Package.swift`, `Cargo.toml`, `go.mod`, `pyproject.toml`, and `semgrep` when omitted).

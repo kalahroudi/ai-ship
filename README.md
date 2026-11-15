@@ -179,3 +179,7 @@ Every run also logs per-stage and task-total token/cache telemetry (`in`, `out`,
     Stage 4: Review: in=900 out=240 cache_read=2700 cache_hit=75.0% total=3840 | $0.0095 (3 calls)
   [Task Total] in=2100 out=590 cache_read=7500 total=10190 | $0.0237 (cache_hit=78.1%)
 ```
+
+### Model evals (vet a model before routing to it)
+`ai-ship --eval implementer --model <provider/model>` runs the implementer on the fixture tasks in `evals/implementer/` (bug fix, feature, security, async concurrency) and scores them with hidden acceptance tests copied in only after the agent finishes. `ai-ship --eval reviewer --model <provider/model>` scores verdicts on `evals/reviewer/` diffs with planted bugs and clean diffs (accuracy, OPEN recall/precision). Options: `--eval-n <1-10>` repeats, `--eval-only a,b`, `--eval-max-cost <usd>`. Spend goes to the budget ledger and the run is refused when the budget is STOP. Reports are saved in `~/.local/share/ai-ship/evals/`; `ai-ship --eval-results` lists the latest per model. Enable a new model in `models.json` only after it passes.
+Limits: agents run as your user, so a determined model could still search the disk for the fixture files; the harness hides case names, rejects edits outside `src/`/`test/` and requires the full TAP pass count, but treat evals as a quality signal for honest models, not a security boundary.

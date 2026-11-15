@@ -1,0 +1,4 @@
+{
+  "test": "node --test --test-reporter=tap hidden/",
+  "tests": 5
+}

@@ -9,7 +9,8 @@ import { startMcpServer } from "../src/mcp.ts";
 import { listNotyCategoryTasks, parseNotyAddress, parseNotyCategoryAddress, resolveNotyTask, writeNotyResult } from "../src/noty.ts";
 import { runQueue } from "../src/queue.ts";
 import { runDreamConsolidation, runPipeline } from "../src/pipeline.ts";
-import { normalizeProvider } from "../src/runner.ts";
+import { createRunner, normalizeProvider } from "../src/runner.ts";
+import { formatEvalReport, latestEvalReports, runEval, saveEvalReport } from "../src/evals.ts";
 import { createRestApi, discoverDesktopService, findDesktopCli } from "../src/oc2/api.ts";
 import { spawnSync } from "node:child_process";
 import { createLazyRunner, createOc2Runner } from "../src/oc2/runner.ts";
@@ -19,7 +20,7 @@ import { buildGatewayProvider, formatCatalog, loadCatalog, syncCatalog } from ".
 import { computeBudgetStatus, formatBudgetReport, loadBudgetConfig, monthStart, readLedger } from "../src/budget.ts";
 import { computeModelScores, formatReport, readOutcomes, refreshOutcomes } from "../src/outcomes.ts";
 import { getModelsFilePath } from "../src/pricing.ts";
-import { planRouting } from "../src/pipeline.ts";
+import { planRouting, resolveCloudflareGatewayUrl } from "../src/pipeline.ts";
 import { formatDoctor, initRepo as initRepoFiles, installPlugin, runDoctor, uninstallPlugin } from "../src/doctor.ts";
 
 function printHelp() {
@@ -63,6 +64,9 @@ Options:
   --init             Copy starter AGENTS.md and .ai-ship.json into target repo
   --route            Dry run: classify the task and print the role → model routing plan (no changes)
   --tag <tag>        Task tag such as size:L or risk:high (overrides the classifier; repeatable)
+  --eval <role> --model <p/m>  Evaluate a model as implementer (hidden-test pass rate) or reviewer (planted-bug verdicts)
+                     [--eval-n <1-10>] [--eval-only a,b] [--eval-max-cost <usd>]; costs real tokens, refused when the budget is STOP
+  --eval-results     Latest eval result per role and model
   --outcomes-refresh Update recorded outcomes from PR CI checks and reverts (feeds routing and --report)
   --report           Monthly report: spend vs budget, tasks, first-pass success, cost per committed task, quality per model
   --budget           Show month-to-date spend vs the £ budget, forecast and breakdowns (ledger: ~/.local/share/ai-ship/ledger.jsonl)
@@ -298,6 +302,72 @@ if (parsed.doReport) {
   const outcomes = readOutcomes(undefined, monthStart(now));
   const spendLines = formatBudgetReport(status, entries, gbpPerUsd, { countSubscription: budgetCfg.countSubscription }).slice(0, 3);
   for (const line of formatReport({ outcomes, spendLines, scores: computeModelScores(outcomes, now) })) console.log(line);
+  process.exit(0);
+}
+
+if (parsed.doEvalResults) {
+  const reports = latestEvalReports();
+  if (reports.length === 0) console.log("No eval results yet (run ai-ship --eval implementer --model <provider/model>).");
+  for (const r of reports) console.log(formatEvalReport(r)[0]);
+  process.exit(0);
+}
+
+if (parsed.evalRole) {
+  const evalModel = parsed.model;
+  if (!evalModel) {
+    console.error("Error: --eval needs --model <provider/model>.");
+    process.exit(1);
+  }
+  const { catalog } = loadCatalog();
+  const now = new Date();
+  const status = computeBudgetStatus({
+    entries: readLedger(undefined, monthStart(now)),
+    budget: loadBudgetConfig(loadRepoConfig(repoDir).budget, getModelsFilePath()),
+    gbpPerUsd: 1 / catalog.fx.GBPUSD,
+    now,
+  });
+  if (status.state === "STOP" && !parsed.overrideBudget) {
+    console.error("Error: the monthly budget is used up (STOP); evals spend real tokens. Pass --override-budget to run anyway.");
+    process.exit(1);
+  }
+  const evalProvider = normalizeProvider(parsed.rawProvider);
+  const role = parsed.evalRole;
+  // The user's repo config (providers, pricing, gateway) — but no fallbacks: a failover would score another
+  // model under the evaluated model's name.
+  const evalConfig = {
+    ...loadRepoConfig(repoDir),
+    implementerFallbackModel: undefined,
+    testerFallbackModel: undefined,
+    reviewerFallbackModel: undefined,
+    bughunterFallbackModel: undefined,
+  };
+  const cfGatewayUrl = resolveCloudflareGatewayUrl();
+  // Without --eval-max-cost, cap spend at what is left of this month's budget.
+  const remainingUsd = status.state === "STOP" ? undefined : status.remainingGBP * catalog.fx.GBPUSD;
+  const maxCostUsd = parsed.evalMaxCostUsd ?? (remainingUsd !== undefined && Number.isFinite(remainingUsd) && remainingUsd > 0 ? remainingUsd : undefined);
+  console.log(`[ai-ship] Eval: ${role} on ${evalModel} (provider ${evalProvider}, budget ${status.state})`);
+  const report = await runEval({
+    role,
+    model: evalModel,
+    n: parsed.evalN,
+    only: parsed.evalOnly,
+    maxCostUsd,
+    makeRunner: (dir, r, m) =>
+      createRunner({
+        provider: evalProvider,
+        worktreeDir: dir,
+        config: evalConfig,
+        cfGatewayUrl,
+        ...(r === "implementer" ? { model: m } : { roleModels: { [r]: m } }),
+      }),
+    onCase: (c) => console.log(`  ${c.pass ? "PASS" : "FAIL"} ${c.name}#${c.attempt} (${(c.latencyMs / 1000).toFixed(1)}s, $${c.costUsd.toFixed(4)})`),
+  });
+  for (const line of formatEvalReport(report)) console.log(line);
+  if (report.cases.length > 0 && report.errored === report.cases.length) {
+    console.error("[ai-ship] Every case errored (model id, API key, gateway or rate limit?); no report saved.");
+    process.exit(1);
+  }
+  console.log(`[ai-ship] Report: ${saveEvalReport(report)}`);
   process.exit(0);
 }
 

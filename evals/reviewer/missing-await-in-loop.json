@@ -1,0 +1,5 @@
+{
+  "expected": "OPEN",
+  "note": "save() not awaited: errors are lost and the response is sent before writes finish",
+  "diff": "--- a/src/import.js\n+++ b/src/import.js\n@@ -4,10 +4,10 @@ export async function importRows(rows, repo) {\n   let saved = 0;\n-  for (const row of rows) {\n-    await repo.save(normalize(row));\n-    saved++;\n-  }\n+  rows.forEach((row) => {\n+    repo.save(normalize(row));\n+    saved++;\n+  });\n   return { saved };\n }\n"
+}

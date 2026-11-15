@@ -1,0 +1,1 @@
+Implement `slugify(text)` in src/slugify.mjs: lowercase, strip diacritics (é → e), replace every run of non [a-z0-9] characters with a single "-", and trim leading/trailing "-". Empty or symbol-only input returns "".

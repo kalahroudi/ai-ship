@@ -313,6 +313,12 @@ export interface ParsedCliArgs {
   doInit: boolean;
   doDoctor: boolean;
   doBudget: boolean;
+  /** `--eval`: run the model eval harness (task 17). */
+  evalRole?: "implementer" | "reviewer";
+  evalN?: number;
+  evalOnly?: string[];
+  evalMaxCostUsd?: number;
+  doEvalResults: boolean;
   doReport: boolean;
   doOutcomesRefresh: boolean;
   routeOnly: boolean;
@@ -388,6 +394,7 @@ export function parseCliArgs(args: string[], cwd = process.cwd()): ParsedCliArgs
     doInit: false,
     doDoctor: false,
     doBudget: false,
+    doEvalResults: false,
     doReport: false,
     doOutcomesRefresh: false,
     routeOnly: false,
@@ -500,6 +507,22 @@ export function parseCliArgs(args: string[], cwd = process.cwd()): ParsedCliArgs
       result.doOutcomesRefresh = true;
     } else if (arg === "--budget") {
       result.doBudget = true;
+    } else if (arg === "--eval" && args[i + 1]) {
+      const r = args[++i];
+      if (r === "implementer" || r === "reviewer") result.evalRole = r;
+      else result.unknownOption ??= `--eval ${r} (role must be implementer or reviewer)`;
+    } else if (arg === "--eval-n" && args[i + 1]) {
+      const n = Number(args[++i]);
+      if (Number.isInteger(n) && n >= 1 && n <= 10) result.evalN = n;
+      else result.unknownOption ??= `--eval-n ${args[i]} (1-10)`;
+    } else if (arg === "--eval-only" && args[i + 1]) {
+      result.evalOnly = args[++i].split(",").map((x) => x.trim()).filter(Boolean);
+    } else if (arg === "--eval-max-cost" && args[i + 1]) {
+      const n = Number(args[++i]);
+      if (Number.isFinite(n) && n > 0) result.evalMaxCostUsd = n;
+      else result.unknownOption ??= `--eval-max-cost ${args[i]} (USD > 0)`;
+    } else if (arg === "--eval-results") {
+      result.doEvalResults = true;
     } else if (arg === "--override-budget") {
       result.overrideBudget = true;
     } else if (arg === "--doctor") {

@@ -113,6 +113,37 @@ export function resolveUpstreamTarget(upstream: URL, rawPath: string | undefined
   return target;
 }
 
+/** FIFO semaphore per key; `limit` undefined or ≤ 0 means unlimited. */
+export function createKeyedLimiter(): { acquire(key: string, limit?: number): Promise<() => void>; active(key: string): number } {
+  const state = new Map<string, { active: number; queue: Array<() => void> }>();
+  const get = (k: string) => {
+    let s = state.get(k);
+    if (!s) state.set(k, (s = { active: 0, queue: [] }));
+    return s;
+  };
+  return {
+    active: (k) => state.get(k)?.active ?? 0,
+    acquire(key, limit) {
+      const s = get(key);
+      const release = () => {
+        s.active -= 1;
+        const next = s.queue.shift();
+        if (next) next();
+      };
+      if (!limit || limit <= 0 || s.active < limit) {
+        s.active += 1;
+        return Promise.resolve(release);
+      }
+      return new Promise((resolve) => {
+        s.queue.push(() => {
+          s.active += 1;
+          resolve(release);
+        });
+      });
+    },
+  };
+}
+
 export async function startEgressProxy(opts: {
   upstreamBase: string;
   token?: string;
@@ -120,7 +151,10 @@ export async function startEgressProxy(opts: {
   onUsage?: (u: EgressUsage) => void;
   /** Called before each upstream request; throw to reject it (e.g. budget exhausted) with HTTP 429. */
   beforeRequest?: (info: { model?: string }) => void | Promise<void>;
+  /** Max concurrent upstream requests per model (from the catalog); extra requests wait in FIFO order. */
+  maxConcurrency?: (model: string | undefined) => number | undefined;
 }): Promise<EgressProxy> {
+  const limiter = createKeyedLimiter();
   const upstream = new URL(opts.upstreamBase.replace(/\/+$/, "") + "/");
   const client = upstream.protocol === "https:" ? https : http;
 
@@ -161,6 +195,27 @@ export async function startEgressProxy(opts: {
     } catch (err) {
       res.writeHead(429, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: { message: `ai-ship egress: ${(err as Error).message}`, type: "budget" } }));
+      return;
+    }
+    const limit = opts.maxConcurrency?.(model);
+    // Watch for the client going away BEFORE waiting for a slot: a request whose client is gone must
+    // neither be sent upstream (paid call) nor keep its slot.
+    let clientGone = false;
+    let release: (() => void) | undefined;
+    let released = false;
+    const done = () => {
+      if (release && !released) {
+        released = true;
+        release();
+      }
+    };
+    res.on("close", () => {
+      clientGone = true;
+      done();
+    });
+    release = await limiter.acquire(model ?? "(none)", limit);
+    if (clientGone) {
+      done();
       return;
     }
     const headers: Record<string, string> = {};

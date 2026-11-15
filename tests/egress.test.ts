@@ -3,7 +3,7 @@ import test from "node:test";
 import http from "node:http";
 import zlib from "node:zlib";
 import net from "node:net";
-import { parseUsageFromBody, resolveUpstreamTarget, startEgressProxy, type EgressUsage } from "../src/egress.ts";
+import { createKeyedLimiter, parseUsageFromBody, resolveUpstreamTarget, startEgressProxy, type EgressUsage } from "../src/egress.ts";
 
 test("parseUsageFromBody: JSON, SSE last usage wins, cached tokens, none", () => {
   const j = parseUsageFromBody(
@@ -281,6 +281,145 @@ test("egress proxy: upstream socket destroyed mid-stream terminates the client r
       new Promise<string>((r) => setTimeout(() => r("hung"), 3000)),
     ]);
     assert.notEqual(outcome, "hung");
+  } finally {
+    await proxy.close();
+    await up.close();
+  }
+});
+
+test("createKeyedLimiter: FIFO per key, release frees next waiter, unlimited when limit <= 0/undefined", async () => {
+  const lim = createKeyedLimiter();
+  const order: string[] = [];
+  const r1 = await lim.acquire("a", 1);
+  assert.equal(lim.active("a"), 1);
+  const p2 = lim.acquire("a", 1).then((rel) => (order.push("2"), rel));
+  const p3 = lim.acquire("a", 1).then((rel) => (order.push("3"), rel));
+  const other = await lim.acquire("b", 1); // different key unaffected
+  await new Promise((r) => setTimeout(r, 10));
+  assert.deepEqual(order, []);
+  r1();
+  const r2 = await p2;
+  await new Promise((r) => setTimeout(r, 10));
+  assert.deepEqual(order, ["2"], "3 still waits");
+  r2();
+  (await p3)();
+  assert.deepEqual(order, ["2", "3"]);
+  other();
+  assert.equal(lim.active("a"), 0);
+  for (const limit of [undefined, 0, -1]) {
+    const rels = await Promise.all([lim.acquire("u", limit), lim.acquire("u", limit), lim.acquire("u", limit)]);
+    assert.equal(lim.active("u"), 3);
+    rels.forEach((r) => r());
+    assert.equal(lim.active("u"), 0);
+  }
+});
+
+test("egress proxy: maxConcurrency serializes a limited model upstream; other models unaffected", async () => {
+  let inflight = 0;
+  const maxByModel: Record<string, number> = {};
+  const cur: Record<string, number> = {};
+  const up = await fakeUpstream((req, res) => {
+    let b = "";
+    req.on("data", (c) => (b += c));
+    req.on("end", () => {
+      const m = (JSON.parse(b) as { model: string }).model;
+      cur[m] = (cur[m] ?? 0) + 1;
+      inflight += 1;
+      maxByModel[m] = Math.max(maxByModel[m] ?? 0, cur[m]);
+      setTimeout(() => {
+        cur[m] -= 1;
+        inflight -= 1;
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ model: m, usage: { prompt_tokens: 1, completion_tokens: 1 } }));
+      }, 150);
+    });
+  });
+  const proxy = await startEgressProxy({ upstreamBase: up.url, maxConcurrency: (m) => (m === "slow" ? 1 : undefined) });
+  const call = (model: string) =>
+    new Promise<number>((resolve, reject) => {
+      const t = Date.now();
+      const r = http.request(`${proxy.url}/chat/completions`, { method: "POST" }, (res) => {
+        res.resume();
+        res.on("end", () => resolve(Date.now() - t));
+      });
+      r.on("error", reject);
+      r.end(JSON.stringify({ model }));
+    });
+  try {
+    const slow = await Promise.all([call("slow"), call("slow")]);
+    assert.equal(maxByModel.slow, 1, "never 2 in flight for the limited model");
+    assert.ok(Math.max(...slow) >= 280, `second waited for first (${slow})`);
+    const fast = await Promise.all([call("fast"), call("fast")]);
+    assert.equal(maxByModel.fast, 2, "unlimited model runs concurrently");
+    assert.ok(Math.max(...fast) < 280);
+    assert.equal(inflight, 0);
+  } finally {
+    await proxy.close();
+    await up.close();
+  }
+});
+
+test("egress proxy: slot is released when the client closes early", async () => {
+  let hits = 0;
+  const up = await fakeUpstream((_req, res) => {
+    hits += 1;
+    setTimeout(() => { res.writeHead(200); res.end("{}"); }, 600);
+  });
+  const proxy = await startEgressProxy({ upstreamBase: up.url, maxConcurrency: () => 1 });
+  try {
+    const first = http.request(`${proxy.url}/x`, { method: "POST" });
+    first.on("error", () => {});
+    first.end(JSON.stringify({ model: "m" }));
+    await new Promise((r) => setTimeout(r, 100));
+    const t = Date.now();
+    const second = new Promise<void>((resolve, reject) => {
+      const r = http.request(`${proxy.url}/x`, { method: "POST" }, (res) => { res.resume(); res.on("end", resolve); });
+      r.on("error", reject);
+      r.end(JSON.stringify({ model: "m" }));
+    });
+    await new Promise((r) => setTimeout(r, 50));
+    first.destroy();
+    await second;
+    assert.ok(Date.now() - t < 1000, "second proceeded after first client closed");
+    assert.equal(hits, 2);
+  } finally {
+    await proxy.close();
+    await up.close();
+  }
+});
+
+test("egress proxy: client aborting while queued is not forwarded and leaks no slot", async () => {
+  const seen: string[] = [];
+  const up = await fakeUpstream((req, res) => {
+    let b = "";
+    req.on("data", (c) => (b += c));
+    req.on("end", () => {
+      seen.push((JSON.parse(b) as { id: string }).id);
+      setTimeout(() => { res.writeHead(200); res.end("{}"); }, 300);
+    });
+  });
+  const proxy = await startEgressProxy({ upstreamBase: up.url, maxConcurrency: () => 1 });
+  const send = (id: string) => {
+    const r = http.request(`${proxy.url}/x`, { method: "POST" }, (res) => res.resume());
+    r.on("error", () => {});
+    r.end(JSON.stringify({ model: "m", id }));
+    return r;
+  };
+  const done = (id: string) =>
+    new Promise<void>((resolve) => {
+      const r = http.request(`${proxy.url}/x`, { method: "POST" }, (res) => { res.resume(); res.on("end", resolve); });
+      r.on("error", () => resolve());
+      r.end(JSON.stringify({ model: "m", id }));
+    });
+  try {
+    send("A");
+    await new Promise((r) => setTimeout(r, 80));
+    const b = send("B");
+    await new Promise((r) => setTimeout(r, 80));
+    b.destroy();
+    await new Promise((r) => setTimeout(r, 400)); // A finishes
+    await Promise.race([done("C"), new Promise((_, rej) => setTimeout(() => rej(new Error("C stuck: slot leaked")), 2000))]);
+    assert.deepEqual(seen, ["A", "C"]);
   } finally {
     await proxy.close();
     await up.close();

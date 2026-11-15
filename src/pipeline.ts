@@ -31,6 +31,7 @@ import { appendLedger, BudgetStopError, computeBudgetStatus, loadBudgetConfig, m
 import { loadCatalog } from "./catalog.ts";
 import { classifyTask, parseNumstat, reclassifyFromDiff, type Classification } from "./classify.ts";
 import { formatRoutePlan, routeModels, type RoutePlan } from "./router.ts";
+import { appendOutcome, computeModelScores, learnedBonus, readOutcomes, type TaskOutcome } from "./outcomes.ts";
 import {
   assertProtectedPathsUnchanged,
   CHECKPOINT_PREFIX,
@@ -878,6 +879,17 @@ async function runDeterministicVerify(
   if (config.verify.length === 0) {
     return { ok: true, output: logs.join("\n\n") || "No verify commands configured or detected." };
   }
+  if (config.verifyParallel && config.verify.length > 1) {
+    console.log(`  -> running in parallel: ${config.verify.join(" | ")}`);
+    const results = await Promise.all(config.verify.map((cmd) => runShellAsync(cmd, worktreeDir)));
+    results.forEach((res, i) => logs.push(`$ ${config.verify[i]}\n${res.output}`));
+    // Report the first failing command in configured order (deterministic).
+    const failed = results.findIndex((r) => !r.ok);
+    if (failed >= 0) {
+      return { ok: false, failedCommand: config.verify[failed], output: results[failed].output.slice(-verifyOutputMaxChars) };
+    }
+    return { ok: true, output: logs.join("\n\n") };
+  }
   for (const cmd of config.verify) {
     console.log(`  -> running: ${cmd}`);
     const res = await runShellAsync(cmd, worktreeDir);
@@ -1221,6 +1233,7 @@ export function planRouting(opts: {
     catalog,
     classification,
     budget: status.state,
+    bonus: learnedBonus(computeModelScores(readOutcomes(undefined, new Date(now.getTime() - 120 * 86_400_000)), now)),
     viaGateway: Boolean(catalog.gateway?.enabled),
     ...(opts.pinnedImplementer ? { pinnedImplementer: opts.pinnedImplementer } : {}),
   };
@@ -1433,6 +1446,43 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
   let bughunterFindings: BughunterFinding[] = [];
   let prUrl: string | undefined;
 
+  // Outcome log for adaptive routing and `ai-ship --report` (task 16).
+  const outcomeStats: { started: boolean; fixRounds: number; reviewRounds: number; openFindings: number; implementerModel?: string } = {
+    started: false,
+    fixRounds: 0,
+    reviewRounds: 0,
+    openFindings: 0,
+  };
+  let outcomeRecorded = false;
+  const recordOutcome = (result: TaskOutcome["result"], err?: unknown) => {
+    if (outcomeRecorded) return;
+    outcomeRecorded = true;
+    try {
+      appendOutcome({
+        ts: new Date().toISOString(),
+        taskId: worktree.branch,
+        repo: repoDir,
+        result,
+        ...(routing.plan ? { size: routing.classification.size, risk: routing.classification.risk } : {}),
+        models: {
+          ...((outcomeStats.implementerModel ?? roleLabels.implementer)
+            ? { implementer: outcomeStats.implementerModel ?? roleLabels.implementer }
+            : {}),
+          ...(roleLabels.tester ? { tester: roleLabels.tester } : {}),
+          ...(roleLabels.reviewer ? { reviewer: roleLabels.reviewer } : {}),
+          ...(roleLabels.bughunter ? { bughunter: roleLabels.bughunter } : {}),
+        },
+        fixRounds: outcomeStats.fixRounds,
+        reviewRounds: outcomeStats.reviewRounds,
+        openFindings: outcomeStats.openFindings,
+        costUsd: budget.getTotals().costUsd,
+        ...(err ? { error: (err instanceof Error ? err.message : String(err)).slice(0, 300) } : {}),
+      });
+    } catch (e) {
+      console.error(`[ai-ship] Warning: could not write the outcome log: ${(e as Error).message}`);
+    }
+  };
+
   // Gate integrity: track this run's starting point, checkpoint each agent's work, and make sure no agent
   // weakens the verify config or edits the tester's tests.
   // Files the verify commands invoke (e.g. scripts/test.sh behind `npm test`) are gates too.
@@ -1512,6 +1562,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
       }
     }
     let testSessionId: string | undefined;
+    outcomeStats.started = true;
     let testerFiles: string[] = [];
     const disputedFiles = new Set<string>();
 
@@ -1667,6 +1718,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
           );
         }
         implementerAttempts += 1;
+        outcomeStats.fixRounds += 1;
         // Router escalation: after two failed implementer fixes, move the implementer up one tier (once).
         if (
           implementerAttempts >= 2 &&
@@ -1698,6 +1750,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
           const up = routeModels({ ...routing.inputs, escalate: true, implementerExcludeFamilies: families }).decisions.implementer;
           if (up && up.model !== routing.plan.decisions.implementer?.model) {
             implementerOverride = { providerID: up.model.slice(0, up.model.indexOf("/")), modelID: up.model.slice(up.model.indexOf("/") + 1) };
+            outcomeStats.implementerModel = up.model;
             integrityLog(`  [router] Escalating implementer to ${up.model} after ${implementerAttempts - 1} failed fixes (${up.reason})`);
           }
         }
@@ -1817,6 +1870,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
         reviewVerdicts = [...verdictMap].map(([lens, verdict]) => ({ lens, verdict }));
 
         const openLenses = reviews.filter((r) => r.verdict === "OPEN");
+        outcomeStats.reviewRounds = round;
         const bughunterOpen = bh?.verdict === "OPEN";
         if (openLenses.length === 0 && !bughunterOpen) {
           console.log("  -> All reviewers CLEAN.");
@@ -1831,6 +1885,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
           .join("\n\n");
 
         if (round === config.maxReviewRounds) {
+          outcomeStats.openFindings = openLenses.length + (bughunterOpen ? 1 : 0);
           console.log("\n[ai-ship] Review findings remain open after max rounds:");
           console.log(`\n${findingsText}`);
           throw new Error(
@@ -1936,6 +1991,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
       for (const line of summaryLines) console.log(line);
     }
 
+    recordOutcome(committed ? "committed" : "no-changes");
     return {
       repoDir,
       worktreeDir: worktree.worktreeDir,
@@ -1955,6 +2011,9 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
       stageUsage,
       totalUsage,
     };
+  } catch (err) {
+    recordOutcome(err instanceof Error && /cancelled/i.test(err.message) ? "cancelled" : "failed", err);
+    throw err;
   } finally {
     runner.close();
   }

@@ -6,7 +6,8 @@ import readline from "node:readline/promises";
 import { listCleanupTargets, removeCleanupTargets } from "../src/git.ts";
 import { loadRepoConfig, parseCliArgs } from "../src/config.ts";
 import { startMcpServer } from "../src/mcp.ts";
-import { parseNotyAddress, resolveNotyTask } from "../src/noty.ts";
+import { listNotyCategoryTasks, parseNotyAddress, parseNotyCategoryAddress, resolveNotyTask, writeNotyResult } from "../src/noty.ts";
+import { runQueue } from "../src/queue.ts";
 import { runDreamConsolidation, runPipeline } from "../src/pipeline.ts";
 import { normalizeProvider } from "../src/runner.ts";
 import { createRestApi, discoverDesktopService, findDesktopCli } from "../src/oc2/api.ts";
@@ -27,6 +28,7 @@ function printHelp() {
 Usage:
   ai-ship "<task description or noty://item/...>" [--repo <dir>] [--worktree <dir>] [--provider <name>] [--model <id>] [--server <url>] [--pr] [--draft] [--skip-tests] [--skip-review]
   ai-ship --noty <noty://item/...> [--noty-dir <dir>] [--repo <dir>] [options]
+  ai-ship noty://category/<path> [--parallel <n>] [--continue-on-failure] [--only-tag <tag>] [--noty-writeback] [options]
   ai-ship --dream [--repo <dir>] [--server <url>] [--model <id>]
   ai-ship --init [--repo <dir>]
   ai-ship --cleanup [--repo <dir>] [--yes]
@@ -38,6 +40,10 @@ Options:
   --repo <dir>       Target git repository (default: current directory)
   --noty <uri>       Resolve task description from a Noty item URI (noty://item/<uuid>)
   --noty-dir <dir>   Override Noty markdown directory (or set NOTY_DIR)
+  --noty-writeback   Append each task's result to its Noty note and mark it done when committed
+  --parallel <n>     Category runs: tasks at once, each in its own worktree (1-4, default 1)
+  --continue-on-failure  Category runs: keep going after a failed task (default: stop)
+  --only-tag <tag>   Category runs: only tasks with this tag (e.g. fix)
   --provider <name>  Runner provider: opencode (default, deepseek/parasail/telnyx/openrouter/cloudflare) or claude-code
   --model <id>       Implementer model override (provider/model for opencode; alias/id for claude-code)
   --tester-model <id>     Tester model override (must differ from the implementer)
@@ -359,12 +365,90 @@ if (doDream) {
 }
 
 const provider = normalizeProvider(rawProvider);
-let task = positional.join(" ").trim();
+const positionalTask = positional.join(" ").trim();
+const onEvent = throttleSink((e) => console.log(formatProgressEvent(e)), 1000);
+/** @type {ReturnType<typeof createRestApi> | undefined} */
+let attachApi;
+if (attach) {
+  const svc = serverUrl ? { baseUrl: serverUrl, password: process.env.OPENCODE_SERVER_PASSWORD } : discoverDesktopService();
+  if (!svc) {
+    console.error("Error: --attach could not find the OpenCode Desktop service (set OPENCODE_SERVER_URL / OPENCODE_SERVER_PASSWORD).");
+    process.exit(1);
+  }
+  console.log(`[ai-ship] Attaching to OpenCode 2.x service at ${svc.baseUrl}`);
+  attachApi = createRestApi(svc);
+}
+
+/** Runs one task through the pipeline (fresh runner per task so each gets its own ship session). */
+async function shipOne(/** @type {string} */ task, /** @type {string | undefined} */ reuseWorktree) {
+  let lazy;
+  if (attachApi) {
+    const api = attachApi;
+    const roleModels = { implementer: model, tester: testerModel, reviewer: reviewerModel, bughunter: bughunterModel };
+    lazy = createLazyRunner((dir, effective, effectiveModels) => createOc2Runner({ api, worktreeDir: dir, config: effective ?? loadRepoConfig(repoDir), task, roleModels: effectiveModels ?? roleModels, onEvent }));
+  }
+  return runPipeline({ repoDir, worktreeDir: reuseWorktree, task, openPr, draft, skipTests, skipReview, skipBughunter, allowConfigChange, provider, model, testerModel, reviewerModel, bughunterModel, serverUrl: attach ? undefined : serverUrl, contextLens, onEvent, overrideBudget: parsed.overrideBudget, tags: parsed.tags, ...(lazy ? { runner: lazy.runner, onWorktree: lazy.onWorktree } : {}) });
+}
+
+function resultSummary(/** @type {any} */ r) {
+  if (!r) return "pipeline completed";
+  return [r.committed ? `committed on ${r.branch}` : "no changes committed", r.prUrl ? `PR ${r.prUrl}` : "", r.diffStat ? r.diffStat.split("\n").pop()?.trim() : ""]
+    .filter(Boolean)
+    .join(" — ");
+}
+
+const categoryInput = notyAddress ?? positionalTask;
+const category = parseNotyCategoryAddress(categoryInput);
+if (!category && /^noty:\/\/category\//i.test(categoryInput.trim())) {
+  console.error(`Error: invalid Noty category address "${categoryInput}".`);
+  process.exit(1);
+}
+if (category) {
+  if (worktreeDir) {
+    console.error("Error: --worktree cannot be combined with a Noty category run (each task gets its own worktree).");
+    process.exit(1);
+  }
+  const notes = listNotyCategoryTasks(category, { customDir: notyDir, onlyTag: parsed.onlyTag });
+  if (notes.length === 0) {
+    console.log(`[ai-ship] No open tasks in Noty category ${category}.`);
+    process.exit(0);
+  }
+  console.log(`[ai-ship] Category ${category}: ${notes.length} open task(s)`);
+  notes.forEach((n, i) => console.log(`  ${i + 1}. ${n.title || n.id}`));
+  const results = await runQueue(
+    notes,
+    async (note, i) => {
+      console.log(`\n[ai-ship] ===== Task ${i + 1}/${notes.length}: ${note.title || note.id} =====`);
+      const r = await shipOne(note.task, undefined);
+      if (r && !r.committed) throw new Error("no changes committed");
+      return r;
+    },
+    {
+      concurrency: parsed.queueParallel ?? 1,
+      stopOnFailure: !parsed.continueOnFailure,
+      onDone: (res) => {
+        if (!parsed.notyWriteBack) return;
+        try {
+          writeNotyResult(res.item, { ok: res.status === "succeeded", summary: res.status === "succeeded" ? resultSummary(res.result) : `failed: ${res.error}` });
+        } catch (err) {
+          console.error(`[ai-ship] Warning: Noty write-back failed for ${res.item.id}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      },
+    }
+  );
+  console.log("\n[ai-ship] Category run summary:");
+  for (const r of results) console.log(`  ${r.status.padEnd(9)} ${r.item.title || r.item.id}${r.error ? ` — ${r.error.slice(0, 200)}` : ""}`);
+  process.exit(results.every((r) => r.status === "succeeded") ? 0 : 1);
+}
+
+let task = positionalTask;
+/** @type {ReturnType<typeof resolveNotyTask> | undefined} */
+let notyNote;
 const notyInput = notyAddress ?? (parseNotyAddress(task) ? task : null);
 if (notyInput) {
-  const note = resolveNotyTask(notyInput, notyDir);
-  console.log(`[ai-ship] Resolved Noty task "${note.title || note.id}" from ${note.filePath}`);
-  task = note.task;
+  notyNote = resolveNotyTask(notyInput, notyDir);
+  console.log(`[ai-ship] Resolved Noty task "${notyNote.title || notyNote.id}" from ${notyNote.filePath}`);
+  task = notyNote.task;
 }
 
 if (!task) {
@@ -373,20 +457,22 @@ if (!task) {
   process.exit(1);
 }
 
-const onEvent = throttleSink((e) => console.log(formatProgressEvent(e)), 1000);
-/** @type {ReturnType<typeof createLazyRunner> | undefined} */
-let lazy;
-if (attach) {
-  const svc = serverUrl ? { baseUrl: serverUrl, password: process.env.OPENCODE_SERVER_PASSWORD } : discoverDesktopService();
-  if (!svc) {
-    console.error("Error: --attach could not find the OpenCode Desktop service (set OPENCODE_SERVER_URL / OPENCODE_SERVER_PASSWORD).");
-    process.exit(1);
+let single;
+try {
+  single = await shipOne(task, worktreeDir);
+} catch (err) {
+  if (notyNote && parsed.notyWriteBack) {
+    try {
+      writeNotyResult(notyNote, { ok: false, summary: `failed: ${err instanceof Error ? err.message : String(err)}` });
+    } catch {}
   }
-  console.log(`[ai-ship] Attaching to OpenCode 2.x service at ${svc.baseUrl}`);
-  const api = createRestApi(svc);
-  const roleModels = { implementer: model, tester: testerModel, reviewer: reviewerModel, bughunter: bughunterModel };
-  lazy = createLazyRunner((dir, effective, effectiveModels) => createOc2Runner({ api, worktreeDir: dir, config: effective ?? loadRepoConfig(repoDir), task, roleModels: effectiveModels ?? roleModels, onEvent }));
+  throw err;
 }
-
-await runPipeline({ repoDir, worktreeDir, task, openPr, draft, skipTests, skipReview, skipBughunter, allowConfigChange, provider, model, testerModel, reviewerModel, bughunterModel, serverUrl: attach ? undefined : serverUrl, contextLens, onEvent, overrideBudget: parsed.overrideBudget, tags: parsed.tags, ...(lazy ? { runner: lazy.runner, onWorktree: lazy.onWorktree } : {}) });
+if (notyNote && parsed.notyWriteBack) {
+  try {
+    writeNotyResult(notyNote, { ok: Boolean(single?.committed ?? true), summary: resultSummary(single) });
+  } catch (err) {
+    console.error(`[ai-ship] Warning: Noty write-back failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
 }

@@ -327,6 +327,14 @@ export interface ParsedCliArgs {
   force: boolean;
   notyAddress?: string;
   notyDir?: string;
+  /** Write each task's result back into its Noty note (and mark it done on commit). */
+  notyWriteBack?: boolean;
+  /** Category runs: how many tasks run at once (1–4, default 1). */
+  queueParallel?: number;
+  /** Category runs: keep going after a failed task. */
+  continueOnFailure?: boolean;
+  /** Category runs: only tasks carrying this tag. */
+  onlyTag?: string;
   rawProvider?: string;
   model?: string;
   testerModel?: string;
@@ -470,6 +478,16 @@ export function parseCliArgs(args: string[], cwd = process.cwd()): ParsedCliArgs
       result.modelsAction = "opencode-config";
     } else if (arg === "--route") {
       result.routeOnly = true;
+    } else if (arg === "--noty-writeback") {
+      result.notyWriteBack = true;
+    } else if (arg === "--continue-on-failure") {
+      result.continueOnFailure = true;
+    } else if (arg === "--parallel" && args[i + 1]) {
+      const n = Number(args[++i]);
+      if (!Number.isInteger(n) || n < 1 || n > 4) result.unknownOption ??= `--parallel ${args[i]} (must be an integer from 1 to 4)`;
+      else result.queueParallel = n;
+    } else if (arg === "--only-tag" && args[i + 1]) {
+      result.onlyTag = args[++i];
     } else if (arg === "--tag" && args[i + 1]) {
       result.tags.push(args[++i]);
     } else if (arg.startsWith("--tag=")) {

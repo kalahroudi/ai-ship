@@ -478,7 +478,14 @@ export function persistMcpJobs(file = getMcpJobsPath()): void {
   try {
     const ours = [...mcpJobs.values()].map(({ cancelled: _c, ...j }) => ({ ...j, events: j.events.slice(-20) }));
     const ids = new Set(ours.map((j) => j.id));
-    const others = readJobFile(file).filter((j) => j.pid !== process.pid && pidAlive(j.pid) && !ids.has(j.id as string));
+    // Keep other servers' entries; a dead server's running job becomes "interrupted" instead of vanishing.
+    const others = readJobFile(file)
+      .filter((j) => j.pid !== process.pid && typeof j.id === "string" && !ids.has(j.id))
+      .map((j) =>
+        j.status === "running" && !pidAlive(j.pid)
+          ? { ...j, status: "interrupted" as const, error: "interrupted: its ai-ship MCP server exited while it was running (worktree kept)." }
+          : j
+      );
     const list = [...others, ...ours].slice(-(MAX_JOBS * 2));
     fs.mkdirSync(path.dirname(file), { recursive: true });
     const tmp = `${file}.${process.pid}.tmp`;

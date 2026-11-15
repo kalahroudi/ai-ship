@@ -121,6 +121,12 @@ export interface BughunterFinding {
   reason: string;
 }
 
+/** claude-code on a Claude subscription (no API key, auth token, Bedrock or Vertex metering). */
+export function isSubscriptionBilled(provider: string, env: NodeJS.ProcessEnv = process.env): boolean {
+  if (provider !== "claude-code") return false;
+  return !(env.ANTHROPIC_API_KEY || env.ANTHROPIC_AUTH_TOKEN || env.CLAUDE_CODE_USE_BEDROCK || env.CLAUDE_CODE_USE_VERTEX);
+}
+
 export interface PipelineResult {
   repoDir: string;
   worktreeDir: string;
@@ -1414,7 +1420,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
   const taskId = worktree.branch;
   // Subscription-billed calls (claude-code without an API key) are not cash spend: the governor's £ task cap
   // does not apply to them unless the user counts subscription usage. An explicit maxTaskCostUsd still does.
-  const subscriptionBilled = provider === "claude-code" && !process.env.ANTHROPIC_API_KEY && !budgetConfig.countSubscription;
+  const subscriptionBilled = isSubscriptionBilled(provider) && !budgetConfig.countSubscription;
   const effectiveMaxTaskCostUsd =
     governorTaskCapUsd === undefined || subscriptionBilled
       ? config.maxTaskCostUsd
@@ -1436,7 +1442,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
         costUsd: u.costUsd,
         ...(u.costSource ? { costSource: u.costSource } : {}),
         // claude-code on a subscription is not cash spend; with ANTHROPIC_API_KEY it is metered.
-        billing: provider === "claude-code" && !process.env.ANTHROPIC_API_KEY ? "subscription" : "metered",
+        billing: isSubscriptionBilled(provider) ? "subscription" : "metered",
       }),
   });
   const testDiffMaxChars =

@@ -288,3 +288,12 @@ test("createLazyRunner passes the config from onWorktree(dir, config) to build(d
   assert.equal(got.dir, "/wt");
   assert.equal(got.config, config);
 });
+
+import { isSubscriptionBilled } from "../src/pipeline.ts";
+test("isSubscriptionBilled: claude-code without metered credentials only", () => {
+  assert.equal(isSubscriptionBilled("claude-code", {}), true);
+  assert.equal(isSubscriptionBilled("opencode", {}), false);
+  for (const k of ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX"]) {
+    assert.equal(isSubscriptionBilled("claude-code", { [k]: "1" }), false, k);
+  }
+});

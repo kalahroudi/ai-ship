@@ -10,6 +10,7 @@ import {
   latestEvalReports,
   loadSuite,
   runEval,
+  runHiddenTests,
   saveEvalReport,
   type EvalReport,
 } from "../src/evals.ts";
@@ -19,8 +20,8 @@ import type { AgentRole, PipelineRunner, PromptResult } from "../src/runner.ts";
 const tmp = (p: string) => fs.mkdtempSync(path.join(os.tmpdir(), `evals-test-${p}-`));
 process.env.AI_SHIP_EVALS_DIR = tmp("reports");
 process.env.AI_SHIP_LEDGER_FILE = path.join(tmp("ledger"), "ledger.jsonl");
-// Under `node --test`, NODE_TEST_CONTEXT is inherited by child `node --test` runs, which then always exit 0
-// (suspected src bug: runHiddenTests does not strip it). Strip it so the real hidden-test pass/fail is observable.
+// This process runs with NODE_TEST_CONTEXT set; runHiddenTests must strip it for child `node --test` runs,
+// otherwise they always exit 0. The tests below rely on that (no workaround here).
 
 const IMPL_NAMES = ["memo-async-rejection", "paginate-off-by-one", "parse-duration-feature", "safejoin-traversal", "slugify-feature"];
 const REV_NAMES = ["clean-parameterized-query", "clean-rename-and-guard", "idor-missing-owner-check", "missing-await-in-loop", "sql-injection-concat"];
@@ -87,9 +88,9 @@ test("every fixture's hidden tests FAIL on the untouched fixture repo", () => {
   for (const c of loadSuite("implementer") as Array<{ name: string; dir: string; test: string }>) {
     const ws = tmp(`untouched-${c.name}`);
     fs.cpSync(path.join(c.dir, "repo"), ws, { recursive: true });
-    fs.cpSync(path.join(c.dir, "hidden"), path.join(ws, "hidden"), { recursive: true });
-    const r = spawnSync(c.test, { cwd: ws, shell: true, encoding: "utf8" });
-    assert.notEqual(r.status, 0, `${c.name}: hidden tests unexpectedly pass on untouched repo\n${r.stdout}`);
+    // runHiddenTests strips NODE_TEST_CONTEXT, which this test process has set.
+    const r = runHiddenTests(c as never, ws);
+    assert.equal(r.pass, false, `${c.name}: hidden tests unexpectedly pass on untouched repo\n${r.output}`);
     fs.rmSync(ws, { recursive: true, force: true });
   }
 });

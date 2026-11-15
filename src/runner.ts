@@ -271,6 +271,8 @@ export interface PromptOptions {
 export interface PipelineRunner {
   createSession(title: string): Promise<string>;
   prompt(sessionId: string, role: AgentRole, text: string, options?: PromptOptions): Promise<PromptResult>;
+  /** Compacts/summarizes a long-running session; returns true when the history was actually reduced. */
+  compact?(sessionId: string, role: AgentRole): Promise<boolean>;
   close(): void;
 }
 
@@ -939,6 +941,20 @@ export function createOpencodeClientRunner(opts: {
         },
       });
     },
+    async compact(sessionId: string, role: AgentRole): Promise<boolean> {
+      const model = modelForRole(role);
+      if (!model || !opts.client.session.summarize) return false;
+      try {
+        const res = await opts.client.session.summarize({
+          path: { id: sessionId },
+          query: { directory: opts.worktreeDir },
+          body: { providerID: model.providerID, modelID: model.modelID },
+        });
+        return !(res as { error?: unknown }).error;
+      } catch {
+        return false;
+      }
+    },
     close() {
       opts.onClose?.();
     },
@@ -1155,6 +1171,12 @@ export function createClaudeCodeRunner(opts: {
           });
         },
       });
+    },
+    async compact(sessionId: string): Promise<boolean> {
+      // claude-code: start a fresh CLI session on the next prompt (the pipeline re-states the task).
+      if (!sessionMap.get(sessionId)) return false;
+      sessionMap.set(sessionId, undefined);
+      return true;
     },
     close() {},
   };

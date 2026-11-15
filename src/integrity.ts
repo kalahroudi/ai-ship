@@ -434,6 +434,24 @@ function hashFile(worktreeDir: string, file: string): string | null {
   }
 }
 
+/** Restores `files` to their state at `ref` (checked out if they existed there, deleted otherwise). */
+export function revertPathsToRef(worktreeDir: string, ref: string, files: readonly string[]): void {
+  for (const file of files) {
+    if (showAtRef(worktreeDir, ref, file) !== undefined) {
+      gitOrThrow(worktreeDir, ["checkout", ref, "--", file]);
+    } else {
+      fs.rmSync(path.join(worktreeDir, file), { force: true, recursive: true });
+    }
+  }
+}
+
+/** Reverts every change made since `ref` (tracked and untracked) and returns the reverted paths. */
+export function revertAllChangesSince(worktreeDir: string, ref: string): string[] {
+  const changed = changedFilesSince(worktreeDir, ref).map((f) => f.path);
+  revertPathsToRef(worktreeDir, ref, changed);
+  return changed;
+}
+
 export type FileSnapshot = Map<string, string | null>;
 
 /** Records sha256 hashes of `files` (null for missing files). */

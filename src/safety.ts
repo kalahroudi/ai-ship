@@ -116,7 +116,7 @@ function isDeploymentConfigFile(filePath: string): boolean {
   return DEPLOYMENT_CONFIG_FILE_RE.test(filePath);
 }
 
-function isTestFile(filePath: string): boolean {
+export function isTestFile(filePath: string): boolean {
   return TEST_FILE_RE.test(filePath);
 }
 

@@ -299,7 +299,11 @@ export function commitAll(worktreeDir: string, message: string): boolean {
   const status = execSync("git status --porcelain", { cwd: worktreeDir, encoding: "utf8" }).trim();
   if (!status) return false;
   execSync("git add -A", { cwd: worktreeDir, stdio: "ignore" });
-  spawnSync("git", ["commit", "-m", message], { cwd: worktreeDir, stdio: inheritStdio() });
+  const res = spawnSync("git", ["commit", "-m", message], { cwd: worktreeDir, encoding: "utf8" });
+  if (res.status !== 0) {
+    const output = [res.stdout, res.stderr].filter(Boolean).join("\n").trim();
+    throw new Error(`git commit failed in ${worktreeDir} (exit ${res.status ?? "unknown"}):\n${output.slice(-4000)}`);
+  }
   return true;
 }
 
@@ -356,7 +360,9 @@ export function rebaseOntoBase(worktree: WorktreeHandle): RebaseResult {
 }
 
 function assertSafeToPush(worktree: WorktreeHandle): void {
-  const cfg = loadRepoConfig(worktree.worktreeDir);
+  // Load config from the main repo, never from the agent-writable worktree: otherwise an agent could
+  // set "safetyCheck": false or a catch-all allowlist in the worktree's .ai-ship.json and skip this scan.
+  const cfg = loadRepoConfig(worktree.repoDir);
   if (cfg.safetyCheck !== false) {
     assertWorktreeSafe(worktree.worktreeDir, {
       baseBranch: worktree.baseBranch,

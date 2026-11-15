@@ -26,6 +26,8 @@ import { buildDreamPrompt, getMemoryPath, readMemory, writeConsolidatedMemory } 
 import { assertWorktreeSafe, formatSafetyFindings, scanWorktreeSafety } from "./safety.ts";
 import { findUnpricedModels, getModelsFilePath, loadPricingTable } from "./pricing.ts";
 import type { ProgressSink } from "./progress.ts";
+import { appendLedger, BudgetStopError, computeBudgetStatus, loadBudgetConfig, monthStart, readLedger, type BudgetStatus } from "./budget.ts";
+import { loadCatalog } from "./catalog.ts";
 import {
   assertProtectedPathsUnchanged,
   CHECKPOINT_PREFIX,
@@ -91,6 +93,8 @@ export interface PipelineOptions {
   runner?: PipelineRunner;
   /** Fine-grained per-agent progress events (sessions, tool calls, usage). */
   onEvent?: ProgressSink;
+  /** Run even when the monthly budget governor is in STOP state. */
+  overrideBudget?: boolean;
   /** Returns true when the run was cancelled; checked between stages and before commit/PR. */
   isCancelled?: () => boolean;
   /** Called once the worktree exists (lets lazily-built runners learn its path). */
@@ -124,6 +128,7 @@ export interface PipelineResult {
   bughunterFindings?: BughunterFinding[];
   prUrl?: string;
   usageLog: string[];
+  budgetState?: BudgetStatus["state"];
   stageUsage?: StageUsageSummary[];
   totalUsage?: UsageTotals;
 }
@@ -222,8 +227,17 @@ export class BudgetTracker {
 
   private readonly failOnUnknownCost: boolean;
 
-  constructor(limits: { maxTaskCostUsd?: number; maxTaskTokens?: number; failOnUnknownCost?: boolean }) {
+  private readonly onRecord?: (stage: string, res: PromptResult, usage: PromptUsage) => void;
+
+  constructor(limits: {
+    maxTaskCostUsd?: number;
+    maxTaskTokens?: number;
+    failOnUnknownCost?: boolean;
+    /** Called for every recorded call (e.g. append to the spend ledger). */
+    onRecord?: (stage: string, res: PromptResult, usage: PromptUsage) => void;
+  }) {
     this.failOnUnknownCost = Boolean(limits.failOnUnknownCost);
+    this.onRecord = limits.onRecord;
     this.maxTaskCostUsd =
       typeof limits.maxTaskCostUsd === "number" && limits.maxTaskCostUsd > 0
         ? limits.maxTaskCostUsd
@@ -242,6 +256,11 @@ export class BudgetTracker {
         cacheRead: 0,
         costUsd: 0,
       };
+    try {
+      this.onRecord?.(stage, res, u);
+    } catch (err) {
+      console.error(`[ai-ship] Warning: could not write the spend ledger: ${(err as Error).message}`);
+    }
     const tokens = u.input + u.output + u.cacheRead + (u.reasoning ?? 0) + (u.cacheWrite ?? 0);
     const unknown = u.costSource === "unknown" ? 1 : 0;
     if (unknown && this.failOnUnknownCost) {
@@ -1210,6 +1229,30 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
   });
   for (const w of independenceWarnings) console.log(`[ai-ship] Warning: ${w}`);
 
+  // Monthly budget governor: refuse new tasks in STOP, cap this task by the remaining budget, and
+  // turn the bughunter off in RED. Spend comes from the append-only ledger.
+  const { catalog: budgetCatalog } = loadCatalog();
+  const gbpPerUsd = 1 / budgetCatalog.fx.GBPUSD;
+  const budgetConfig = loadBudgetConfig(config.budget, getModelsFilePath());
+  const now = new Date();
+  const budgetStatus = computeBudgetStatus({
+    entries: readLedger(undefined, monthStart(now)),
+    budget: budgetConfig,
+    gbpPerUsd,
+    now,
+  });
+  console.log(
+    `[ai-ship] Budget ${budgetStatus.state}: £${budgetStatus.monthSpendGBP.toFixed(2)} of £${budgetStatus.spendableGBP.toFixed(2)} this month, next-task cap £${budgetStatus.taskCapGBP.toFixed(2)}${budgetStatus.reasons.length ? ` (${budgetStatus.reasons.join("; ")})` : ""}${budgetStatus.unknownCostCalls ? `; ${budgetStatus.unknownCostCalls} call(s) with unknown cost not counted` : ""}`
+  );
+  // Note: concurrent tasks each pass this check with the full per-task cap; the reserve absorbs the overlap.
+  if (budgetStatus.state === "STOP" && !opts.overrideBudget) throw new BudgetStopError(budgetStatus);
+  // Floor at a tiny positive cap: 0 would mean "no limit" to BudgetTracker.
+  const governorTaskCapUsd = opts.overrideBudget ? undefined : Math.max(1e-6, budgetStatus.taskCapGBP / gbpPerUsd);
+  if (budgetStatus.state === "RED" && !opts.overrideBudget && !opts.skipBughunter) {
+    console.log("[ai-ship] Budget RED: skipping the bughunter pass for this task.");
+    opts = { ...opts, skipBughunter: true };
+  }
+
   // Cost accounting preflight: OpenCode reports $0 for models it has no price for, which would make the
   // budget breaker blind. claude-code reports its own cost.
   if (provider !== "claude-code") {
@@ -1271,10 +1314,30 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
         serverUrl: opts.serverUrl,
       });
   const usageLog: string[] = [];
+  const taskId = worktree.branch;
+  const effectiveMaxTaskCostUsd =
+    governorTaskCapUsd === undefined
+      ? config.maxTaskCostUsd
+      : Math.min(config.maxTaskCostUsd ?? Number.POSITIVE_INFINITY, governorTaskCapUsd);
   const budget = new BudgetTracker({
-    maxTaskCostUsd: config.maxTaskCostUsd,
+    maxTaskCostUsd: Number.isFinite(effectiveMaxTaskCostUsd ?? Number.NaN) ? effectiveMaxTaskCostUsd : config.maxTaskCostUsd,
     maxTaskTokens: config.maxTaskTokens,
     failOnUnknownCost: config.requirePricing === true,
+    onRecord: (stage, res, u) =>
+      appendLedger({
+        ts: new Date().toISOString(),
+        taskId,
+        repo: repoDir,
+        stage,
+        ...(res.model ? { model: res.model } : {}),
+        input: u.input,
+        output: u.output + (u.reasoning ?? 0),
+        cacheRead: u.cacheRead,
+        costUsd: u.costUsd,
+        ...(u.costSource ? { costSource: u.costSource } : {}),
+        // claude-code on a subscription is not cash spend; with ANTHROPIC_API_KEY it is metered.
+        billing: provider === "claude-code" && !process.env.ANTHROPIC_API_KEY ? "subscription" : "metered",
+      }),
   });
   const testDiffMaxChars =
     config.contextLimits?.testDiffMaxChars ?? DEFAULT_CONTEXT_LIMITS.testDiffMaxChars;
@@ -1755,6 +1818,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
       ...(bughunterFindings.length > 0 ? { bughunterFindings } : {}),
       prUrl,
       usageLog,
+      budgetState: budgetStatus.state,
       stageUsage,
       totalUsage,
     };

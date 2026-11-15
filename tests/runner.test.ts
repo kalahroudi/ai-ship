@@ -316,13 +316,14 @@ test("buildOpencodeProviderConfig configures DeepSeek Direct, Parasail.io, and C
     undefined,
     "http://localhost:4040/"
   );
+  // Context Lens routes only the default provider; others keep their own URLs.
   assert.equal(
     (viaContextLens?.deepseek?.options as Record<string, unknown>)?.baseURL,
     "http://localhost:4040"
   );
   assert.equal(
     (viaContextLens?.parasail?.options as Record<string, unknown>)?.baseURL,
-    "http://localhost:4040"
+    "https://api.parasail.io/v1"
   );
 });
 

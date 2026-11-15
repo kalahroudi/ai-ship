@@ -48,7 +48,10 @@ import {
   collectRecentTranscripts,
   createOpencodeClientRunner,
   createRunner,
+  checkAttachedReadOnlyAgents,
   checkModelIndependence,
+  describeIgnoredForAttachedServer,
+  buildOpencodeAgentConfig,
   formatRoleModelTable,
   resolveRoleFallbackLabels,
   resolveRoleModelLabels,
@@ -1221,6 +1224,13 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
     : createWorktree(repoDir, config.baseBranch, opts.task);
   console.log(`[ai-ship] Worktree: ${worktree.worktreeDir} (branch: ${worktree.branch})`);
 
+  if (provider === "opencode" && (opts.client || opts.serverUrl)) {
+    const ignored = describeIgnoredForAttachedServer({ cfGatewayUrl, contextLensUrl, config });
+    console.log(`[ai-ship] Attached to an existing OpenCode ${opts.client ? "client" : "server"}; ignored settings: ${ignored.join("; ")}.`);
+    const attached = opts.client ?? createOpencodeClient({ baseUrl: opts.serverUrl as string });
+    for (const w of await checkAttachedReadOnlyAgents(attached)) console.log(`[ai-ship] Warning: ${w}`);
+  }
+
   const runner = opts.client
     ? createOpencodeClientRunner({
         client: opts.client,
@@ -1715,6 +1725,14 @@ export async function runDreamConsolidation(opts: {
 
   let client = opts.client;
   let closeServer: (() => void) | undefined;
+  if (client || opts.serverUrl) {
+    const ignored = describeIgnoredForAttachedServer({
+      cfGatewayUrl: resolveCloudflareGatewayUrl(),
+      contextLensUrl: resolveContextLensUrl(config),
+      config,
+    });
+    console.log(`[ai-ship] Dream attached to an existing OpenCode ${client ? "client" : "server"}; ignored settings: ${ignored.join("; ")}.`);
+  }
   if (!client) {
     if (opts.serverUrl) {
       client = createOpencodeClient({ baseUrl: opts.serverUrl });
@@ -1724,7 +1742,11 @@ export async function runDreamConsolidation(opts: {
       const providerConfig = buildOpencodeProviderConfig(config, cfGatewayUrl, contextLensUrl);
       const started = await createOpencode({
         port: 0,
-        ...(providerConfig ? { config: { provider: providerConfig as never } } : {}),
+        config: {
+          ...(providerConfig ? { provider: providerConfig as never } : {}),
+          // dream runs as the read-only reviewer role: keep its agent permissions locked down too
+          agent: buildOpencodeAgentConfig() as never,
+        },
       });
       client = started.client;
       closeServer = () => started.server.close();

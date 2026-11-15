@@ -30,7 +30,10 @@ export interface UsageForCost {
 
 /** Path of the user-level models/pricing file (override with AI_SHIP_MODELS_FILE). */
 export function getModelsFilePath(): string {
-  return process.env.AI_SHIP_MODELS_FILE || path.join(os.homedir(), ".config", "ai-ship", "models.json");
+  if (process.env.AI_SHIP_MODELS_FILE) return process.env.AI_SHIP_MODELS_FILE;
+  // Test runs never read the user's real models/pricing file.
+  if (process.env.NODE_TEST_CONTEXT) return path.join(os.tmpdir(), `ai-ship-test-models-${process.pid}-none.json`);
+  return path.join(os.homedir(), ".config", "ai-ship", "models.json");
 }
 
 function isFiniteNonNegative(n: unknown): n is number {

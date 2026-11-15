@@ -15,6 +15,8 @@ import { createLazyRunner, createOc2Runner } from "../src/oc2/runner.ts";
 import { formatProgressEvent, throttleSink } from "../src/progress.ts";
 import { formatSafetyFindings, scanWorktreeSafety } from "../src/safety.ts";
 import { buildGatewayProvider, formatCatalog, loadCatalog, syncCatalog } from "../src/catalog.ts";
+import { computeBudgetStatus, formatBudgetReport, loadBudgetConfig, monthStart, readLedger } from "../src/budget.ts";
+import { getModelsFilePath } from "../src/pricing.ts";
 import { formatDoctor, initRepo as initRepoFiles, installPlugin, runDoctor, uninstallPlugin } from "../src/doctor.ts";
 
 function printHelp() {
@@ -51,6 +53,8 @@ Options:
   --skip-bughunter   Skip Stage 4b adversarial Hunter -> Skeptic -> Referee pass
   --allow-config-change  Let agents change protected verify/config files (.ai-ship.json, package.json scripts, CI, test config)
   --init             Copy starter AGENTS.md and .ai-ship.json into target repo
+  --budget           Show month-to-date spend vs the £ budget, forecast and breakdowns (ledger: ~/.local/share/ai-ship/ledger.jsonl)
+  --override-budget  Run a task even when the monthly budget governor is in STOP state
   --models           List the model catalog (~/.config/ai-ship/models.json) and gateway settings
   --models-sync      Send a 1-token request per enabled catalog model through the Cloudflare AI Gateway
   --models-opencode-config  Print an OpenCode "provider" entry for the gateway (paste into opencode.json for Desktop)
@@ -252,6 +256,17 @@ if (doInit) {
   process.exit(0);
 }
 
+if (parsed.doBudget) {
+  const { catalog } = loadCatalog();
+  const gbpPerUsd = 1 / catalog.fx.GBPUSD;
+  const now = new Date();
+  const entries = readLedger(undefined, monthStart(now));
+  const budgetCfg = loadBudgetConfig(loadRepoConfig(repoDir).budget, getModelsFilePath());
+  const status = computeBudgetStatus({ entries, budget: budgetCfg, gbpPerUsd, now });
+  for (const line of formatBudgetReport(status, entries, gbpPerUsd, { countSubscription: budgetCfg.countSubscription })) console.log(line);
+  process.exit(0);
+}
+
 if (parsed.modelsAction) {
   const { catalog, problems } = loadCatalog();
   for (const p of problems) console.log(`[ai-ship] models.json: ${p}`);
@@ -341,5 +356,5 @@ if (attach) {
   lazy = createLazyRunner((dir) => createOc2Runner({ api, worktreeDir: dir, config: loadRepoConfig(repoDir), task, roleModels, onEvent }));
 }
 
-await runPipeline({ repoDir, worktreeDir, task, openPr, draft, skipTests, skipReview, skipBughunter, allowConfigChange, provider, model, testerModel, reviewerModel, bughunterModel, serverUrl: attach ? undefined : serverUrl, contextLens, onEvent, ...(lazy ? { runner: lazy.runner, onWorktree: lazy.onWorktree } : {}) });
+await runPipeline({ repoDir, worktreeDir, task, openPr, draft, skipTests, skipReview, skipBughunter, allowConfigChange, provider, model, testerModel, reviewerModel, bughunterModel, serverUrl: attach ? undefined : serverUrl, contextLens, onEvent, overrideBudget: parsed.overrideBudget, ...(lazy ? { runner: lazy.runner, onWorktree: lazy.onWorktree } : {}) });
 }

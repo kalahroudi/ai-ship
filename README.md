@@ -78,6 +78,13 @@ The tester, reviewers and bughunter must run on models different from the implem
 - `ai-ship --models` lists the catalog; `--models-sync` sends a 1-token request per model through the gateway; `--models-opencode-config` prints the provider entry to paste into `opencode.json` for OpenCode Desktop (OpenCode never discovers gateway models on its own).
 - Catalog prices also feed cost accounting (also for the `aig/…` alias).
 
+### Monthly budget governor (£)
+Every model call is appended to `~/.local/share/ai-ship/ledger.jsonl`. Before each task ai-ship computes month-to-date spend (converted with `fx.GBPUSD` from models.json) against `budget` (models.json, overridable per repo): defaults `monthlyGBP: 90`, `reserveGBP: 8` (kept for evals), `perTaskMaxGBP: 3`, `softPct: 75`.
+- **GREEN** normal · **AMBER** spending ahead of pro-rata, past the soft %, or today's cap reached (router downgrades a tier, task 14) · **RED** ≥ 95% of spendable: bughunter skipped · **STOP** spendable used: new tasks refused (`--override-budget` to force).
+- Each task's cost cap is the lower of `maxTaskCostUsd` and min(`perTaskMaxGBP`, remaining). Tasks started in parallel each get the full cap; the reserve absorbs the overlap.
+- claude-code calls are recorded as subscription-billed (not counted as cash spend) unless `ANTHROPIC_API_KEY` is set (then metered) or `"countSubscription": true`.
+- `ai-ship --budget` shows month-to-date, pro-rata, forecast, today's cap, and spend by model, stage and repo.
+
 ### Budget Circuit Breaker
 `ai-ship` tracks `input`, `output`, `cache_read` tokens and USD cost across all stages and retries, and aborts cleanly before launching the next stage/retry if thresholds are reached. Defaults are `maxTaskCostUsd: 5` and `maxTaskTokens: 2000000` (set to `null` or `0` to disable).
 

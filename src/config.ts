@@ -66,6 +66,8 @@ export interface RepoConfig {
   /** Fail before any model call if a role's model has no known price (default false: warn). */
   requirePricing?: boolean;
   contextLimits?: Partial<ContextLimits>;
+  /** Compact the implementer session once its accumulated input reaches this many tokens (0 disables; default 120000). */
+  compactAfterTokens?: number;
   securityScan: boolean;
   safetyCheck: boolean;
   safetyAllowlist?: string[];

@@ -37,6 +37,10 @@ import {
   snapshotFiles,
   snapshotIgnoredProtectedFiles,
   squashCheckpoints,
+  isTesterPath,
+  revertAllChangesSince,
+  revertPathsToRef,
+  changedFilesSince,
   type FileSnapshot,
 } from "./integrity.ts";
 import {
@@ -424,6 +428,156 @@ export async function withSharedContext<T>(
     }
   }
 }
+
+interface DiffBlock {
+  file: string;
+  text: string;
+  index: number;
+}
+
+/** Splits a combined diff (git diff output + ai-ship untracked-file sections) into per-file blocks. */
+export function splitDiffBlocks(diff: string): DiffBlock[] {
+  const lines = diff.split("\n");
+  const blocks: DiffBlock[] = [];
+  let current: string[] = [];
+  let currentFile = "";
+  // Inside a `diff --git` header (until its first hunk) a `--- /dev/null` line belongs to that header.
+  let inGitHeader = false;
+  let headerHasPlus = false;
+  const flush = () => {
+    const text = current.join("\n");
+    if (text.trim()) blocks.push({ file: currentFile || "(preamble)", text, index: blocks.length });
+    current = [];
+    currentFile = "";
+  };
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const gitHeader = line.startsWith("diff --git ");
+    // A hunk-less git block (pure rename/mode change) never reaches "@@", so also start a new untracked
+    // section once the current git header already had its own "+++" line.
+    const untrackedHeader =
+      (!inGitHeader || headerHasPlus) && line === "--- /dev/null" && lines[i + 1]?.startsWith("+++ b/");
+    const binary = line.match(/^Binary file (.+) added \(/);
+    if (gitHeader || untrackedHeader || binary) {
+      flush();
+      if (gitHeader) {
+        inGitHeader = true;
+        // Prefer the `+++ b/` path from the header (robust to paths containing " b/"), else parse the header line.
+        const lookahead: string[] = [];
+        for (let j = i + 1; j < Math.min(lines.length, i + 8) && !lines[j].startsWith("diff --git "); j++) lookahead.push(lines[j]);
+        const plus = lookahead.find((l) => l.startsWith("+++ b/"));
+        headerHasPlus = false;
+        const m = line.match(/^diff --git a\/(.+) b\/(.+)$/);
+        currentFile = plus ? plus.slice("+++ b/".length) : m ? m[2] : line.slice("diff --git ".length);
+      } else {
+        inGitHeader = false;
+        headerHasPlus = false;
+        currentFile = binary ? binary[1] : lines[i + 1].slice("+++ b/".length);
+      }
+    } else if (inGitHeader && line.startsWith("+++ ")) {
+      headerHasPlus = true;
+    } else if (inGitHeader && (line.startsWith("@@") || line.startsWith("Binary files "))) {
+      inGitHeader = false;
+    }
+    current.push(line);
+  }
+  flush();
+  return blocks;
+}
+
+/**
+ * Truncates a diff to `maxChars` without cutting files in half: whole per-file blocks are kept, production
+ * files before tests and smaller before larger, in their original order; omitted files are listed so the
+ * reader can open them directly. A single oversize block is cut at a line boundary.
+ */
+export function truncateDiff(diff: string, maxChars: number): string {
+  if (diff.length <= maxChars) return diff;
+  const blocks = splitDiffBlocks(diff);
+  const reserve = Math.min(2000, Math.floor(maxChars * 0.1));
+  const budget = Math.max(0, maxChars - reserve);
+  const priority = [...blocks].sort((a, b) => {
+    const ta = isTesterPath(a.file) ? 1 : 0;
+    const tb = isTesterPath(b.file) ? 1 : 0;
+    return ta - tb || a.text.length - b.text.length || a.index - b.index;
+  });
+  const kept = new Set<number>();
+  let used = 0;
+  for (const b of priority) {
+    if (used + b.text.length + 1 <= budget) {
+      kept.add(b.index);
+      used += b.text.length + 1;
+    }
+  }
+  let body: string;
+  if (kept.size === 0 && priority.length > 0) {
+    const first = priority[0];
+    const cut = first.text.slice(0, budget);
+    const nl = cut.lastIndexOf("\n");
+    body = `${nl > 0 ? cut.slice(0, nl) : cut}\n(ai-ship: ${first.file} truncated)`;
+    kept.add(first.index);
+  } else {
+    body = blocks.filter((b) => kept.has(b.index)).map((b) => b.text).join("\n");
+  }
+  const omitted = blocks.filter((b) => !kept.has(b.index)).map((b) => b.file);
+  const shown = omitted.slice(0, 40);
+  const more = omitted.length - shown.length;
+  const note = omitted.length
+    ? `\n\n(ai-ship: diff truncated to ~${maxChars} chars; omitted file diffs — read these files directly if relevant:\n${shown.map((f) => `- ${f}`).join("\n")}${more > 0 ? `\n- …and ${more} more (see git diff --stat)` : ""})`
+    : "";
+  return `${body}${note}`;
+}
+
+export type TestDisputeVerdict = "TEST_BUG" | "IMPL_BUG" | "MISSING";
+
+/** Parses the tester's dispute answer from its last `TEST_BUG` / `IMPL_BUG` line. */
+export function parseTestDispute(text: string): TestDisputeVerdict {
+  let last: TestDisputeVerdict = "MISSING";
+  for (const m of text.matchAll(/^[\s>*_`#-]*(TEST_BUG|IMPL_BUG)\b/gim)) {
+    last = m[1].toUpperCase() as TestDisputeVerdict;
+  }
+  return last;
+}
+
+const FAILURE_LINE_RE = /(fail|error|✖|✗|×|not ok|assert|expected|panic|traceback)/i;
+
+/**
+ * Tester-owned test files that a verify failure points at: the file's full repo-relative path (or the
+ * worktree-absolute path) must appear on a failure-looking line, bounded by non-path characters, so passing
+ * file listings or a same-named test in another directory do not trigger a dispute.
+ */
+export function findDisputedTestFiles(output: string, testerFiles: readonly string[], worktreeDir?: string): string[] {
+  const failureLines = output.split(/\r?\n/).filter((l) => FAILURE_LINE_RE.test(l));
+  if (failureLines.length === 0) return [];
+  const esc = (t: string) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return testerFiles.filter((f) => {
+    const rel = new RegExp(`(^|[^\\w./-])${esc(f)}($|[^\\w./-])`);
+    const abs = worktreeDir ? new RegExp(`${esc(path.join(worktreeDir, f))}($|[^\\w./-])`) : undefined;
+    return failureLines.some((l) => rel.test(l) || (abs ? abs.test(l) : false));
+  });
+}
+
+export function buildTestDisputePrompt(opts: { task: string; files: string[]; failedCommand: string; output: string }): string {
+  return [
+    "You wrote the tests below for this task. They now fail in the verify gate.",
+    "Decide, given ONLY the task intent, whether the failing tests are wrong (they assert behaviour the task does not require, or contain a bug) or the implementation is wrong.",
+    "Do not edit any files in this reply.",
+    "Answer with a short reason and a final line that is exactly `TEST_BUG` or `IMPL_BUG`.",
+    "",
+    `Task Intent: ${opts.task}`,
+    `Failing tester-owned files: ${opts.files.join(", ")}`,
+    `Failed command: ${opts.failedCommand}`,
+    "",
+    "Output:",
+    "```",
+    opts.output,
+    "```",
+  ].join("\n");
+}
+
+export const TEST_FIX_PROMPT = [
+  "Fix your failing test(s) so they assert only behaviour the task requires.",
+  "Only edit the test files you wrote; do NOT modify production code, other tests, or config.",
+].join("\n");
 
 export const IMPLEMENTER_STATIC_INSTRUCTIONS = [
   "Instructions:",
@@ -1154,6 +1308,41 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
     recordUsage(usageLog, "Stage 1: Implement", implRes, budget, "Stage 1: Implement");
     afterImplementerTurn("Stage 1: Implement");
     const stage1Ref = createCheckpoint(worktree.worktreeDir, `${CHECKPOINT_PREFIX} stage 1 (implementer)`);
+    let testSessionId: string | undefined;
+    let testerFiles: string[] = [];
+    const disputedFiles = new Set<string>();
+
+    // Implementer context control: compact the implementer session once its accumulated input grows large,
+    // then re-state the task so the next turn does not depend on the dropped history.
+    const compactAfterTokens = config.compactAfterTokens ?? 120_000;
+    // Approximate context size by the last implementer turn's prompt tokens (input + cache read).
+    let implInputSinceCompact = (implRes.usage?.input ?? 0) + (implRes.usage?.cacheRead ?? 0);
+    let lastAgentText = implRes.text;
+    const implementerTurn = async (label: string, stageKey: string, promptText: string) => {
+      budget.assertWithinBudget(label);
+      let text = promptText;
+      if (compactAfterTokens > 0 && implInputSinceCompact >= compactAfterTokens && runner.compact) {
+        const compacted = await runner.compact(implSessionId, "implementer");
+        if (compacted) {
+          integrityLog(`  [context] Implementer session compacted after ~${implInputSinceCompact} input tokens.`);
+          implInputSinceCompact = 0;
+          text = [
+            "Context (session was compacted). Original instructions and task follow.",
+            buildImplementerPrompt(opts.task, memory),
+            "",
+            `Files changed so far:\n${getDiffStat(worktree.worktreeDir, worktree.baseBranch) || "(see git status)"}`,
+            "",
+            promptText,
+          ].join("\n");
+        }
+      }
+      const res = await runner.prompt(implSessionId, "implementer", text);
+      implInputSinceCompact = (res.usage?.input ?? 0) + (res.usage?.cacheRead ?? 0);
+      lastAgentText = res.text;
+      recordUsage(usageLog, label, res, budget, stageKey);
+      afterImplementerTurn(label);
+      return res;
+    };
 
     // -------------------------------------------------------------------------
     // Stage 2: Independent Adversarial Test Session (Separate Session & Model)
@@ -1164,14 +1353,14 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
       const diff = getDiff(worktree.worktreeDir, worktree.baseBranch);
       if (diff.trim()) {
         budget.assertWithinBudget("Stage 2: Adversarial Tests");
-        const testSessionId = await runner.createSession(`Adversarial Tests: ${opts.task.slice(0, 50)}`);
+        testSessionId = await runner.createSession(`Adversarial Tests: ${opts.task.slice(0, 50)}`);
 
         const testRes = await runner.prompt(
           testSessionId,
           "tester",
           buildTesterPrompt({
             task: opts.task,
-            diff: diff.slice(0, testDiffMaxChars),
+            diff: truncateDiff(diff, testDiffMaxChars),
             memory,
           })
         );
@@ -1184,6 +1373,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
           );
         }
         testerRef = createCheckpoint(worktree.worktreeDir, `${CHECKPOINT_PREFIX} stage 2 (tester)`);
+        testerFiles = scope.testerFiles;
         testerSnapshot = snapshotFiles(worktree.worktreeDir, scope.testerFiles);
         if (scope.testerFiles.length > 0) {
           integrityLog(`  [integrity] Tester-owned tests (protected from implementer edits): ${scope.testerFiles.join(", ")}`);
@@ -1194,45 +1384,110 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
     // -------------------------------------------------------------------------
     // Stage 3: Deterministic Local Verification Gate (Zero LLM Tokens)
     // -------------------------------------------------------------------------
+    /**
+     * Runs the verify gate and loops failures back to the implementer (up to maxFixRetries). When the failure
+     * points at tester-owned tests, the tester is asked first whether its test is wrong (TEST_BUG); if so it
+     * may fix that test once. Used after Stage 2 and after every review fix.
+     */
+    const verifyWithFixes = async (context: string) => {
+      // Implementer attempts are bounded by maxFixRetries; test disputes are bounded separately (at most once
+      // per tester-owned file) and do not consume implementer attempts.
+      let implementerAttempts = 0;
+      for (;;) {
+        const verify = await runDeterministicVerify(worktree.worktreeDir, config);
+        if (verify.ok) {
+          console.log(`  -> Local verify gate PASSED${context ? ` (${context})` : ""}.`);
+          return;
+        }
+
+        const disputed = findDisputedTestFiles(verify.output, testerFiles, worktree.worktreeDir).filter(
+          (f) => !disputedFiles.has(f)
+        );
+        if (testSessionId && disputed.length > 0) {
+          for (const f of disputed) disputedFiles.add(f);
+          // Checkpoint first, and undo anything the (read-only by instruction) dispute session writes.
+          const preDispute = createCheckpoint(worktree.worktreeDir, `${CHECKPOINT_PREFIX} before test dispute`);
+          budget.assertWithinBudget("Stage 3: Test dispute");
+          const disputeSession = await runner.createSession(`Test dispute: ${opts.task.slice(0, 50)}`);
+          const dispute = await runner.prompt(
+            disputeSession,
+            "tester",
+            buildTestDisputePrompt({
+              task: opts.task,
+              files: disputed,
+              failedCommand: verify.failedCommand ?? "verify",
+              output: verify.output,
+            })
+          );
+          recordUsage(usageLog, "Stage 3: Test dispute", dispute, budget, "Stage 3: Fix");
+          const disputeEdits = revertAllChangesSince(worktree.worktreeDir, preDispute);
+          if (disputeEdits.length > 0) {
+            integrityLog(`  [integrity] Test-dispute session edited files (reverted): ${disputeEdits.join(", ")}`);
+          }
+          const ruling = parseTestDispute(dispute.text);
+          integrityLog(`  [dispute] Tester ruling on ${disputed.join(", ")}: ${ruling}`);
+          if (ruling === "TEST_BUG") {
+            budget.assertWithinBudget("Stage 3: Tester fix");
+            const testFix = await runner.prompt(
+              testSessionId,
+              "tester",
+              `${TEST_FIX_PROMPT}\n\nFiles: ${disputed.join(", ")}\n\nOutput:\n\`\`\`\n${verify.output}\n\`\`\``
+            );
+            recordUsage(usageLog, "Stage 3: Tester fix", testFix, budget, "Stage 3: Fix");
+            // Only the disputed test files may change: revert everything else (other tests, prod code, config).
+            // Deleting a disputed test is not a fix: restore it too.
+            const outOfScope = changedFilesSince(worktree.worktreeDir, preDispute)
+              .filter((f) => !disputed.includes(f.path) || f.status === "deleted")
+              .map((f) => f.path);
+            revertPathsToRef(worktree.worktreeDir, preDispute, outOfScope);
+            if (outOfScope.length > 0) {
+              integrityLog(`  [integrity] Tester fix touched files outside the disputed tests (reverted): ${outOfScope.join(", ")}`);
+            }
+            testerRef = createCheckpoint(worktree.worktreeDir, `${CHECKPOINT_PREFIX} tester test fix`);
+            testerSnapshot = snapshotFiles(worktree.worktreeDir, testerFiles);
+            continue;
+          }
+          continue;
+        }
+
+        if (implementerAttempts >= config.maxFixRetries) {
+          const agentNote = lastAgentText ? `\n\nLast implementer response:\n${lastAgentText.slice(-2000)}` : "";
+          throw new Error(
+            `Deterministic verify failed after ${config.maxFixRetries} fix attempts${context ? ` (${context})` : ""}:\n${verify.output}${agentNote}`
+          );
+        }
+        implementerAttempts += 1;
+        console.log(
+          `  -> Verify failed (${verify.failedCommand}). Sending failure back to implementer (attempt ${implementerAttempts}/${config.maxFixRetries})...`
+        );
+        await implementerTurn(
+          `Stage 3: Fix #${implementerAttempts}${context ? ` (${context})` : ""}`,
+          "Stage 3: Fix",
+          [
+            "Fix the root cause in the implementation (do NOT weaken or delete tests).",
+            "",
+            `Verification command failed: ${verify.failedCommand}`,
+            "",
+            "Output:",
+            "```",
+            verify.output,
+            "```",
+          ].join("\n")
+        );
+      }
+    };
+
     opts.onProgress?.("Stage 3/4: Running local verify gate");
     console.log("\n[Stage 3/4] Running deterministic local verify gate...");
-    let lastAgentText = implRes.text;
-    for (let attempt = 1; attempt <= config.maxFixRetries + 1; attempt++) {
-      const verify = await runDeterministicVerify(worktree.worktreeDir, config);
-      if (verify.ok) {
-        console.log("  -> Local verify gate PASSED.");
-        break;
-      }
-      if (attempt > config.maxFixRetries) {
-        const agentNote = lastAgentText ? `\n\nLast implementer response:\n${lastAgentText.slice(-2000)}` : "";
-        throw new Error(`Deterministic verify failed after ${config.maxFixRetries} fix attempts:\n${verify.output}${agentNote}`);
-      }
-      console.log(`  -> Verify failed (${verify.failedCommand}). Sending failure back to implementer (attempt ${attempt}/${config.maxFixRetries})...`);
-      budget.assertWithinBudget(`Stage 3: Fix #${attempt}`);
-      const fixRes = await runner.prompt(
-        implSessionId,
-        "implementer",
-        [
-          "Fix the root cause in the implementation (do NOT weaken or delete tests).",
-          "",
-          `Verification command failed: ${verify.failedCommand}`,
-          "",
-          "Output:",
-          "```",
-          verify.output,
-          "```",
-        ].join("\n")
-      );
-      lastAgentText = fixRes.text;
-      recordUsage(usageLog, `Stage 3: Fix #${attempt}`, fixRes, budget, "Stage 3: Fix");
-      afterImplementerTurn(`Stage 3: Fix #${attempt}`);
-    }
+    await verifyWithFixes("");
 
     // -------------------------------------------------------------------------
-    // Stage 4: Shared-Context Parallel Multi-Lens Review
+    // Stage 4: Review lenses + adversarial bughunter, run concurrently on the same diff snapshot.
+    // OPEN findings are merged into ONE implementer fix round, re-verified (with fix loop), and then only the
+    // lenses that were OPEN (plus Correctness) and the bughunter (if it was OPEN) review the new diff.
     // -------------------------------------------------------------------------
     if (!opts.skipReview) {
-      const lenses = [
+      const lenses: ReviewLens[] = [
         {
           name: "Security",
           focus: "auth, RBAC/tenant isolation (IDOR), input validation, SQLi/XSS/SSRF, secret handling, leaked deployment config IDs/keys/emails/PII, rate limiting, and webhook/billing integrity",
@@ -1246,142 +1501,95 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
           focus: "race conditions, unhandled error paths, edge cases, type safety, and dead/duplicated code",
         },
       ];
+      const bughunterEnabled = !opts.skipBughunter && config.bughunter !== false;
+      let pendingLenses = lenses;
+      let runBughunterThisRound = bughunterEnabled;
 
       for (let round = 1; round <= config.maxReviewRounds; round++) {
-        console.log(`\n[Stage 4/4] Parallel multi-lens review (round ${round}/${config.maxReviewRounds})...`);
         const diff = getDiff(worktree.worktreeDir, worktree.baseBranch);
         if (!diff.trim()) {
           console.log("  -> No diff to review.");
           break;
         }
+        const reviewDiff = truncateDiff(diff, reviewDiffMaxChars);
+        const parts = [
+          pendingLenses.length ? `${pendingLenses.map((l) => l.name).join("/")} lenses` : "",
+          runBughunterThisRound ? "bughunter" : "",
+        ].filter(Boolean);
+        console.log(`\n[Stage 4/4] Review round ${round}/${config.maxReviewRounds}: ${parts.join(" + ")} (concurrent)...`);
+        opts.onProgress?.(`Stage 4/4: Review round ${round}/${config.maxReviewRounds} (${parts.join(" + ")})`);
+        budget.assertWithinBudget(`Stage 4: Review (round ${round})`);
 
-        const sharedContextParts = [
+        const sharedContext = [
           `Task: ${opts.task}`,
           ...(memory ? ["", `## Persistent Repository Memory\n${memory}`] : []),
           "",
-          `Diff:\n${diff.slice(0, reviewDiffMaxChars)}`,
-        ];
+          `Diff:\n${reviewDiff}`,
+        ].join("\n");
+        const [reviews, bh] = await withSharedContext(worktree.worktreeDir, sharedContext, async () => {
+          // allSettled: never leave one reviewer running in the background while another failed.
+          const settled = await Promise.allSettled([
+            pendingLenses.length
+              ? runReviewLenses({ lenses: pendingLenses, config, runner, usageLog, budget })
+              : Promise.resolve([] as Array<{ lens: string; text: string; verdict: "CLEAN" | "OPEN" }>),
+            runBughunterThisRound
+              ? runBughunterPass({ task: opts.task, diff: reviewDiff, memory, runner, usageLog, budget })
+              : Promise.resolve(undefined),
+          ] as const);
+          const failed = settled.find((r) => r.status === "rejected");
+          if (failed && failed.status === "rejected") throw failed.reason;
+          return [
+            (settled[0] as PromiseFulfilledResult<Array<{ lens: string; text: string; verdict: "CLEAN" | "OPEN" }>>).value,
+            (settled[1] as PromiseFulfilledResult<BughunterResult | undefined>).value,
+          ] as const;
+        });
 
-        opts.onProgress?.(`Stage 4/4: Parallel 3-lens review (round ${round}/${config.maxReviewRounds})`);
-        budget.assertWithinBudget(`Stage 4: Review (round ${round})`);
-        const reviews = await withSharedContext(worktree.worktreeDir, sharedContextParts.join("\n"), () =>
-          runReviewLenses({
-            lenses,
-            config,
-            runner,
-            usageLog,
-            budget,
-          })
-        );
-
-        const openFindings = reviews.filter((r) => r.verdict === "OPEN");
-        reviewVerdicts = reviews.map((r) => ({ lens: r.lens, verdict: r.verdict }));
+        const verdictMap = new Map(reviewVerdicts.map((r) => [r.lens, r.verdict] as const));
         for (const r of reviews) {
+          verdictMap.set(r.lens, r.verdict);
           console.log(`  -> ${r.lens}: ${r.verdict}`);
         }
+        if (bh) {
+          bughunterFindings = bh.findings;
+          verdictMap.set("Bughunter", bh.verdict);
+          console.log(`  -> Bughunter: ${bh.verdict}`);
+        }
+        reviewVerdicts = [...verdictMap].map(([lens, verdict]) => ({ lens, verdict }));
 
-        if (openFindings.length === 0) {
-          console.log("  -> All review lenses CLEAN.");
+        const openLenses = reviews.filter((r) => r.verdict === "OPEN");
+        const bughunterOpen = bh?.verdict === "OPEN";
+        if (openLenses.length === 0 && !bughunterOpen) {
+          console.log("  -> All reviewers CLEAN.");
           break;
         }
 
-        const findingsText = formatOpenReviewFindings(openFindings);
+        const findingsText = [
+          openLenses.length ? formatOpenReviewFindings(openLenses) : "",
+          bughunterOpen && bh ? formatBughunterFindings(bh.findings, bh.refereeText) : "",
+        ]
+          .filter(Boolean)
+          .join("\n\n");
 
         if (round === config.maxReviewRounds) {
           console.log("\n[ai-ship] Review findings remain open after max rounds:");
-          for (const f of openFindings) {
-            console.log(`\n--- ${f.lens} ---\n${f.text}`);
-          }
+          console.log(`\n${findingsText}`);
           throw new Error(
             `Review findings remain OPEN after ${config.maxReviewRounds} round(s). Inspect the worktree (${worktree.worktreeDir}) before pushing.\n\n${findingsText}`
           );
         }
 
         opts.onProgress?.(`Stage 4/4: Addressing review findings (round ${round})`);
-        console.log("  -> Sending OPEN findings back to implementer...");
-        budget.assertWithinBudget(`Stage 4: Review Fix #${round}`);
-        const fixReviewRes = await runner.prompt(
-          implSessionId,
-          "implementer",
+        console.log("  -> Sending merged OPEN findings back to implementer (one fix round)...");
+        await implementerTurn(
+          `Stage 4: Review Fix #${round}`,
+          "Stage 4: Review",
           `Address these review findings, then re-run local checks:\n\n${findingsText}`
         );
-        recordUsage(usageLog, `Stage 4: Review Fix #${round}`, fixReviewRes, budget, "Stage 4: Review");
-        afterImplementerTurn(`Stage 4: Review Fix #${round}`);
+        await verifyWithFixes(`after review fix #${round}`);
 
-        const reverify = await runDeterministicVerify(worktree.worktreeDir, config);
-        if (!reverify.ok) {
-          throw new Error(`Verify failed after review fix:\n${reverify.output}`);
-        }
-      }
-    }
-
-    // -------------------------------------------------------------------------
-    // Stage 4b: Adversarial Bughunter Pass (Hunter -> Skeptic -> Referee)
-    // -------------------------------------------------------------------------
-    if (!opts.skipReview && !opts.skipBughunter && config.bughunter !== false) {
-      for (let round = 1; round <= config.maxReviewRounds; round++) {
-        const diff = getDiff(worktree.worktreeDir, worktree.baseBranch);
-        if (!diff.trim()) {
-          break;
-        }
-
-        opts.onProgress?.(
-          `Stage 4b: Adversarial bughunter Hunter -> Skeptic -> Referee (round ${round}/${config.maxReviewRounds})`
-        );
-        console.log(
-          `\n[Stage 4b] Adversarial bughunter Hunter -> Skeptic -> Referee (round ${round}/${config.maxReviewRounds})...`
-        );
-
-        const bh = await runBughunterPass({
-          task: opts.task,
-          diff: diff.slice(0, reviewDiffMaxChars),
-          memory,
-          runner,
-          usageLog,
-          budget,
-        });
-
-        bughunterFindings = bh.findings;
-        reviewVerdicts = [
-          ...reviewVerdicts.filter((r) => r.lens !== "Bughunter"),
-          { lens: "Bughunter", verdict: bh.verdict },
-        ];
-        console.log(`  -> Bughunter: ${bh.verdict}`);
-
-        if (bh.verdict === "CLEAN") {
-          break;
-        }
-
-        const bhFindingsText = formatBughunterFindings(bh.findings, bh.refereeText);
-        if (round === config.maxReviewRounds) {
-          console.log("\n[ai-ship] Bughunter findings remain open after max rounds:");
-          console.log(`\n${bhFindingsText}`);
-          throw new Error(
-            `Bughunter findings remain OPEN after ${config.maxReviewRounds} round(s). Inspect the worktree (${worktree.worktreeDir}) before pushing.\n\n${bhFindingsText}`
-          );
-        }
-
-        opts.onProgress?.(`Stage 4b: Addressing bughunter findings (round ${round})`);
-        console.log("  -> Sending confirmed Bughunter findings back to implementer...");
-        budget.assertWithinBudget(`Stage 4b: Bughunter Fix #${round}`);
-        const fixBhRes = await runner.prompt(
-          implSessionId,
-          "implementer",
-          `Address these confirmed cross-boundary bugs, then re-run local checks:\n\n${bhFindingsText}`
-        );
-        recordUsage(
-          usageLog,
-          `Stage 4b: Bughunter Fix #${round}`,
-          fixBhRes,
-          budget,
-          "Stage 4b: Bughunter"
-        );
-        afterImplementerTurn(`Stage 4b: Bughunter Fix #${round}`);
-
-        const reverify = await runDeterministicVerify(worktree.worktreeDir, config);
-        if (!reverify.ok) {
-          throw new Error(`Verify failed after bughunter fix:\n${reverify.output}`);
-        }
+        const openNames = new Set(openLenses.map((r) => r.lens));
+        pendingLenses = lenses.filter((l) => openNames.has(l.name) || l.name === "Correctness");
+        runBughunterThisRound = bughunterEnabled && bughunterOpen;
       }
     }
 

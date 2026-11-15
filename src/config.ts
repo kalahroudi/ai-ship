@@ -314,6 +314,7 @@ export interface ParsedCliArgs {
   doDoctor: boolean;
   doBudget: boolean;
   doReport: boolean;
+  doOutcomesRefresh: boolean;
   routeOnly: boolean;
   tags: string[];
   overrideBudget: boolean;
@@ -380,6 +381,7 @@ export function parseCliArgs(args: string[], cwd = process.cwd()): ParsedCliArgs
     doDoctor: false,
     doBudget: false,
     doReport: false,
+    doOutcomesRefresh: false,
     routeOnly: false,
     tags: [],
     overrideBudget: false,
@@ -476,6 +478,8 @@ export function parseCliArgs(args: string[], cwd = process.cwd()): ParsedCliArgs
       result.tags.push(arg.slice("--tag=".length));
     } else if (arg === "--report") {
       result.doReport = true;
+    } else if (arg === "--outcomes-refresh") {
+      result.doOutcomesRefresh = true;
     } else if (arg === "--budget") {
       result.doBudget = true;
     } else if (arg === "--override-budget") {

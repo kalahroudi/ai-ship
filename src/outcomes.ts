@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -21,6 +22,11 @@ export interface TaskOutcome {
   openFindings: number;
   costUsd: number;
   error?: string;
+  /** HEAD of the task branch when it was committed (used to detect later reverts). */
+  commitSha?: string;
+  /** Filled in later by `ai-ship --outcomes-refresh` from the PR's CI checks and the base branch history. */
+  postMerge?: "ok" | "pending" | "ci-failed" | "reverted";
+  refreshedAt?: string;
 }
 
 export function getOutcomesPath(): string {
@@ -58,7 +64,13 @@ export function readOutcomes(file = getOutcomesPath(), since?: Date): TaskOutcom
 }
 
 export function isSuccess(o: TaskOutcome): boolean {
-  return o.result === "committed" && o.fixRounds <= 1 && o.openFindings === 0;
+  return (
+    o.result === "committed" &&
+    o.fixRounds <= 1 &&
+    o.openFindings === 0 &&
+    o.postMerge !== "ci-failed" &&
+    o.postMerge !== "reverted"
+  );
 }
 
 export interface ModelScore {
@@ -129,4 +141,77 @@ export function formatReport(opts: {
     for (const [k, s] of rows) lines.push(`  ${k} — ${s.n}, ${Math.round(s.successRate * 100)}%, $${s.avgCostUsd.toFixed(3)}`);
   }
   return lines;
+}
+
+export type Exec = (cmd: string, args: string[], cwd: string) => { ok: boolean; stdout: string };
+
+const defaultExec: Exec = (cmd, args, cwd) => {
+  const r = spawnSync(cmd, args, { cwd, encoding: "utf8", timeout: 30_000 });
+  return { ok: r.status === 0, stdout: r.stdout ?? "" };
+};
+
+/** CI verdict from `gh pr view --json state,statusCheckRollup` output. */
+export function ciVerdict(json: string): "ok" | "pending" | "ci-failed" | undefined {
+  let v: { state?: string; statusCheckRollup?: Array<{ conclusion?: string | null; state?: string | null; status?: string | null }> };
+  try {
+    v = JSON.parse(json);
+  } catch {
+    return undefined;
+  }
+  const checks = v.statusCheckRollup ?? [];
+  const results = checks.map((c) => String(c.conclusion ?? c.state ?? "").toUpperCase());
+  if (results.some((r) => ["FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"].includes(r))) return "ci-failed";
+  if (results.some((r) => !r || ["PENDING", "EXPECTED", "QUEUED", "IN_PROGRESS"].includes(r))) return "pending";
+  return v.state === "MERGED" ? "ok" : "pending";
+}
+
+/**
+ * Updates committed outcomes with what happened after the pipeline: a revert of the task's commit on any
+ * branch → "reverted"; the PR's CI checks failing → "ci-failed"; merged with green checks → "ok". Final
+ * verdicts (ok/ci-failed/reverted) are re-checked only for reverts. Rewrites the log atomically and returns
+ * the number of outcomes changed.
+ */
+export function refreshOutcomes(opts: { file?: string; exec?: Exec; now?: Date; maxAgeDays?: number } = {}): { checked: number; changed: number } {
+  const file = opts.file ?? getOutcomesPath();
+  const exec = opts.exec ?? defaultExec;
+  const now = opts.now ?? new Date();
+  const maxAge = (opts.maxAgeDays ?? 60) * 86_400_000;
+  let text: string;
+  try {
+    text = fs.readFileSync(file, "utf8");
+  } catch {
+    return { checked: 0, changed: 0 };
+  }
+  let checked = 0;
+  let changed = 0;
+  const lines = text.split("\n").map((line) => {
+    if (!line.trim()) return line;
+    let o: TaskOutcome;
+    try {
+      o = JSON.parse(line) as TaskOutcome;
+    } catch {
+      return line; // keep corrupt lines as they are
+    }
+    if (o.result !== "committed" || o.postMerge === "reverted") return line;
+    if (now.getTime() - new Date(o.ts).getTime() > maxAge || !o.repo || !fs.existsSync(o.repo)) return line;
+    checked++;
+    let next: TaskOutcome["postMerge"] = o.postMerge;
+    if (o.commitSha && /^[0-9a-f]{7,40}$/i.test(o.commitSha)) {
+      const rev = exec("git", ["log", "--all", "--format=%H", "-n", "1", "-F", `--grep=This reverts commit ${o.commitSha}`], o.repo);
+      if (rev.ok && rev.stdout.trim()) next = "reverted";
+    }
+    if (next !== "reverted" && (o.postMerge === undefined || o.postMerge === "pending")) {
+      const pr = exec("gh", ["pr", "view", o.taskId, "--json", "state,statusCheckRollup"], o.repo);
+      if (pr.ok) next = ciVerdict(pr.stdout) ?? next;
+    }
+    if (next === o.postMerge) return line;
+    changed++;
+    return JSON.stringify({ ...o, postMerge: next, refreshedAt: now.toISOString() });
+  });
+  if (changed > 0) {
+    const tmp = `${file}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, lines.join("\n"), "utf8");
+    fs.renameSync(tmp, file);
+  }
+  return { checked, changed };
 }

@@ -120,6 +120,12 @@ export interface BughunterFinding {
   reason: string;
 }
 
+function headSha(dir: string): { commitSha?: string } {
+  const r = spawnSync("git", ["rev-parse", "HEAD"], { cwd: dir, encoding: "utf8" });
+  const sha = r.status === 0 ? r.stdout.trim() : "";
+  return /^[0-9a-f]{40}$/.test(sha) ? { commitSha: sha } : {};
+}
+
 export interface PipelineResult {
   repoDir: string;
   worktreeDir: string;
@@ -1463,6 +1469,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
         taskId: worktree.branch,
         repo: repoDir,
         result,
+        ...(result === "committed" ? headSha(worktree.worktreeDir) : {}),
         ...(routing.plan ? { size: routing.classification.size, risk: routing.classification.risk } : {}),
         models: {
           ...((outcomeStats.implementerModel ?? roleLabels.implementer)

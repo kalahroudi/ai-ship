@@ -16,7 +16,7 @@ import { formatProgressEvent, throttleSink } from "../src/progress.ts";
 import { formatSafetyFindings, scanWorktreeSafety } from "../src/safety.ts";
 import { buildGatewayProvider, formatCatalog, loadCatalog, syncCatalog } from "../src/catalog.ts";
 import { computeBudgetStatus, formatBudgetReport, loadBudgetConfig, monthStart, readLedger } from "../src/budget.ts";
-import { computeModelScores, formatReport, readOutcomes } from "../src/outcomes.ts";
+import { computeModelScores, formatReport, readOutcomes, refreshOutcomes } from "../src/outcomes.ts";
 import { getModelsFilePath } from "../src/pricing.ts";
 import { planRouting } from "../src/pipeline.ts";
 import { formatDoctor, initRepo as initRepoFiles, installPlugin, runDoctor, uninstallPlugin } from "../src/doctor.ts";
@@ -57,6 +57,7 @@ Options:
   --init             Copy starter AGENTS.md and .ai-ship.json into target repo
   --route            Dry run: classify the task and print the role → model routing plan (no changes)
   --tag <tag>        Task tag such as size:L or risk:high (overrides the classifier; repeatable)
+  --outcomes-refresh Update recorded outcomes from PR CI checks and reverts (feeds routing and --report)
   --report           Monthly report: spend vs budget, tasks, first-pass success, cost per committed task, quality per model
   --budget           Show month-to-date spend vs the £ budget, forecast and breakdowns (ledger: ~/.local/share/ai-ship/ledger.jsonl)
   --override-budget  Run a task even when the monthly budget governor is in STOP state
@@ -272,6 +273,12 @@ if (parsed.routeOnly) {
   console.log(`Budget: ${r.inputs.budget}`);
   if (!r.plan) console.log("No enabled catalog models (see ~/.config/ai-ship/models.json).");
   else for (const line of r.lines) console.log(line);
+  process.exit(0);
+}
+
+if (parsed.doOutcomesRefresh) {
+  const r = refreshOutcomes();
+  console.log(`[ai-ship] Outcomes refreshed: ${r.checked} checked, ${r.changed} updated.`);
   process.exit(0);
 }
 

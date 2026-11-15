@@ -1412,8 +1412,11 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
       });
   const usageLog: string[] = [];
   const taskId = worktree.branch;
+  // Subscription-billed calls (claude-code without an API key) are not cash spend: the governor's £ task cap
+  // does not apply to them unless the user counts subscription usage. An explicit maxTaskCostUsd still does.
+  const subscriptionBilled = provider === "claude-code" && !process.env.ANTHROPIC_API_KEY && !budgetConfig.countSubscription;
   const effectiveMaxTaskCostUsd =
-    governorTaskCapUsd === undefined
+    governorTaskCapUsd === undefined || subscriptionBilled
       ? config.maxTaskCostUsd
       : Math.min(config.maxTaskCostUsd ?? Number.POSITIVE_INFINITY, governorTaskCapUsd);
   const budget = new BudgetTracker({

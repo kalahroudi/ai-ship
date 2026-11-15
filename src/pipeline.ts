@@ -211,6 +211,9 @@ function formatStageTelemetryLines(
   return lines;
 }
 
+/** Weight of cache-read tokens in the maxTaskTokens cap (roughly their price relative to fresh input). */
+export const CACHE_READ_CAP_WEIGHT = 0.1;
+
 export class BudgetExceededError extends Error {
   readonly totals: UsageTotals;
   readonly stageBreakdown: StageUsageSummary[];
@@ -235,6 +238,8 @@ export class BudgetExceededError extends Error {
 /** Tracks per-stage and per-task token/USD usage and trips when configured thresholds are reached. */
 export class BudgetTracker {
   private readonly maxTaskCostUsd?: number;
+  /** Tokens counted against maxTaskTokens (cache reads weighted by CACHE_READ_CAP_WEIGHT). */
+  private capTokens = 0;
   private readonly maxTaskTokens?: number;
   private readonly totals: UsageTotals = {
     input: 0,
@@ -283,6 +288,9 @@ export class BudgetTracker {
       console.error(`[ai-ship] Warning: could not write the spend ledger: ${(err as Error).message}`);
     }
     const tokens = u.input + u.output + u.cacheRead + (u.reasoning ?? 0) + (u.cacheWrite ?? 0);
+    // maxTaskTokens guards runaway work, not context re-reads: agent loops re-read cached context every turn,
+    // and cache reads cost ~10% of input, so they count at that weight.
+    this.capTokens += tokens - u.cacheRead * (1 - CACHE_READ_CAP_WEIGHT);
     const unknown = u.costSource === "unknown" ? 1 : 0;
     if (unknown && this.failOnUnknownCost) {
       throw new Error(
@@ -327,7 +335,7 @@ export class BudgetTracker {
     const costExceeded =
       this.maxTaskCostUsd !== undefined && this.totals.costUsd >= this.maxTaskCostUsd;
     const tokensExceeded =
-      this.maxTaskTokens !== undefined && this.totals.totalTokens >= this.maxTaskTokens;
+      this.maxTaskTokens !== undefined && this.capTokens >= this.maxTaskTokens;
     if (!costExceeded && !tokensExceeded) return;
 
     const reasons: string[] = [];
@@ -337,7 +345,9 @@ export class BudgetTracker {
       );
     }
     if (tokensExceeded && this.maxTaskTokens !== undefined) {
-      reasons.push(`task tokens ${this.totals.totalTokens} >= maxTaskTokens ${this.maxTaskTokens}`);
+      reasons.push(
+        `task tokens ${Math.round(this.capTokens)} (cache reads at ${CACHE_READ_CAP_WEIGHT * 100}%; ${this.totals.totalTokens} raw) >= maxTaskTokens ${this.maxTaskTokens}`
+      );
     }
 
     const stageBreakdown = this.getStageSummaries();

@@ -385,7 +385,7 @@ async function shipOne(/** @type {string} */ task, /** @type {string | undefined
   if (attachApi) {
     const api = attachApi;
     const roleModels = { implementer: model, tester: testerModel, reviewer: reviewerModel, bughunter: bughunterModel };
-    lazy = createLazyRunner((dir) => createOc2Runner({ api, worktreeDir: dir, config: loadRepoConfig(repoDir), task, roleModels, onEvent }));
+    lazy = createLazyRunner((dir, effective, effectiveModels) => createOc2Runner({ api, worktreeDir: dir, config: effective ?? loadRepoConfig(repoDir), task, roleModels: effectiveModels ?? roleModels, onEvent }));
   }
   return runPipeline({ repoDir, worktreeDir: reuseWorktree, task, openPr, draft, skipTests, skipReview, skipBughunter, allowConfigChange, provider, model, testerModel, reviewerModel, bughunterModel, serverUrl: attach ? undefined : serverUrl, contextLens, onEvent, overrideBudget: parsed.overrideBudget, tags: parsed.tags, ...(lazy ? { runner: lazy.runner, onWorktree: lazy.onWorktree } : {}) });
 }

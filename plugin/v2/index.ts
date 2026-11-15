@@ -99,13 +99,16 @@ export function createAiShipV2Plugin(deps: {
       };
       const config = loadRepoConfig(parsed.repoDir);
       let oc2: ReturnType<typeof createOc2Runner> | undefined;
-      const lazy = createLazyRunner((dir) => {
+      const lazy = createLazyRunner((dir, effective, effectiveModels) => {
         oc2 = createOc2Runner({
           api: createCtxApi(ctx),
           worktreeDir: dir,
-          config,
+          // Effective config from the pipeline (router-chosen models and fallbacks), else the repo config.
+          config: effective ?? config,
           task,
-          roleModels: {
+          // The pipeline's resolved role models (router choices + CLI overrides), so primaries, fallbacks and
+          // the independence check all refer to the same models.
+          roleModels: effectiveModels ?? {
             implementer: parsed.model,
             tester: parsed.testerModel,
             reviewer: parsed.reviewerModel,

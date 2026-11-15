@@ -282,7 +282,7 @@ export function createAiShipPlugin(tool: ToolHelper) {
             if (!args.confirm) {
               return `Dry run — pass confirm=true to remove:\n${summary}`;
             }
-            const removed = removeCleanupTargets(targetRepo, targets);
+            const removed = removeCleanupTargets(targets);
             notifyProgress(
               ctx.client,
               toolCtx,

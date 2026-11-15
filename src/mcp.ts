@@ -13,14 +13,15 @@ interface JsonRpcRequest {
   jsonrpc?: string;
   id?: string | number | null;
   method: string;
-  params?: Record<string, any>;
+  params?: Record<string, unknown>;
 }
 
 interface JsonRpcResponse {
   jsonrpc: "2.0";
   id: string | number | null;
+  // MCP results are tool-specific JSON payloads.
   result?: any;
-  error?: { code: number; message: string; data?: any };
+  error?: { code: number; message: string; data?: unknown };
 }
 
 export interface McpToolDeps {
@@ -32,7 +33,7 @@ export interface McpToolDeps {
   listCleanupTargets: typeof listCleanupTargets;
   removeCleanupTargets: typeof removeCleanupTargets;
   openPrFromWorktree: typeof openPrFromWorktree;
-  notify?: (notification: { jsonrpc: "2.0"; method: string; params: Record<string, any> }) => void;
+  notify?: (notification: { jsonrpc: "2.0"; method: string; params: Record<string, unknown> }) => void;
 }
 
 const DEFAULT_DEPS: McpToolDeps = {
@@ -294,7 +295,7 @@ export function resolveMcpProvider(
 
 async function executeTool(
   name: string,
-  args: Record<string, any>,
+  args: Record<string, unknown>,
   deps: McpToolDeps,
   onProgress?: (stage: string) => void
 ): Promise<string> {
@@ -443,8 +444,9 @@ export async function handleMcpRequest(
 
   if (req.method === "tools/call") {
     const name = req.params?.name;
-    const args = (req.params?.arguments ?? {}) as Record<string, any>;
-    const progressToken = req.params?._meta?.progressToken as string | number | undefined;
+    const args = (req.params?.arguments ?? {}) as Record<string, unknown>;
+    const meta = req.params?._meta as { progressToken?: string | number } | undefined;
+    const progressToken = meta?.progressToken;
     let step = 0;
     const onProgress = (stage: string) => {
       step += 1;

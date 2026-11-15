@@ -392,8 +392,29 @@ function extractNumericStatus(err: unknown): number | undefined {
   return undefined;
 }
 
+/** Thrown when a read-only role (reviewer/bughunter) gets an empty reply; classified as transient so retry/fallback runs. */
+export class EmptyModelResponseError extends Error {
+  readonly role: AgentRole;
+  constructor(role: AgentRole) {
+    super(`${role} returned an empty response`);
+    this.name = "EmptyModelResponseError";
+    this.role = role;
+  }
+}
+
+/** Throws EmptyModelResponseError when a read-only role's reply has no text. Writer roles may legitimately end with tool calls only. */
+export function assertNonEmptyReadOnlyReply(role: AgentRole, result: PromptResult): PromptResult {
+  if (isReadOnlyRole(role) && !result.text.trim()) {
+    throw new EmptyModelResponseError(role);
+  }
+  return result;
+}
+
 /** Classifies whether a provider/transport error is a transient 429 or 5xx failure. */
 export function classifyProviderError(err: unknown): TransientErrorInfo {
+  if (err instanceof EmptyModelResponseError) {
+    return { transient: true, reason: "empty response" };
+  }
   const statusCode = extractNumericStatus(err);
   if (statusCode !== undefined) {
     if (statusCode === 429 || (statusCode >= 500 && statusCode < 600)) {
@@ -602,9 +623,9 @@ export function createOpencodeClientRunner(opts: {
               parts: [{ type: "text", text }],
             },
           });
-          return parseOpencodePromptResponse(
-            res as { data?: PromptResponseData; error?: unknown },
-            role
+          return assertNonEmptyReadOnlyReply(
+            role,
+            parseOpencodePromptResponse(res as { data?: PromptResponseData; error?: unknown }, role)
           );
         },
       });
@@ -797,11 +818,11 @@ function createClaudeCodeRunner(opts: {
           if (parsed.sessionId) {
             sessionMap.set(sessionId, parsed.sessionId);
           }
-          return {
+          return assertNonEmptyReadOnlyReply(role, {
             text: parsed.text,
             usageSummary: parsed.usageSummary,
             usage: parsed.usage,
-          };
+          });
         },
       });
     },

@@ -207,7 +207,8 @@ export function refreshOutcomes(opts: { file?: string; exec?: Exec; now?: Date; 
     let mergeSha = o.mergeSha;
     let prState = o.prState;
     // CI verdict is final only once the PR is merged or closed; until then a failed run may be re-run green.
-    const prFinal = prState === "MERGED" || prState === "CLOSED";
+    // A merged PR whose checks were still running at the last refresh stays open until they finish.
+    const prFinal = (prState === "MERGED" || prState === "CLOSED") && next !== "pending" && next !== undefined;
     if (!prFinal && next !== "closed") {
       const pr = exec("gh", ["pr", "view", o.taskId, "--json", "state,statusCheckRollup,mergeCommit"], o.repo);
       if (pr.ok) {

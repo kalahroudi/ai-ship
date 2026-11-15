@@ -25,7 +25,10 @@ export interface TaskOutcome {
   /** HEAD of the task branch when it was committed (used to detect later reverts). */
   commitSha?: string;
   /** Filled in later by `ai-ship --outcomes-refresh` from the PR's CI checks and the base branch history. */
-  postMerge?: "ok" | "pending" | "ci-failed" | "reverted";
+  postMerge?: "ok" | "pending" | "ci-failed" | "reverted" | "closed";
+  /** Merge commit on the base branch (differs from commitSha for squash/rebase merges). */
+  mergeSha?: string;
+  prState?: string;
   refreshedAt?: string;
 }
 
@@ -69,7 +72,8 @@ export function isSuccess(o: TaskOutcome): boolean {
     o.fixRounds <= 1 &&
     o.openFindings === 0 &&
     o.postMerge !== "ci-failed" &&
-    o.postMerge !== "reverted"
+    o.postMerge !== "reverted" &&
+    o.postMerge !== "closed"
   );
 }
 
@@ -160,8 +164,9 @@ export function ciVerdict(json: string): "ok" | "pending" | "ci-failed" | undefi
   }
   const checks = v.statusCheckRollup ?? [];
   const results = checks.map((c) => String(c.conclusion ?? c.state ?? "").toUpperCase());
-  if (results.some((r) => ["FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"].includes(r))) return "ci-failed";
-  if (results.some((r) => !r || ["PENDING", "EXPECTED", "QUEUED", "IN_PROGRESS"].includes(r))) return "pending";
+  if (results.some((r) => ["FAILURE", "ERROR", "TIMED_OUT", "STARTUP_FAILURE"].includes(r))) return "ci-failed";
+  // CANCELLED/ACTION_REQUIRED are usually superseded runs or approvals, not a verdict: wait for a re-run.
+  if (results.some((r) => !r || ["PENDING", "EXPECTED", "QUEUED", "IN_PROGRESS", "CANCELLED", "ACTION_REQUIRED"].includes(r))) return "pending";
   return v.state === "MERGED" ? "ok" : "pending";
 }
 
@@ -183,35 +188,73 @@ export function refreshOutcomes(opts: { file?: string; exec?: Exec; now?: Date; 
     return { checked: 0, changed: 0 };
   }
   let checked = 0;
-  let changed = 0;
-  const lines = text.split("\n").map((line) => {
-    if (!line.trim()) return line;
+  const updates = new Map<string, string>();
+  const fetched = new Set<string>();
+  const keyOf = (o: TaskOutcome) => `${o.ts}\u0000${o.taskId}`;
+  const isSha = (x: unknown): x is string => typeof x === "string" && /^[0-9a-f]{7,40}$/i.test(x);
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
     let o: TaskOutcome;
     try {
       o = JSON.parse(line) as TaskOutcome;
     } catch {
-      return line; // keep corrupt lines as they are
+      continue;
     }
-    if (o.result !== "committed" || o.postMerge === "reverted") return line;
-    if (now.getTime() - new Date(o.ts).getTime() > maxAge || !o.repo || !fs.existsSync(o.repo)) return line;
+    if (o.result !== "committed" || o.postMerge === "reverted") continue;
+    if (now.getTime() - new Date(o.ts).getTime() > maxAge || !o.repo || !fs.existsSync(o.repo)) continue;
     checked++;
     let next: TaskOutcome["postMerge"] = o.postMerge;
-    if (o.commitSha && /^[0-9a-f]{7,40}$/i.test(o.commitSha)) {
-      const rev = exec("git", ["log", "--all", "--format=%H", "-n", "1", "-F", `--grep=This reverts commit ${o.commitSha}`], o.repo);
-      if (rev.ok && rev.stdout.trim()) next = "reverted";
+    let mergeSha = o.mergeSha;
+    let prState = o.prState;
+    // CI verdict is final only once the PR is merged or closed; until then a failed run may be re-run green.
+    const prFinal = prState === "MERGED" || prState === "CLOSED";
+    if (!prFinal && next !== "closed") {
+      const pr = exec("gh", ["pr", "view", o.taskId, "--json", "state,statusCheckRollup,mergeCommit"], o.repo);
+      if (pr.ok) {
+        try {
+          const v = JSON.parse(pr.stdout) as { state?: string; mergeCommit?: { oid?: string } | null };
+          if (typeof v.state === "string") prState = v.state;
+          if (isSha(v.mergeCommit?.oid)) mergeSha = v.mergeCommit.oid;
+        } catch {
+          // ciVerdict below handles bad JSON
+        }
+        const ci = ciVerdict(pr.stdout);
+        next = prState === "CLOSED" ? "closed" : (ci ?? next);
+      }
     }
-    if (next !== "reverted" && (o.postMerge === undefined || o.postMerge === "pending")) {
-      const pr = exec("gh", ["pr", "view", o.taskId, "--json", "state,statusCheckRollup"], o.repo);
-      if (pr.ok) next = ciVerdict(pr.stdout) ?? next;
+    const shas = [o.commitSha, mergeSha].filter(isSha);
+    if (shas.length && next !== "closed") {
+      if (!fetched.has(o.repo)) {
+        fetched.add(o.repo);
+        exec("git", ["fetch", "--quiet", "origin"], o.repo); // reverts merged on GitHub; failure is fine
+      }
+      for (const sha of shas) {
+        const rev = exec("git", ["log", "--all", "--format=%H", "-n", "1", "-F", `--grep=This reverts commit ${sha}`], o.repo);
+        if (rev.ok && rev.stdout.trim()) next = "reverted";
+      }
     }
-    if (next === o.postMerge) return line;
-    changed++;
-    return JSON.stringify({ ...o, postMerge: next, refreshedAt: now.toISOString() });
-  });
-  if (changed > 0) {
+    if (next === o.postMerge && mergeSha === o.mergeSha && prState === o.prState) continue;
+    updates.set(
+      keyOf(o),
+      JSON.stringify({ ...o, postMerge: next, ...(mergeSha ? { mergeSha } : {}), ...(prState ? { prState } : {}), refreshedAt: now.toISOString() })
+    );
+  }
+  if (updates.size > 0) {
+    // Re-read right before writing: pipelines may have appended outcomes while git/gh were running.
+    const fresh = fs.readFileSync(file, "utf8");
+    const out = fresh.split("\n").map((line) => {
+      if (!line.trim()) return line;
+      try {
+        const o = JSON.parse(line) as TaskOutcome;
+        return updates.get(keyOf(o)) ?? line;
+      } catch {
+        return line;
+      }
+    });
     const tmp = `${file}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, lines.join("\n"), "utf8");
+    fs.writeFileSync(tmp, out.join("\n"), "utf8");
     fs.renameSync(tmp, file);
   }
+  const changed = updates.size;
   return { checked, changed };
 }

@@ -297,6 +297,7 @@ export interface ParsedCliArgs {
   doSafetyCheck: boolean;
   doDream: boolean;
   skipConfirm: boolean;
+  force: boolean;
   notyAddress?: string;
   notyDir?: string;
   rawProvider?: string;
@@ -327,6 +328,7 @@ export function parseCliArgs(args: string[], cwd = process.cwd()): ParsedCliArgs
     doSafetyCheck: false,
     doDream: false,
     skipConfirm: false,
+    force: false,
     positional: [],
   };
 
@@ -404,6 +406,8 @@ export function parseCliArgs(args: string[], cwd = process.cwd()): ParsedCliArgs
       result.doCleanup = true;
     } else if (arg === "--safety-check") {
       result.doSafetyCheck = true;
+    } else if (arg === "--force") {
+      result.force = true;
     } else if (arg === "--yes" || arg === "-y") {
       result.skipConfirm = true;
     } else if ((arg === "--cf" || arg === "-cf") && args[i + 1] && args[i + 2]) {

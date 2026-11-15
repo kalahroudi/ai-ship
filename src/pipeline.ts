@@ -10,6 +10,7 @@ import {
 } from "./config.ts";
 import {
   abortRebase,
+  buildCommitMessage,
   commitAll,
   createWorktree,
   getDiff,
@@ -1348,7 +1349,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
     }
     afterImplementerTurn("Pre-commit");
     squashCheckpoints(worktree.worktreeDir, startRef);
-    const committed = commitAll(worktree.worktreeDir, `feat: ${opts.task.slice(0, 72)}`);
+    const committed = commitAll(worktree.worktreeDir, buildCommitMessage(opts.task));
     console.log(`\n[ai-ship] Done! Branch: ${worktree.branch} (${committed ? "committed" : "no changes"})`);
     console.log(`[ai-ship] Worktree: ${worktree.worktreeDir}`);
     console.log("\n[ai-ship] Token & Cost Summary:");

@@ -83,7 +83,8 @@ test("writeNotyResult: ok appends section, sets done, preserves frontmatter", ()
     const fp = path.join(dir, "a.md");
     writeNotyResult({ id: "x1", filePath: fp }, { ok: true, summary: "committed abc", now: new Date("2026-01-02T03:04:05Z") });
     const out = fs.readFileSync(fp, "utf8");
-    assert.match(out, /^---\ndone: true\n/);
+    // done: true is added inside the frontmatter block (appended to it when absent).
+    assert.match(out, /^---\n[^]*\ndone: true\n---\n/);
     for (const l of ["id: X1", "kind: task", "title: T", 'tags: ["order-01"]']) assert.ok(out.includes(l), l);
     assert.match(out, /do it\n\n## ai-ship result \(2026-01-02 03:04\)\n\n✅ committed abc\n$/);
     assert.equal(fs.readdirSync(dir).filter((n) => n.endsWith(".tmp")).length, 0);
@@ -113,4 +114,21 @@ test("writeNotyResult refuses when id mismatched and leaves file untouched", () 
     assert.throws(() => writeNotyResult({ id: "OTHER", filePath: fp }, { ok: true, summary: "s" }), /no longer has id/);
     assert.equal(fs.readFileSync(fp, "utf8"), before);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("writeNotyResult: edits only frontmatter, keeps CRLF, no key swallowing", () => {
+  const { root, dir } = store();
+  try {
+    const fp = path.join(dir, "c.md");
+    fs.writeFileSync(fp, "---\r\nid: C\r\ndone:\r\ntitle: Keep\r\n---\r\ndone: body line\r\n");
+    writeNotyResult({ id: "C", filePath: fp }, { ok: true, summary: "ok" });
+    const out = fs.readFileSync(fp, "utf8");
+    assert.ok(out.includes("done: true\r\ntitle: Keep\r\n---"), out);
+    assert.ok(out.includes("\r\ndone: body line\r\n"), "body untouched");
+    assert.ok(!/[^\r]\n/.test(out), "CRLF only");
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("parseNotyCategoryAddress returns null on a malformed escape", () => {
+  assert.equal(parseNotyCategoryAddress("noty://category/100%"), null);
 });

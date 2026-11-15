@@ -397,7 +397,12 @@ function resultSummary(/** @type {any} */ r) {
     .join(" — ");
 }
 
-const category = parseNotyCategoryAddress(notyAddress ?? positionalTask);
+const categoryInput = notyAddress ?? positionalTask;
+const category = parseNotyCategoryAddress(categoryInput);
+if (!category && /^noty:\/\/category\//i.test(categoryInput.trim())) {
+  console.error(`Error: invalid Noty category address "${categoryInput}".`);
+  process.exit(1);
+}
 if (category) {
   if (worktreeDir) {
     console.error("Error: --worktree cannot be combined with a Noty category run (each task gets its own worktree).");
@@ -464,6 +469,10 @@ try {
   throw err;
 }
 if (notyNote && parsed.notyWriteBack) {
-  writeNotyResult(notyNote, { ok: Boolean(single?.committed ?? true), summary: resultSummary(single) });
+  try {
+    writeNotyResult(notyNote, { ok: Boolean(single?.committed ?? true), summary: resultSummary(single) });
+  } catch (err) {
+    console.error(`[ai-ship] Warning: Noty write-back failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 }

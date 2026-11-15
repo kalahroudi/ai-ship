@@ -20,7 +20,8 @@ export async function runQueue<T, R>(
     onDone?: (r: QueueItemResult<T, R>, index: number) => void | Promise<void>;
   } = {}
 ): Promise<Array<QueueItemResult<T, R>>> {
-  const concurrency = Math.max(1, Math.min(4, Math.floor(opts.concurrency ?? 1)));
+  const requested = Number.isFinite(opts.concurrency) ? Math.floor(opts.concurrency as number) : 1;
+  const concurrency = Math.max(1, Math.min(4, requested));
   const stopOnFailure = opts.stopOnFailure ?? true;
   const results: Array<QueueItemResult<T, R>> = items.map((item) => ({ item, status: "skipped" }));
   let next = 0;

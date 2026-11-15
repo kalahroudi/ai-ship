@@ -483,7 +483,9 @@ export function parseCliArgs(args: string[], cwd = process.cwd()): ParsedCliArgs
     } else if (arg === "--continue-on-failure") {
       result.continueOnFailure = true;
     } else if (arg === "--parallel" && args[i + 1]) {
-      result.queueParallel = Number(args[++i]);
+      const n = Number(args[++i]);
+      if (!Number.isInteger(n) || n < 1 || n > 4) result.unknownOption ??= `--parallel ${args[i]} (must be an integer from 1 to 4)`;
+      else result.queueParallel = n;
     } else if (arg === "--only-tag" && args[i + 1]) {
       result.onlyTag = args[++i];
     } else if (arg === "--tag" && args[i + 1]) {

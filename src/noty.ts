@@ -177,7 +177,12 @@ export function resolveNotyTask(addressOrId: string, customDir?: string): NotyNo
 export function parseNotyCategoryAddress(input: string): string | null {
   const m = input.trim().match(/^noty:\/\/category\/(.+?)\/?$/i);
   if (!m) return null;
-  const rel = decodeURIComponent(m[1]);
+  let rel: string;
+  try {
+    rel = decodeURIComponent(m[1]);
+  } catch {
+    return null; // malformed %-escape
+  }
   // Stay inside the Noty store.
   if (rel.split("/").some((seg) => seg === ".." || seg === "") || path.isAbsolute(rel)) return null;
   return rel;
@@ -239,13 +244,19 @@ export function writeNotyResult(note: Pick<NotyNote, "id" | "filePath">, result:
   if (!parsed.id || parsed.id.toLowerCase() !== note.id.toLowerCase()) {
     throw new Error(`Noty note ${note.filePath} no longer has id ${note.id}; not writing the result.`);
   }
-  let out = raw;
+  const eol = raw.includes("\r\n") ? "\r\n" : "\n";
+  // Edit `done:` only inside the frontmatter block (never a body line), on a single line.
+  const fm = raw.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
+  if (!fm) throw new Error(`Noty note ${note.filePath} has no frontmatter; not writing the result.`);
+  let front = fm[1];
   if (result.ok) {
-    out = /^done:\s*\S+/m.test(out) ? out.replace(/^done:\s*\S+/m, "done: true") : out.replace(/^---\r?\n/, "---\ndone: true\n");
+    front = /^done:[ \t]*.*$/m.test(front) ? front.replace(/^done:[ \t]*.*$/m, "done: true") : `${front}${eol}done: true`;
   }
+  const body = raw.slice(fm[0].length);
   const stamp = (result.now ?? new Date()).toISOString().slice(0, 16).replace("T", " ");
-  const summary = result.summary.replace(/\r/g, "").slice(0, 4000);
-  out = `${out.replace(/\s*$/, "")}\n\n## ai-ship result (${stamp})\n\n${result.ok ? "✅" : "❌"} ${summary}\n`;
+  const summary = result.summary.replace(/\r/g, "").slice(0, 4000).split("\n").join(eol);
+  let out = `---${eol}${front}${eol}---${eol}${body}`;
+  out = `${out.replace(/\s*$/, "")}${eol}${eol}## ai-ship result (${stamp})${eol}${eol}${result.ok ? "✅" : "❌"} ${summary}${eol}`;
   const tmp = `${note.filePath}.ai-ship-${process.pid}.tmp`;
   fs.writeFileSync(tmp, out, "utf8");
   fs.renameSync(tmp, note.filePath);

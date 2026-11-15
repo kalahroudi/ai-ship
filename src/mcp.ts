@@ -9,7 +9,7 @@ import { appendMemory, forgetMemory } from "./memory.ts";
 import { formatPipelineResult, runDreamConsolidation, runPipeline } from "./pipeline.ts";
 import { normalizeProvider, type ProviderName } from "./runner.ts";
 import { formatProgressEvent } from "./progress.ts";
-import { listNotyCategoryTasks, parseNotyCategoryAddress, writeNotyResult } from "./noty.ts";
+import { listNotyCategoryTasks, parseNotyAddress, parseNotyCategoryAddress, resolveNotyTask, writeNotyResult } from "./noty.ts";
 import { runQueue } from "./queue.ts";
 
 interface JsonRpcRequest {
@@ -399,6 +399,8 @@ interface McpJob {
   label: string;
   status: "running" | "succeeded" | "failed" | "cancelled" | "interrupted";
   startedAt: number;
+  /** Server process that owns the job (several MCP servers may share the job file). */
+  pid?: number;
   worktreeDir?: string;
   events: string[];
   cancelled: boolean;
@@ -428,6 +430,7 @@ export function cancelAllMcpJobs(): number {
 export function resetMcpJobs(): void {
   mcpJobs.clear();
   nextJobId = 1;
+  if (process.env.NODE_TEST_CONTEXT) fs.rmSync(getMcpJobsPath(), { force: true });
 }
 
 /** Job store file so ship_status survives an MCP server restart (override AI_SHIP_MCP_JOBS_FILE). */
@@ -437,10 +440,46 @@ export function getMcpJobsPath(): string {
   return path.join(os.homedir(), ".local", "share", "ai-ship", "mcp-jobs.json");
 }
 
-/** Best-effort atomic save of finished + running jobs (last 20 events each). */
+function pidAlive(pid: number | undefined): boolean {
+  if (!pid || !Number.isInteger(pid)) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+function readJobFile(file: string): Array<Partial<McpJob>> {
+  try {
+    const list = JSON.parse(fs.readFileSync(file, "utf8")) as unknown;
+    return Array.isArray(list) ? list.filter((j): j is Partial<McpJob> => Boolean(j) && typeof j === "object") : [];
+  } catch {
+    return [];
+  }
+}
+
+function jobNum(id: unknown): number {
+  const n = typeof id === "string" ? Number(id.replace(/^job-/, "")) : NaN;
+  return Number.isFinite(n) ? n : 0;
+}
+
+/** Next job id, also past ids another live server saved, so two servers sharing the file don't collide. */
+function allocJobId(file = getMcpJobsPath()): string {
+  for (const j of readJobFile(file)) if (jobNum(j.id) >= nextJobId) nextJobId = jobNum(j.id) + 1;
+  return `job-${nextJobId++}`;
+}
+
+/**
+ * Best-effort atomic save of this server's jobs (last 20 events each), merged with entries other live
+ * servers own so concurrent servers don't drop each other's jobs.
+ */
 export function persistMcpJobs(file = getMcpJobsPath()): void {
   try {
-    const list = [...mcpJobs.values()].map(({ cancelled: _c, ...j }) => ({ ...j, events: j.events.slice(-20) }));
+    const ours = [...mcpJobs.values()].map(({ cancelled: _c, ...j }) => ({ ...j, events: j.events.slice(-20) }));
+    const ids = new Set(ours.map((j) => j.id));
+    const others = readJobFile(file).filter((j) => j.pid !== process.pid && pidAlive(j.pid) && !ids.has(j.id as string));
+    const list = [...others, ...ours].slice(-(MAX_JOBS * 2));
     fs.mkdirSync(path.dirname(file), { recursive: true });
     const tmp = `${file}.${process.pid}.tmp`;
     fs.writeFileSync(tmp, JSON.stringify(list), "utf8");
@@ -464,6 +503,11 @@ export function loadPersistedMcpJobs(file = getMcpJobsPath()): number {
     if (!raw || typeof raw !== "object") continue;
     const j = raw as Partial<McpJob>;
     if (typeof j.id !== "string" || typeof j.label !== "string" || mcpJobs.has(j.id)) continue;
+    // A job another live server is still running is that server's; don't adopt it (or call it interrupted).
+    if (j.status === "running" && j.pid !== process.pid && pidAlive(j.pid)) {
+      if (jobNum(j.id) >= nextJobId) nextJobId = jobNum(j.id) + 1;
+      continue;
+    }
     const job: McpJob = {
       id: j.id,
       label: j.label,
@@ -551,6 +595,14 @@ async function executeTool(
     }
     case "ship_start": {
       const category = typeof args.task === "string" ? parseNotyCategoryAddress(args.task) : null;
+      if (!category && typeof args.task === "string" && /^noty:\/\/category\//i.test(args.task.trim())) {
+        throw new Error(`Invalid Noty category address "${args.task}".`);
+      }
+      // Single noty://item run with write-back: remember the note so the result can be written to it.
+      const itemNote =
+        !category && args.notyWriteBack === true && typeof args.task === "string" && parseNotyAddress(args.task)
+          ? resolveNotyTask(args.task)
+          : undefined;
       const notes = category ? (deps.listNotyCategoryTasks ?? listNotyCategoryTasks)(category, { onlyTag: typeof args.onlyTag === "string" ? args.onlyTag : undefined }) : [];
       if (category && notes.length === 0) return `No open tasks in Noty category ${category}.`;
       const { options, label, openPr } = category
@@ -566,10 +618,11 @@ async function executeTool(
       const clash = wt ? running.find((j) => j.worktreeDir === wt) : undefined;
       if (clash) throw new Error(`${clash.id} is already running in ${wt}; wait for it or ship_cancel it first.`);
       const job: McpJob = {
-        id: `job-${nextJobId++}`,
+        id: allocJobId(),
         label,
         status: "running",
         startedAt: Date.now(),
+        pid: process.pid,
         events: [],
         cancelled: false,
         ...(wt ? { worktreeDir: wt } : {}),
@@ -610,7 +663,7 @@ async function executeTool(
               stopOnFailure: args.continueOnFailure !== true,
               isCancelled: () => job.cancelled,
               onDone: (r) => {
-                if (args.notyWriteBack !== true) return;
+                if (args.notyWriteBack !== true || job.cancelled) return;
                 (deps.writeNotyResult ?? writeNotyResult)(r.item, {
                   ok: r.status === "succeeded" && r.result?.committed === true,
                   summary: r.status === "succeeded" ? (r.result?.text ?? "").split("\n")[0] : `failed: ${r.error}`,
@@ -623,7 +676,23 @@ async function executeTool(
             if (rs.some((r) => r.status !== "succeeded")) throw new Error(lines.join("\n"));
             return lines.join("\n");
           })
-        : runOne(options, label).then((r) => r.text);
+        : runOne(options, label).then(
+            (r) => {
+              if (itemNote) writeBackSafe(itemNote, { ok: r.committed, summary: r.text.split("\n")[0] });
+              return r.text;
+            },
+            (err: unknown) => {
+              if (itemNote && !job.cancelled) writeBackSafe(itemNote, { ok: false, summary: `failed: ${err instanceof Error ? err.message : String(err)}` });
+              throw err;
+            }
+          );
+      function writeBackSafe(note: Parameters<typeof writeNotyResult>[0], r: { ok: boolean; summary: string }) {
+        try {
+          (deps.writeNotyResult ?? writeNotyResult)(note, r);
+        } catch (e) {
+          push(`Noty write-back failed: ${(e as Error).message}`);
+        }
+      }
       void work
         .then((text) => {
           job.status = "succeeded";

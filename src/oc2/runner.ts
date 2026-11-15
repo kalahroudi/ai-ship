@@ -38,7 +38,7 @@ export function createOc2Runner(opts: {
   pollMs?: number;
   /** Max time one agent turn may run before it is interrupted (default config.agentTimeoutMs or 30 min). */
   turnTimeoutMs?: number;
-}): PipelineRunner & { shipSessionId(): string | undefined } {
+}): PipelineRunner & { shipSessionId(): string | undefined; cancel(): Promise<void>; isCancelled(): boolean } {
   const turnTimeoutMs = opts.turnTimeoutMs ?? opts.config.agentTimeoutMs ?? 30 * 60_000;
   const pricing = opts.pricing ?? loadPricingTable(opts.config.pricing);
   const labels = resolveRoleModelLabels("opencode", opts.config, opts.roleModels ?? {});
@@ -49,6 +49,7 @@ export function createOc2Runner(opts: {
   const sessions = new Map<string, { title: string; realId?: string; creating?: Promise<string> }>();
   let nextLocal = 1;
   const emit = opts.onEvent ?? (() => undefined);
+  let cancelled = false;
 
   const toRef = (label?: string): Oc2ModelRef | undefined => {
     if (!label) return undefined;
@@ -144,15 +145,33 @@ export function createOc2Runner(opts: {
 
   return {
     shipSessionId: () => shipId,
+    isCancelled: () => cancelled,
+    /** Stops the run: interrupts every agent session and makes further prompts fail. */
+    async cancel(): Promise<void> {
+      cancelled = true;
+      const ids = [...sessions.values()].map((s) => s.realId).filter((id): id is string => Boolean(id));
+      await Promise.all(
+        ids.map(async (id) => {
+          try {
+            await opts.api.interrupt?.(id, opts.worktreeDir);
+          } catch {
+            // ignore
+          }
+        })
+      );
+      emit({ ts: Date.now(), kind: "error", agent: "ship", text: `cancelled (${ids.length} agent session(s) interrupted)` });
+    },
     async createSession(title: string): Promise<string> {
       const id = `oc2-local-${nextLocal++}`;
       sessions.set(id, { title });
       return id;
     },
     async prompt(localId: string, role: AgentRole, text: string, promptOpts?: PromptOptions): Promise<PromptResult> {
+      if (cancelled) throw new Error("ai-ship run was cancelled");
       const override = promptOpts?.modelOverride;
       const model = override ? { providerID: override.providerID, id: override.modelID } : toRef(labels[role]);
       const sessionID = await realSession(localId, role, model);
+      if (cancelled) throw new Error("ai-ship run was cancelled");
       const title = sessions.get(localId)?.title ?? role;
       const user = await opts.api.prompt(sessionID, text, opts.worktreeDir);
 

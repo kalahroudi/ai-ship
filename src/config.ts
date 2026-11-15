@@ -305,6 +305,9 @@ export interface ParsedCliArgs {
   skipBughunter: boolean;
   allowConfigChange: boolean;
   doInit: boolean;
+  doDoctor: boolean;
+  doFix: boolean;
+  pluginAction?: "install" | "uninstall";
   doCleanup: boolean;
   doSafetyCheck: boolean;
   doDream: boolean;
@@ -362,6 +365,8 @@ export function parseCliArgs(args: string[], cwd = process.cwd()): ParsedCliArgs
     skipBughunter: false,
     allowConfigChange: false,
     doInit: false,
+    doDoctor: false,
+    doFix: false,
     doCleanup: false,
     doSafetyCheck: false,
     doDream: false,
@@ -440,6 +445,14 @@ export function parseCliArgs(args: string[], cwd = process.cwd()): ParsedCliArgs
       result.skipBughunter = true;
     } else if (arg === "--allow-config-change") {
       result.allowConfigChange = true;
+    } else if (arg === "--doctor") {
+      result.doDoctor = true;
+    } else if (arg === "--fix") {
+      result.doFix = true;
+    } else if (arg === "--plugin-install") {
+      result.pluginAction = "install";
+    } else if (arg === "--plugin-uninstall") {
+      result.pluginAction = "uninstall";
     } else if (arg === "--init") {
       result.doInit = true;
     } else if (arg === "--cleanup") {

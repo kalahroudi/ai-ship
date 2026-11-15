@@ -4,18 +4,25 @@
 
 OpenCode 2.x loads plugins from `~/.config/opencode/plugins/` but requires a **default export `{ id, setup(ctx) }`**; the 1.x `Plugin` function format below is rejected by 2.x ("Plugin must export a default definition with an id and an effect or setup function").
 
-Install (until `ai-ship plugin install` lands):
+Install, then restart OpenCode Desktop and run `/ship-doctor`:
 
 ```sh
-echo 'export { default } from "/Users/<you>/ai-ship/plugin/v2/index.ts";' > ~/.config/opencode/plugins/ai-ship.ts
+ai-ship --plugin-install      # writes ~/.config/opencode/plugins/ai-ship.ts (remove with --plugin-uninstall)
+ai-ship --doctor              # checks version, plugin, duplicate MCP, git/gh, pricing, gateway token
+ai-ship --doctor --fix        # removes the duplicate ai-ship MCP server from opencode.json (backup kept)
 ```
 
-Restart OpenCode Desktop. Commands:
+Inside OpenCode the native plugin replaces the ai-ship MCP server (having both gives the model two copies of the same tools). MCP stays available for other clients such as Claude Code. See [docs/plugin-smoke.md](../docs/plugin-smoke.md) for the post-update checklist.
+
+Commands:
 
 | Command | What it does |
 |---|---|
 | `/ship <task or noty://item/…> [--pr] [--draft] [--skip-tests] [--skip-review] [--skip-bughunter] [--model p/m] [--tester-model p/m] [--reviewer-model p/m]` | Starts the pipeline in the background and returns immediately |
 | `/ship-status [job]` | Job status and the latest per-agent progress lines |
+| `/ship-cancel [job]` | Interrupt a running job's agent sessions (worktree kept) |
+| `/ship-init` | Copy starter `AGENTS.md` / `.ai-ship.json` (never overwrites) |
+| `/ship-doctor [--fix]` | Setup check; `--fix` removes a duplicate ai-ship MCP entry (with backup) |
 | `/remember <fact>` · `/forget <text>` | Repo memory |
 | `/cleanup [--yes] [--force]` | Leftover worktrees / `ai/*` branches (dry run without `--yes`) |
 | `/safety-check` | Secret / deployment-ID scan |

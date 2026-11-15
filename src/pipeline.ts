@@ -91,6 +91,8 @@ export interface PipelineOptions {
   runner?: PipelineRunner;
   /** Fine-grained per-agent progress events (sessions, tool calls, usage). */
   onEvent?: ProgressSink;
+  /** Returns true when the run was cancelled; checked between stages and before commit/PR. */
+  isCancelled?: () => boolean;
   /** Called once the worktree exists (lets lazily-built runners learn its path). */
   onWorktree?: (worktreeDir: string) => void;
   /** Allow agents to change protected verify/config files (see DEFAULT_PROTECTED_PATHS). */
@@ -1341,6 +1343,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
     // -------------------------------------------------------------------------
     // Stage 1: Implementer Session
     // -------------------------------------------------------------------------
+    if (opts.isCancelled?.()) throw new Error("ai-ship run was cancelled");
     opts.onProgress?.("Stage 1/4: Implementing in isolated worktree");
     console.log("\n[Stage 1/4] Implementing in isolated worktree...");
     const implSessionId = await runner.createSession(`Implement: ${opts.task.slice(0, 60)}`);
@@ -1392,6 +1395,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
     // -------------------------------------------------------------------------
     // Stage 2: Independent Adversarial Test Session (Separate Session & Model)
     // -------------------------------------------------------------------------
+    if (opts.isCancelled?.()) throw new Error("ai-ship run was cancelled");
     if (!opts.skipTests) {
       opts.onProgress?.("Stage 2/4: Independent adversarial tests");
       console.log("\n[Stage 2/4] Independent adversarial test generation (separate session)...");
@@ -1522,6 +1526,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
       }
     };
 
+    if (opts.isCancelled?.()) throw new Error("ai-ship run was cancelled");
     opts.onProgress?.("Stage 3/4: Running local verify gate");
     console.log("\n[Stage 3/4] Running deterministic local verify gate...");
     await verifyWithFixes("");
@@ -1531,6 +1536,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
     // OPEN findings are merged into ONE implementer fix round, re-verified (with fix loop), and then only the
     // lenses that were OPEN (plus Correctness) and the bughunter (if it was OPEN) review the new diff.
     // -------------------------------------------------------------------------
+    if (opts.isCancelled?.()) throw new Error("ai-ship run was cancelled");
     if (!opts.skipReview) {
       const lenses: ReviewLens[] = [
         {
@@ -1661,6 +1667,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
         allowlist: config.safetyAllowlist,
       });
     }
+    if (opts.isCancelled?.()) throw new Error("ai-ship run was cancelled");
     afterImplementerTurn("Pre-commit");
     squashCheckpoints(worktree.worktreeDir, startRef);
     const committed = commitAll(worktree.worktreeDir, buildCommitMessage(opts.task));
@@ -1708,6 +1715,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
         }
       }
 
+      if (opts.isCancelled?.()) throw new Error("ai-ship run was cancelled");
       console.log("\n[ai-ship] Pushing branch and opening PR...");
       opts.onProgress?.(opts.draft ? "Pushing branch and opening draft PR" : "Pushing branch and opening PR");
       const prTitle = opts.task.split(/\r?\n/)[0].trim().slice(0, 72);

@@ -39,6 +39,7 @@ Options:
   --skip-tests       Skip Stage 2 independent adversarial test generation
   --skip-review      Skip Stage 4 parallel multi-lens review
   --skip-bughunter   Skip Stage 4b adversarial Hunter -> Skeptic -> Referee pass
+  --allow-config-change  Let agents change protected verify/config files (.ai-ship.json, package.json scripts, CI, test config)
   --init             Copy starter AGENTS.md and .ai-ship.json into target repo
   --cleanup          List and remove leftover ai-ship worktrees and ai/* branches (prompts for confirmation)
   --safety-check     Scan repo/worktree diff and untracked files for leaked deployment config, secrets, keys, emails, and IDs
@@ -204,6 +205,7 @@ const {
   skipTests,
   skipReview,
   skipBughunter,
+  allowConfigChange,
   doInit,
   doCleanup,
   doSafetyCheck,
@@ -259,5 +261,5 @@ if (!task) {
   process.exit(1);
 }
 
-await runPipeline({ repoDir, worktreeDir, task, openPr, draft, skipTests, skipReview, skipBughunter, provider, model, serverUrl, contextLens });
+await runPipeline({ repoDir, worktreeDir, task, openPr, draft, skipTests, skipReview, skipBughunter, allowConfigChange, provider, model, serverUrl, contextLens });
 }

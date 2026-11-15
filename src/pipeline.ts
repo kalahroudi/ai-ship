@@ -24,6 +24,20 @@ import {
 import { buildDreamPrompt, getMemoryPath, readMemory, writeConsolidatedMemory } from "./memory.ts";
 import { assertWorktreeSafe, formatSafetyFindings, scanWorktreeSafety } from "./safety.ts";
 import {
+  assertProtectedPathsUnchanged,
+  CHECKPOINT_PREFIX,
+  createCheckpoint,
+  DEFAULT_PROTECTED_PATHS,
+  enforceTesterScope,
+  excludeFileDigest,
+  resolveRunStartRef,
+  restoreTamperedFiles,
+  snapshotFiles,
+  snapshotIgnoredProtectedFiles,
+  squashCheckpoints,
+  type FileSnapshot,
+} from "./integrity.ts";
+import {
   buildOpencodeProviderConfig,
   collectRecentTranscripts,
   createOpencodeClientRunner,
@@ -52,6 +66,8 @@ export interface PipelineOptions {
   model?: string;
   serverUrl?: string;
   contextLens?: boolean | string;
+  /** Allow agents to change protected verify/config files (see DEFAULT_PROTECTED_PATHS). */
+  allowConfigChange?: boolean;
   client?: OpencodeClient;
   onProgress?: (stage: string) => void;
 }
@@ -1003,6 +1019,44 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
   let bughunterFindings: BughunterFinding[] = [];
   let prUrl: string | undefined;
 
+  // Gate integrity: track this run's starting point, checkpoint each agent's work, and make sure no agent
+  // weakens the verify config or edits the tester's tests.
+  const protectedPaths = config.protectedPaths ?? DEFAULT_PROTECTED_PATHS;
+  const startRef = resolveRunStartRef(worktree.worktreeDir);
+  const excludeDigest = excludeFileDigest(worktree.worktreeDir);
+  const ignoredBaseline = snapshotIgnoredProtectedFiles(worktree.worktreeDir, protectedPaths);
+  let testerSnapshot: FileSnapshot | undefined;
+  let testerRef: string | undefined;
+  const integrityLog = (line: string) => {
+    console.log(line);
+    usageLog.push(line);
+  };
+  const afterImplementerTurn = (stage: string, sinceRef = startRef, failOnRestore = false) => {
+    assertProtectedPathsUnchanged({
+      worktreeDir: worktree.worktreeDir,
+      sinceRef,
+      stage,
+      patterns: protectedPaths,
+      allow: opts.allowConfigChange,
+      excludeDigest,
+      ignoredBaseline,
+      log: integrityLog,
+    });
+    if (testerSnapshot && testerRef) {
+      const restored = restoreTamperedFiles(worktree.worktreeDir, testerSnapshot, testerRef);
+      if (restored.length > 0 && failOnRestore) {
+        throw new Error(
+          `${stage} modified or deleted tester-authored tests after the final commit (${restored.join(", ")}); refusing to push.`
+        );
+      }
+      if (restored.length > 0) {
+        integrityLog(
+          `  [integrity] ${stage} modified or deleted tester-authored tests; restored: ${restored.join(", ")}`
+        );
+      }
+    }
+  };
+
   try {
     // -------------------------------------------------------------------------
     // Stage 1: Implementer Session
@@ -1017,6 +1071,8 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
       buildImplementerPrompt(opts.task, memory)
     );
     recordUsage(usageLog, "Stage 1: Implement", implRes, budget, "Stage 1: Implement");
+    afterImplementerTurn("Stage 1: Implement");
+    const stage1Ref = createCheckpoint(worktree.worktreeDir, `${CHECKPOINT_PREFIX} stage 1 (implementer)`);
 
     // -------------------------------------------------------------------------
     // Stage 2: Independent Adversarial Test Session (Separate Session & Model)
@@ -1039,6 +1095,18 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
           })
         );
         recordUsage(usageLog, "Stage 2: Adversarial Tests", testRes, budget, "Stage 2: Adversarial Tests");
+
+        const scope = enforceTesterScope(worktree.worktreeDir, stage1Ref, protectedPaths);
+        if (scope.reverted.length > 0) {
+          integrityLog(
+            `  [integrity] Tester changed non-test files (reverted): ${scope.reverted.join(", ")}`
+          );
+        }
+        testerRef = createCheckpoint(worktree.worktreeDir, `${CHECKPOINT_PREFIX} stage 2 (tester)`);
+        testerSnapshot = snapshotFiles(worktree.worktreeDir, scope.testerFiles);
+        if (scope.testerFiles.length > 0) {
+          integrityLog(`  [integrity] Tester-owned tests (protected from implementer edits): ${scope.testerFiles.join(", ")}`);
+        }
       }
     }
 
@@ -1076,6 +1144,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
       );
       lastAgentText = fixRes.text;
       recordUsage(usageLog, `Stage 3: Fix #${attempt}`, fixRes, budget, "Stage 3: Fix");
+      afterImplementerTurn(`Stage 3: Fix #${attempt}`);
     }
 
     // -------------------------------------------------------------------------
@@ -1156,6 +1225,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
           `Address these review findings, then re-run local checks:\n\n${findingsText}`
         );
         recordUsage(usageLog, `Stage 4: Review Fix #${round}`, fixReviewRes, budget, "Stage 4: Review");
+        afterImplementerTurn(`Stage 4: Review Fix #${round}`);
 
         const reverify = await runDeterministicVerify(worktree.worktreeDir, config);
         if (!reverify.ok) {
@@ -1225,6 +1295,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
           budget,
           "Stage 4b: Bughunter"
         );
+        afterImplementerTurn(`Stage 4b: Bughunter Fix #${round}`);
 
         const reverify = await runDeterministicVerify(worktree.worktreeDir, config);
         if (!reverify.ok) {
@@ -1242,6 +1313,8 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
         allowlist: config.safetyAllowlist,
       });
     }
+    afterImplementerTurn("Pre-commit");
+    squashCheckpoints(worktree.worktreeDir, startRef);
     const committed = commitAll(worktree.worktreeDir, `feat: ${opts.task.slice(0, 72)}`);
     console.log(`\n[ai-ship] Done! Branch: ${worktree.branch} (${committed ? "committed" : "no changes"})`);
     console.log(`[ai-ship] Worktree: ${worktree.worktreeDir}`);
@@ -1275,6 +1348,8 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
           abortRebase(worktree.worktreeDir);
           throw new Error(`Rebase onto ${rebase.targetRef} remained incomplete after conflict resolution.`);
         }
+        // Upstream changes are legitimate; only this branch's changes relative to the rebase target count.
+        afterImplementerTurn("Pre-PR Rebase conflict resolution", rebase.targetRef, true);
       }
 
       if (rebase.updated) {

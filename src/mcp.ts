@@ -87,6 +87,11 @@ export const MCP_TOOLS = [
             "Runner provider (defaults to opencode when any OpenCode provider is configured, otherwise claude-code if available)",
         },
         model: { type: "string", description: "Optional model override (provider/model)" },
+        allowConfigChange: {
+          type: "boolean",
+          description:
+            "Allow agents to change protected verify/config files (.ai-ship.json, package.json scripts, CI, test config)",
+        },
       },
       required: ["task"],
     },
@@ -330,6 +335,7 @@ async function executeTool(
         skipReview: resolved.skipReview,
         provider,
         model: typeof args.model === "string" ? args.model : undefined,
+        ...(args.allowConfigChange === true ? { allowConfigChange: true } : {}),
         onProgress,
       });
       if (!result) {

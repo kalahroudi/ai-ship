@@ -61,6 +61,8 @@ export interface RepoConfig {
   securityScan: boolean;
   safetyCheck: boolean;
   safetyAllowlist?: string[];
+  /** Globs of verify/config files agents may not change (default: DEFAULT_PROTECTED_PATHS in integrity.ts). */
+  protectedPaths?: string[];
   bughunter?: boolean;
   contextLens?: boolean | string;
 }
@@ -285,6 +287,7 @@ export interface ParsedCliArgs {
   skipTests: boolean;
   skipReview: boolean;
   skipBughunter: boolean;
+  allowConfigChange: boolean;
   doInit: boolean;
   doCleanup: boolean;
   doSafetyCheck: boolean;
@@ -311,6 +314,7 @@ export function parseCliArgs(args: string[], cwd = process.cwd()): ParsedCliArgs
     skipTests: false,
     skipReview: false,
     skipBughunter: false,
+    allowConfigChange: false,
     doInit: false,
     doCleanup: false,
     doSafetyCheck: false,
@@ -373,6 +377,8 @@ export function parseCliArgs(args: string[], cwd = process.cwd()): ParsedCliArgs
       result.skipReview = true;
     } else if (arg === "--skip-bughunter") {
       result.skipBughunter = true;
+    } else if (arg === "--allow-config-change") {
+      result.allowConfigChange = true;
     } else if (arg === "--init") {
       result.doInit = true;
     } else if (arg === "--cleanup") {

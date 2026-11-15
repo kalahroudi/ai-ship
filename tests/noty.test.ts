@@ -32,6 +32,7 @@ test("parseNotyMarkdown parses YAML frontmatter id, title, and body", () => {
     id: "11111111-2222-3333-4444-555555555555",
     title: "Add healthcheck endpoint",
     body: "Return 200 OK on /healthz.",
+    kind: "task",
   });
 });
 

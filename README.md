@@ -90,6 +90,7 @@ The router then picks catalog models per role: implementer S→tier 1, M→2, L 
 - **Per-model concurrency:** catalog `maxConcurrency` limits concurrent gateway requests per model in the egress proxy (FIFO queue), so parallel reviewers don't trigger 429 storms on one provider.
 - **Parallel verify (opt-in):** `"verifyParallel": true` runs the verify commands concurrently (only for commands that don't share outputs); the first failing command in configured order is reported.
 - **Outcome log & adaptive routing:** every task is recorded in `~/.local/share/ai-ship/outcomes.jsonl` (result, size/risk, role models, fix and review rounds, open findings, cost). The router adds a small learned bonus (±0.1, after ≥3 observations, 30-day half-life) per role and model based on first-pass success, so cheaper models that keep succeeding win ties.
+- `ai-ship --outcomes-refresh` revisits committed tasks: a PR whose CI checks failed or a commit that was later reverted turns that outcome into a failure for routing and the report (run it e.g. weekly).
 - `ai-ship --report` shows spend vs budget, tasks, first-pass success, cost per committed task and quality per model.
 
 ### Monthly budget governor (£)

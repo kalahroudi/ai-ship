@@ -155,7 +155,8 @@ function costOf(res: PromptResult | undefined): number {
 function usageOfFailure(err: unknown): PromptResult | undefined {
   const e = err as { usage?: PromptResult["usage"]; wastedUsage?: PromptResult["usage"] } | undefined;
   const valid = (u: unknown): u is NonNullable<PromptResult["usage"]> => Boolean(u) && typeof (u as { input?: unknown }).input === "number";
-  const u = valid(e?.usage) && valid(e?.wastedUsage) ? addUsage(e.usage, e.wastedUsage) : valid(e?.usage) ? e.usage : valid(e?.wastedUsage) ? e.wastedUsage : undefined;
+  // wastedUsage (retried failures) already includes the last attempt's own usage.
+  const u = valid(e?.wastedUsage) ? e.wastedUsage : valid(e?.usage) ? e.usage : undefined;
   return u ? { text: "", usageSummary: "", usage: u } : undefined;
 }
 

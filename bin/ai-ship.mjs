@@ -545,7 +545,10 @@ try {
   }
   // Budget stops are expected outcomes, not crashes: print the reason (incl. per-stage spend) without a stack.
   if (err instanceof Error && (err.name === "BudgetExceededError" || err.name === "BudgetStopError")) {
-    console.error(`\n[ai-ship] Stopped: ${err.message}\n[ai-ship] The worktree is kept; re-run with --worktree <dir> to continue, or raise the limit in .ai-ship.json.`);
+    console.error(`\n[ai-ship] Stopped: ${err.message}`);
+    if (err.name === "BudgetExceededError") {
+      console.error("[ai-ship] The worktree is kept; re-run with --worktree <dir> to continue, or raise the limit in .ai-ship.json.");
+    }
     process.exit(1);
   }
   throw err;

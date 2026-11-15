@@ -83,6 +83,12 @@ Each task is classified with zero model calls — size S/M/L, risk low/med/high,
 The router then picks catalog models per role: implementer S→tier 1, M→2, L or high risk→3; tester tier 2; reviewers tier 1–2; the Security lens tier 3 on high-risk tasks; bughunter 2–3. Tester and reviewers always come from a **different model family** than the implementer, fallbacks prefer other providers, budget AMBER drops one tier (never the high-risk Security lens), RED uses tier 1, and after two failed fixes the implementer escalates one tier once. Explicit `--model` / role-model flags always win.
 `ai-ship --route "<task>"` prints the plan without running anything.
 
+### Throughput & learning
+- **Per-model concurrency:** catalog `maxConcurrency` limits concurrent gateway requests per model in the egress proxy (FIFO queue), so parallel reviewers don't trigger 429 storms on one provider.
+- **Parallel verify (opt-in):** `"verifyParallel": true` runs the verify commands concurrently (only for commands that don't share outputs); the first failing command in configured order is reported.
+- **Outcome log & adaptive routing:** every task is recorded in `~/.local/share/ai-ship/outcomes.jsonl` (result, size/risk, role models, fix and review rounds, open findings, cost). The router adds a small learned bonus (±0.1, after ≥3 observations, 30-day half-life) per role and model based on first-pass success, so cheaper models that keep succeeding win ties.
+- `ai-ship --report` shows spend vs budget, tasks, first-pass success, cost per committed task and quality per model.
+
 ### Monthly budget governor (£)
 Every model call is appended to `~/.local/share/ai-ship/ledger.jsonl`. Before each task ai-ship computes month-to-date spend (converted with `fx.GBPUSD` from models.json) against `budget` (models.json, overridable per repo): defaults `monthlyGBP: 90`, `reserveGBP: 8` (kept for evals), `perTaskMaxGBP: 3`, `softPct: 75`.
 - **GREEN** normal · **AMBER** spending ahead of pro-rata, past the soft %, or today's cap reached (router downgrades a tier, task 14) · **RED** ≥ 95% of spendable: bughunter skipped · **STOP** spendable used: new tasks refused (`--override-budget` to force).

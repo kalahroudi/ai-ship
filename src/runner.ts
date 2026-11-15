@@ -1203,6 +1203,7 @@ async function createOpencodeRunner(opts: {
       token,
       metadata: () => ({ app: "ai-ship", ...(opts.gatewayMetadata ?? {}) }),
       onUsage: opts.onGatewayUsage,
+      maxConcurrency: (model) => catalog.models.find((m) => m.id === model)?.maxConcurrency,
     });
     closeProxy = proxy.close;
     const aig = buildGatewayProvider(catalog, { proxyUrl: proxy.url });

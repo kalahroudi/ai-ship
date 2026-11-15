@@ -49,6 +49,11 @@ For OpenCode Desktop/TUI/Mobile plugin usage, see [plugin/README.md](./plugin/RE
 - Node.js >= 22.18 (runs TypeScript directly).
 - git >= 2.30 (`--force-with-lease --force-if-includes` is used when re-pushing a rebased `ai/*` branch), and `gh` for PRs.
 
+## Verify-gate integrity
+- npm/yarn worktrees get a private copy-on-write clone of `node_modules` (APFS `cp -c`, Linux `--reflink=always`); if cloning is unavailable they fall back to a symlink to the main repo's `node_modules`.
+- Every `node_modules/.bin` tool (and the package behind it) is fingerprinted at run start and re-checked before each verify run. If an agent's `npm install` rewrites an existing tool package, the run stops; re-run once the dependency change is intended.
+- Files that verify commands invoke (e.g. `scripts/test.sh` behind `npm test`) are protected for the run, alongside `.ai-ship.json`, package.json scripts, CI and test-runner config. Use `--allow-config-change` for intended changes.
+
 ## Git safety
 - Re-pushing an existing `ai/*` branch uses `--force-with-lease --force-if-includes`, so a collaborator's commit is never overwritten. Other branches are never force-pushed.
 - Re-running with an open PR updates its body; the title is left as is.

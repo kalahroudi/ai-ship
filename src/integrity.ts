@@ -454,6 +454,205 @@ export function revertAllChangesSince(worktreeDir: string, ref: string): string[
 
 export type FileSnapshot = Map<string, string | null>;
 
+/** Nearest directory at or above `file` (within node_modules) that contains a package.json. */
+function owningPackageDir(file: string): string | undefined {
+  let dir = path.dirname(file);
+  for (let i = 0; i < 12; i++) {
+    if (fs.existsSync(path.join(dir, "package.json"))) return dir;
+    const parent = path.dirname(dir);
+    if (parent === dir || !parent.includes("node_modules")) return undefined;
+    dir = parent;
+  }
+  return undefined;
+}
+
+/** Digest of a package tree: relative path, size and mtime of every file (nested node_modules skipped). */
+function packageManifestDigest(pkgDir: string, maxFiles = 20_000): string {
+  const h = crypto.createHash("sha256");
+  let count = 0;
+  const walk = (dir: string, rel: string) => {
+    let entries: fs.Dirent[] = [];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    entries.sort((a, b) => a.name.localeCompare(b.name));
+    for (const e of entries) {
+      if (count >= maxFiles) return;
+      if (e.name === "node_modules") continue;
+      const full = path.join(dir, e.name);
+      const r = rel ? `${rel}/${e.name}` : e.name;
+      if (e.isDirectory()) walk(full, r);
+      else if (e.isFile()) {
+        try {
+          const st = fs.statSync(full);
+          h.update(`${r}:${st.size}:${Math.floor(st.mtimeMs)}\n`);
+          count++;
+        } catch {
+          // unreadable file: skip
+        }
+      }
+    }
+  };
+  walk(pkgDir, "");
+  return h.digest("hex");
+}
+
+/**
+ * Fingerprints every root `node_modules/.bin/*` tool: the content of the resolved bin file PLUS a manifest
+ * (path/size/mtime) of the package that owns it, because bin files are usually shims that `require()` the
+ * real implementation (e.g. typescript/bin/tsc -> lib/tsc.js). Detects an agent rewriting tsc/vitest/eslint
+ * internals to always pass.
+ */
+export function snapshotBinTools(worktreeDir: string): FileSnapshot {
+  const snap: FileSnapshot = new Map();
+  const dir = path.join(worktreeDir, "node_modules", ".bin");
+  let entries: string[] = [];
+  try {
+    entries = fs.readdirSync(dir);
+  } catch {
+    return snap;
+  }
+  const manifestCache = new Map<string, string>();
+  for (const name of entries) {
+    const link = path.join(dir, name);
+    let real: string;
+    try {
+      real = fs.realpathSync(link);
+    } catch {
+      snap.set(`.bin/${name}`, null);
+      continue;
+    }
+    try {
+      const content = crypto.createHash("sha256").update(fs.readFileSync(real)).digest("hex");
+      const pkg = owningPackageDir(real);
+      let manifest = "";
+      if (pkg) {
+        manifest = manifestCache.get(pkg) ?? packageManifestDigest(pkg);
+        manifestCache.set(pkg, manifest);
+      }
+      snap.set(`.bin/${name}`, `${content}:${manifest}`);
+    } catch {
+      snap.set(`.bin/${name}`, null);
+    }
+  }
+  return snap;
+}
+
+/** `.bin` tools that changed or disappeared since `baseline` (new tools from installs are allowed). */
+export function findTamperedBinTools(worktreeDir: string, baseline: FileSnapshot): string[] {
+  const current = snapshotBinTools(worktreeDir);
+  const out: string[] = [];
+  for (const [name, h] of baseline) {
+    if (!current.has(name)) out.push(`${name} (removed)`);
+    else if (current.get(name) !== h) out.push(`${name} (changed)`);
+  }
+  return out;
+}
+
+const SCRIPT_PATH_RE = /(?:^|[\s;&|()'"=])((?:\.{1,2}\/)?(?:[\w.-]+\/)*[\w.-]+\.(?:sh|bash|zsh|js|mjs|cjs|ts|mts|cts|py|rb|pl))(?=$|[\s;&|()'"])/g;
+const SCRIPT_DIR_RE = /(?:^|[\s;&|()'"=])(\.\/[\w./-]+|(?:bin|scripts|tools)\/[\w./-]+)(?=$|[\s;&|()'"])/g;
+
+const VALUE_FLAGS = new Set(["--filter", "-F", "--dir", "-C", "--prefix", "--workspace", "-w", "--cwd"]);
+const NPM_LIFECYCLE = new Set(["test", "t", "tst", "start", "stop", "restart"]);
+
+/**
+ * package.json script names a shell command runs via npm/pnpm/yarn/bun, skipping flags such as
+ * `-s`, `--silent` or `--filter <pkg>`: `npm run x`, `npm run-script x`, `npm test|t|start|stop|restart`,
+ * `pnpm [run] x`, `yarn [run] x`, `bun run x`.
+ */
+export function scriptNamesInvoked(cmd: string): string[] {
+  const tokens = cmd.split(/[\s;&|()]+/).filter(Boolean);
+  const names: string[] = [];
+  const skipFlags = (i: number): number => {
+    while (i < tokens.length && tokens[i].startsWith("-")) {
+      const flag = tokens[i].split("=")[0];
+      i += VALUE_FLAGS.has(flag) && !tokens[i].includes("=") ? 2 : 1;
+    }
+    return i;
+  };
+  for (let i = 0; i < tokens.length; i++) {
+    const tool = tokens[i];
+    if (!["npm", "pnpm", "yarn", "bun"].includes(tool)) continue;
+    let j = skipFlags(i + 1);
+    const sub = tokens[j];
+    if (!sub) continue;
+    if (tool === "npm") {
+      if (sub === "run" || sub === "run-script") {
+        j = skipFlags(j + 1);
+        if (tokens[j]) names.push(tokens[j]);
+      } else if (NPM_LIFECYCLE.has(sub)) {
+        names.push(sub === "t" || sub === "tst" ? "test" : sub);
+      }
+    } else if (tool === "bun") {
+      if (sub === "run") {
+        j = skipFlags(j + 1);
+        if (tokens[j]) names.push(tokens[j]);
+      } else if (sub === "test") {
+        names.push("test");
+      }
+    } else if (sub === "run") {
+      j = skipFlags(j + 1);
+      if (tokens[j]) names.push(tokens[j]);
+    } else if (!["install", "add", "remove", "exec", "dlx", "x", "i"].includes(sub)) {
+      names.push(sub);
+    }
+  }
+  return names;
+}
+
+/**
+ * Repo-relative files that the verify commands invoke, directly or via package.json scripts
+ * (`npm run x` / `pnpm x` / `yarn x` / `bun run x` are followed recursively). Only existing files are returned.
+ */
+export function findScriptInvokedPaths(worktreeDir: string, verifyCommands: readonly string[]): string[] {
+  let scripts: Record<string, string> = {};
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(worktreeDir, "package.json"), "utf8")) as { scripts?: Record<string, string> };
+    scripts = pkg.scripts ?? {};
+  } catch {
+    // no package.json
+  }
+  const found = new Set<string>();
+  const seenScripts = new Set<string>();
+  const queue = [...verifyCommands];
+  while (queue.length > 0) {
+    const cmd = queue.shift() as string;
+    for (const re of [SCRIPT_PATH_RE, SCRIPT_DIR_RE]) {
+      for (const m of cmd.matchAll(re)) {
+        const rel = path.posix.normalize(m[1].replace(/^\.\//, ""));
+        if (rel.startsWith("..") || rel.includes("node_modules")) continue;
+        // Test files named in a verify command belong to the tester and must stay editable by it.
+        if (isTesterPath(rel)) continue;
+        const full = path.join(worktreeDir, rel);
+        if (fs.existsSync(full) && fs.statSync(full).isFile() && !found.has(rel)) {
+          found.add(rel);
+          // Follow shell scripts one level at a time (test.sh -> helper.sh).
+          if (/\.(sh|bash|zsh)$/.test(rel)) {
+            try {
+              queue.push(fs.readFileSync(full, "utf8"));
+            } catch {
+              // unreadable: ignore
+            }
+          }
+        }
+      }
+    }
+    // npm/pnpm/yarn/bun script invocations, incl. npm lifecycle shortcuts and flags before the name.
+    const names = scriptNamesInvoked(cmd);
+    for (const name of names) {
+      for (const candidate of [name, `pre${name}`, `post${name}`]) {
+        if (scripts[candidate] !== undefined && !seenScripts.has(candidate)) {
+          seenScripts.add(candidate);
+          queue.push(scripts[candidate]);
+        }
+      }
+    }
+  }
+  return [...found].sort();
+}
+
 /** Records sha256 hashes of `files` (null for missing files). */
 export function snapshotFiles(worktreeDir: string, files: readonly string[]): FileSnapshot {
   const snap: FileSnapshot = new Map();

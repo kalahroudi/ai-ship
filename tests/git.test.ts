@@ -6,6 +6,7 @@ import path from "node:path";
 import { execSync, spawnSync } from "node:child_process";
 import {
   abortRebase,
+  cloneDirCopyOnWrite,
   commitAll,
   createWorktree,
   isRebaseInProgress,
@@ -30,7 +31,7 @@ function makeCommittedRepo(files: Record<string, string>) {
   return dir;
 }
 
-test("createWorktree symlinks node_modules for npm repos", () => {
+test("createWorktree provides node_modules (private clone or symlink fallback) for npm repos", () => {
   const dir = makeCommittedRepo({
     "package.json": JSON.stringify({ name: "npm-app", version: "1.0.0" }),
   });
@@ -38,9 +39,39 @@ test("createWorktree symlinks node_modules for npm repos", () => {
 
   const handle = createWorktree(dir, "main", "test npm worktree");
   const wtModules = path.join(handle.worktreeDir, "node_modules");
-  assert.equal(fs.lstatSync(wtModules).isSymbolicLink(), true);
+  const st = fs.lstatSync(wtModules);
+  assert.ok(st.isDirectory() || st.isSymbolicLink());
+  assert.ok(fs.existsSync(path.join(wtModules, "pkg")));
+  fs.writeFileSync(path.join(handle.worktreeDir, "feature.ts"), "export const f = 1;\n");
+  commitAll(handle.worktreeDir, "add");
+  const tree = execSync("git ls-tree -r HEAD --name-only", { cwd: handle.worktreeDir, encoding: "utf8" });
+  assert.doesNotMatch(tree, /node_modules/);
 
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("setupWorktreeDependencies falls back to a symlink when the clone fails and leaves no partial dest", () => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "ai-ship-fb-repo-"));
+  const wt = fs.mkdtempSync(path.join(os.tmpdir(), "ai-ship-fb-wt-"));
+  try {
+    fs.mkdirSync(path.join(repoDir, "node_modules"));
+    const dest = path.join(wt, "node_modules");
+    const ok = cloneDirCopyOnWrite(path.join(repoDir, "node_modules"), dest, (args) => {
+      fs.mkdirSync(args[args.length - 1], { recursive: true }); // simulate partial copy
+      return 1;
+    }, "linux");
+    assert.equal(ok, false);
+    assert.equal(fs.existsSync(dest), false);
+
+    // Unsupported platform path in setup: real setup falls back to symlink or clones; either is fine.
+    fs.writeFileSync(path.join(wt, "package.json"), "{}");
+    setupWorktreeDependencies(repoDir, wt);
+    const st = fs.lstatSync(dest);
+    assert.ok(st.isDirectory() || st.isSymbolicLink());
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+    fs.rmSync(wt, { recursive: true, force: true });
+  }
 });
 
 test("setupWorktreeDependencies runs pnpm install offline without symlinking node_modules", () => {

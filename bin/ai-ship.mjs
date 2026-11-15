@@ -29,7 +29,10 @@ Options:
   --noty <uri>       Resolve task description from a Noty item URI (noty://item/<uuid>)
   --noty-dir <dir>   Override Noty markdown directory (or set NOTY_DIR)
   --provider <name>  Runner provider: opencode (default, deepseek/parasail/telnyx/openrouter/cloudflare) or claude-code
-  --model <id>       Model ID override (defaults to sonnet-5-5 for claude-code)
+  --model <id>       Implementer model override (provider/model for opencode; alias/id for claude-code)
+  --tester-model <id>     Tester model override (must differ from the implementer)
+  --reviewer-model <id>   Reviewer model override (must differ from the implementer)
+  --bughunter-model <id>  Bughunter model override (must differ from the implementer)
   --server <url>     Attach to a running \`opencode serve\` URL (visible on mobile/web)
   --context-lens [url]  Route OpenCode provider requests through Context Lens proxy (default: http://localhost:4040)
   --dream            Consolidate repo memory from recent OpenCode transcripts
@@ -215,6 +218,9 @@ const {
   notyDir,
   rawProvider,
   model,
+  testerModel,
+  reviewerModel,
+  bughunterModel,
   serverUrl,
   contextLens,
   positional,
@@ -261,5 +267,5 @@ if (!task) {
   process.exit(1);
 }
 
-await runPipeline({ repoDir, worktreeDir, task, openPr, draft, skipTests, skipReview, skipBughunter, allowConfigChange, provider, model, serverUrl, contextLens });
+await runPipeline({ repoDir, worktreeDir, task, openPr, draft, skipTests, skipReview, skipBughunter, allowConfigChange, provider, model, testerModel, reviewerModel, bughunterModel, serverUrl, contextLens });
 }

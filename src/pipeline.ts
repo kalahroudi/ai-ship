@@ -42,7 +42,11 @@ import {
   collectRecentTranscripts,
   createOpencodeClientRunner,
   createRunner,
-  DEFAULT_CLAUDE_MODEL,
+  checkModelIndependence,
+  formatRoleModelTable,
+  resolveRoleFallbackLabels,
+  resolveRoleModelLabels,
+  type RoleModelOverrides,
   parseUsageSummary,
   type OpencodeClient,
   type AgentRole,
@@ -63,7 +67,11 @@ export interface PipelineOptions {
   skipReview?: boolean;
   skipBughunter?: boolean;
   provider?: ProviderName;
+  /** Implementer model override. Does not change the tester/reviewer/bughunter models. */
   model?: string;
+  testerModel?: string;
+  reviewerModel?: string;
+  bughunterModel?: string;
   serverUrl?: string;
   contextLens?: boolean | string;
   /** Allow agents to change protected verify/config files (see DEFAULT_PROTECTED_PATHS). */
@@ -976,7 +984,32 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
   const cfGatewayUrl = resolveCloudflareGatewayUrl();
   const contextLensUrl = resolveContextLensUrl(config, opts.contextLens);
   console.log(`\n[ai-ship] Repo: ${repoDir} (base: ${config.baseBranch})`);
-  console.log(`[ai-ship] Provider: ${provider}${opts.model ? ` (model: ${opts.model})` : provider === "claude-code" ? ` (model: ${DEFAULT_CLAUDE_MODEL})` : ""}`);
+  const roleModels: RoleModelOverrides = {
+    ...(opts.model ? { implementer: opts.model } : {}),
+    ...(opts.testerModel ? { tester: opts.testerModel } : {}),
+    ...(opts.reviewerModel ? { reviewer: opts.reviewerModel } : {}),
+    ...(opts.bughunterModel ? { bughunter: opts.bughunterModel } : {}),
+  };
+  const roleLabels = resolveRoleModelLabels(provider, config, roleModels);
+  console.log(`[ai-ship] Provider: ${provider}`);
+  console.log("[ai-ship] Role models:");
+  for (const line of formatRoleModelTable(roleLabels)) console.log(line);
+  const independenceWarnings = checkModelIndependence({
+    labels: roleLabels,
+    fallbacks: resolveRoleFallbackLabels(provider, config),
+    lensModels:
+      provider === "claude-code"
+        ? undefined
+        : Object.fromEntries(
+            Object.entries(config.reviewerLensModels ?? {}).map(([lens, ref]) => [
+              lens,
+              { ...ref, providerID: ref.providerID || config.reviewerModel?.providerID || config.defaultProvider || "" },
+            ])
+          ),
+    strict: config.strictIndependence !== false,
+    provider,
+  });
+  for (const w of independenceWarnings) console.log(`[ai-ship] Warning: ${w}`);
   if (provider === "opencode" && cfGatewayUrl) console.log(`[ai-ship] Cloudflare AI Gateway: ${cfGatewayUrl}`);
   if (provider === "opencode" && contextLensUrl) console.log(`[ai-ship] Context Lens Proxy: ${contextLensUrl}`);
   console.log(`[ai-ship] Verify pipeline: ${config.verify.length ? config.verify.join(" && ") : "(none detected)"}`);
@@ -992,7 +1025,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
         client: opts.client,
         worktreeDir: worktree.worktreeDir,
         config,
-        model: opts.model,
+        roleModels,
       })
     : await createRunner({
         provider,
@@ -1000,7 +1033,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
         config,
         cfGatewayUrl,
         contextLensUrl,
-        model: opts.model,
+        roleModels,
         serverUrl: opts.serverUrl,
       });
   const usageLog: string[] = [];
@@ -1456,7 +1489,8 @@ export async function runDreamConsolidation(opts: {
       client,
       worktreeDir: repoDir,
       config,
-      model: opts.model,
+      // dream consolidation runs as the read-only reviewer role
+      roleModels: opts.model ? { reviewer: opts.model } : undefined,
     });
 
     const sessionId = await runner.createSession(`Dream: ${repoName}`);

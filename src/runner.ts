@@ -48,6 +48,162 @@ export function buildOpencodeAgentConfig(): Record<
 
 export const DEFAULT_CLAUDE_MODEL = "sonnet";
 
+/** Per-role Claude models for the claude-code runner; distinct by default so tests/reviews are independent. */
+export const DEFAULT_CLAUDE_ROLE_MODELS: Readonly<Record<AgentRole, string>> = {
+  implementer: "opus",
+  tester: "sonnet",
+  reviewer: "haiku",
+  bughunter: "sonnet",
+};
+
+export const AGENT_ROLES: readonly AgentRole[] = ["implementer", "tester", "reviewer", "bughunter"];
+
+/** CLI/MCP per-role model overrides (`provider/model` for OpenCode, alias or id for claude-code). */
+export type RoleModelOverrides = Partial<Record<AgentRole, string>>;
+
+function roleConfigModel(config: RepoConfig, role: AgentRole): ModelRef | undefined {
+  return role === "implementer"
+    ? config.implementerModel
+    : role === "tester"
+      ? config.testerModel
+      : role === "bughunter"
+        ? config.bughunterModel
+        : config.reviewerModel;
+}
+
+/**
+ * Resolves the model label used for each role.
+ * `overrides.implementer` (the `--model` flag) only affects the implementer; other roles keep their own model.
+ * Returns undefined for a role whose model is left to the OpenCode agent config.
+ */
+export function resolveRoleModelLabels(
+  provider: ProviderName,
+  config: RepoConfig,
+  overrides: RoleModelOverrides = {}
+): Record<AgentRole, string | undefined> {
+  const out = {} as Record<AgentRole, string | undefined>;
+  for (const role of AGENT_ROLES) {
+    if (provider === "claude-code") {
+      out[role] = overrides[role] || config.claudeModels?.[role] || DEFAULT_CLAUDE_ROLE_MODELS[role];
+    } else {
+      const defaultProvider = config.defaultProvider ?? config.implementerModel?.providerID ?? "deepseek";
+      const parsed = parseOpencodeModel(overrides[role], defaultProvider);
+      const ref = parsed ?? toOpencodeModel(roleConfigModel(config, role));
+      out[role] = ref ? `${ref.providerID}/${ref.modelID}` : undefined;
+    }
+  }
+  return out;
+}
+
+export class ModelIndependenceError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ModelIndependenceError";
+  }
+}
+
+function roleFallbackConfigModel(config: RepoConfig, role: AgentRole): ModelRef | undefined {
+  return role === "implementer"
+    ? config.implementerFallbackModel
+    : role === "tester"
+      ? config.testerFallbackModel
+      : role === "bughunter"
+        ? config.bughunterFallbackModel
+        : config.reviewerFallbackModel;
+}
+
+/** Fallback model labels per role (OpenCode only; the claude-code runner has no per-role fallback). */
+export function resolveRoleFallbackLabels(
+  provider: ProviderName,
+  config: RepoConfig
+): Record<AgentRole, string | undefined> {
+  const out = {} as Record<AgentRole, string | undefined>;
+  for (const role of AGENT_ROLES) {
+    const ref = provider === "claude-code" ? undefined : roleFallbackConfigModel(config, role);
+    out[role] = ref ? `${ref.providerID}/${ref.id}` : undefined;
+  }
+  return out;
+}
+
+function normalizeModelLabel(label: string): string {
+  return label.trim().toLowerCase();
+}
+
+/** Last path segment of a model label (e.g. "openrouter/anthropic/claude-x" -> "claude-x"). */
+function modelBaseName(label: string): string {
+  const parts = normalizeModelLabel(label).split("/");
+  return parts[parts.length - 1] ?? "";
+}
+
+/**
+ * Checks that the tester, reviewer(s) and bughunter never run on the implementer's model, including via
+ * fallback models used after a 429/5xx failover. Exact matches (case-insensitive) are violations and throw
+ * ModelIndependenceError when `strict`; the same model name reached through a different provider prefix is
+ * reported as a warning. Returns all problems/warnings.
+ */
+export function checkModelIndependence(opts: {
+  labels: Record<AgentRole, string | undefined>;
+  fallbacks?: Partial<Record<AgentRole, string | undefined>>;
+  lensModels?: Record<string, ModelRef>;
+  strict: boolean;
+  provider?: ProviderName;
+}): string[] {
+  const implementerModels = [opts.labels.implementer, opts.fallbacks?.implementer].filter(
+    (l): l is string => Boolean(l)
+  );
+  const problems: string[] = [];
+  const warnings: string[] = [];
+  if (!opts.labels.implementer) {
+    warnings.push("implementer model is resolved by the OpenCode agent config; independence could not be verified");
+  }
+
+  const consider = (who: string, label: string | undefined) => {
+    if (!label) {
+      warnings.push(`${who} model is resolved by the OpenCode agent config; independence could not be verified`);
+      return;
+    }
+    // Exact matches first, so a same-name warning against the primary can't shadow an exact fallback match.
+    const exact = implementerModels.find((impl) => normalizeModelLabel(label) === normalizeModelLabel(impl));
+    if (exact) {
+      problems.push(`${who} uses the implementer's model (${exact})`);
+      return;
+    }
+    const sameName = implementerModels.find((impl) => modelBaseName(label) === modelBaseName(impl));
+    if (sameName) {
+      warnings.push(`${who} (${label}) may be the same model as the implementer (${sameName}) via a different provider`);
+    }
+  };
+
+  for (const role of ["tester", "reviewer", "bughunter"] as const) {
+    consider(role, opts.labels[role]);
+    if (opts.fallbacks?.[role]) consider(`${role} fallback`, opts.fallbacks[role]);
+  }
+  for (const [lens, ref] of Object.entries(opts.lensModels ?? {})) {
+    consider(`review lens "${lens}"`, ref.providerID ? `${ref.providerID}/${ref.id}` : ref.id);
+  }
+
+  if (problems.length > 0 && opts.strict) {
+    const hint =
+      opts.provider === "claude-code"
+        ? 'Set distinct "claudeModels" per role in .ai-ship.json (or --tester-model/--reviewer-model/--bughunter-model),'
+        : "Set distinct testerModel/reviewerModel/bughunterModel and their fallbacks in .ai-ship.json (or --tester-model/--reviewer-model/--bughunter-model),";
+    throw new ModelIndependenceError(
+      [
+        "Independent tests/reviews require models different from the implementer:",
+        ...problems.map((p) => `- ${p}`),
+        hint,
+        'or set "strictIndependence": false in .ai-ship.json to allow it.',
+      ].join("\n")
+    );
+  }
+  return [...problems, ...warnings];
+}
+
+/** Formats the role -> model table printed at pipeline start. */
+export function formatRoleModelTable(labels: Record<AgentRole, string | undefined>): string[] {
+  return AGENT_ROLES.map((r) => `  ${r.padEnd(11)} ${labels[r] ?? "(OpenCode agent default)"}`);
+}
+
 export interface FallbackActivation {
   role: AgentRole;
   from: string;
@@ -553,26 +709,21 @@ export function createOpencodeClientRunner(opts: {
   client: OpencodeClient;
   worktreeDir: string;
   config: RepoConfig;
+  /** Implementer model override (the `--model` flag). Other roles are not affected. */
   model?: string;
+  roleModels?: RoleModelOverrides;
   retry?: RetryOptions;
   onClose?: () => void;
 }): PipelineRunner {
   const defaultProvider =
     opts.config.defaultProvider ?? opts.config.implementerModel?.providerID ?? "deepseek";
-  const cliModel = parseOpencodeModel(opts.model, defaultProvider);
+  const overrides: RoleModelOverrides = { ...opts.roleModels, ...(opts.model ? { implementer: opts.model } : {}) };
 
   const modelForRole = (role: AgentRole, override?: { providerID: string; modelID: string }) => {
     if (override) return override;
-    if (cliModel) return cliModel;
-    const roleCfg =
-      role === "implementer"
-        ? opts.config.implementerModel
-        : role === "tester"
-          ? opts.config.testerModel
-          : role === "bughunter"
-            ? opts.config.bughunterModel
-            : opts.config.reviewerModel;
-    return toOpencodeModel(roleCfg);
+    const cli = parseOpencodeModel(overrides[role], defaultProvider);
+    if (cli) return cli;
+    return toOpencodeModel(roleConfigModel(opts.config, role));
   };
 
   const fallbackModelForRole = (role: AgentRole) => {
@@ -762,6 +913,7 @@ async function createOpencodeRunner(opts: {
   cfGatewayUrl?: string;
   contextLensUrl?: string;
   model?: string;
+  roleModels?: RoleModelOverrides;
   serverUrl?: string;
 }): Promise<PipelineRunner> {
   if (opts.serverUrl) {
@@ -771,6 +923,7 @@ async function createOpencodeRunner(opts: {
       worktreeDir: opts.worktreeDir,
       config: opts.config,
       model: opts.model,
+      roleModels: opts.roleModels,
     });
   }
 
@@ -789,15 +942,24 @@ async function createOpencodeRunner(opts: {
     worktreeDir: opts.worktreeDir,
     config: opts.config,
     model: opts.model,
+    roleModels: opts.roleModels,
     onClose: () => server.close(),
   });
 }
 
-function createClaudeCodeRunner(opts: {
+export function createClaudeCodeRunner(opts: {
   worktreeDir: string;
+  config?: RepoConfig;
+  /** Implementer model override (the `--model` flag). */
   model?: string;
+  roleModels?: RoleModelOverrides;
+  /** Test seam: replaces spawning the `claude` CLI. */
+  exec?: (cwd: string, args: string[], promptText: string) => Promise<string>;
 }): PipelineRunner {
-  const model = opts.model || DEFAULT_CLAUDE_MODEL;
+  const overrides: RoleModelOverrides = { ...opts.roleModels, ...(opts.model ? { implementer: opts.model } : {}) };
+  const modelFor = (role: AgentRole) =>
+    overrides[role] || opts.config?.claudeModels?.[role] || DEFAULT_CLAUDE_ROLE_MODELS[role];
+  const exec = opts.exec ?? runClaudeCommand;
   const sessionMap = new Map<string, string | undefined>();
   let nextLocalId = 1;
 
@@ -812,8 +974,8 @@ function createClaudeCodeRunner(opts: {
         role,
         invoke: async () => {
           const resumeSessionId = sessionMap.get(sessionId);
-          const args = buildClaudeArgs({ model, role, resumeSessionId });
-          const stdout = await runClaudeCommand(opts.worktreeDir, args, text);
+          const args = buildClaudeArgs({ model: modelFor(role), role, resumeSessionId });
+          const stdout = await exec(opts.worktreeDir, args, text);
           const parsed = parseClaudeJsonOutput(stdout);
           if (parsed.sessionId) {
             sessionMap.set(sessionId, parsed.sessionId);
@@ -838,12 +1000,15 @@ export async function createRunner(opts: {
   cfGatewayUrl?: string;
   contextLensUrl?: string;
   model?: string;
+  roleModels?: RoleModelOverrides;
   serverUrl?: string;
 }): Promise<PipelineRunner> {
   if (opts.provider === "claude-code") {
     return createClaudeCodeRunner({
       worktreeDir: opts.worktreeDir,
+      config: opts.config,
       model: opts.model,
+      roleModels: opts.roleModels,
     });
   }
   return createOpencodeRunner({
@@ -852,6 +1017,7 @@ export async function createRunner(opts: {
     cfGatewayUrl: opts.cfGatewayUrl,
     contextLensUrl: opts.contextLensUrl,
     model: opts.model,
+    roleModels: opts.roleModels,
     serverUrl: opts.serverUrl,
   });
 }

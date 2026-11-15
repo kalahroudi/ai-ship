@@ -49,6 +49,13 @@ For OpenCode Desktop/TUI/Mobile plugin usage, see [plugin/README.md](./plugin/RE
 - Global models & zero-friction permissions: `~/.config/opencode/opencode.json`
 - Per-repo verify commands & overrides: `<repo>/.ai-ship.json` (auto-detects `package.json`, `Package.swift`, `Cargo.toml`, `go.mod`, `pyproject.toml`, and `semgrep` when omitted).
 
+### Independent Models per Role
+The tester, reviewers and bughunter must run on models different from the implementer, otherwise "independent" tests and reviews would just be the implementer checking itself.
+- `--model` overrides only the **implementer**. Use `--tester-model`, `--reviewer-model` and `--bughunter-model` for the others (also available as MCP args).
+- `claude-code` runner defaults: implementer `opus`, tester `sonnet`, reviewer `haiku`, bughunter `sonnet`. Override with `"claudeModels": { "reviewer": "sonnet" }` in `.ai-ship.json`.
+- At start (before any worktree or model call), ai-ship prints the role → model table and fails if any reviewing role — or its fallback model, or a `reviewerLensModels` entry — shares the implementer's model or the implementer's fallback. The same model name via a different provider prefix is a warning. Set `"strictIndependence": false` to downgrade failures to warnings.
+- `reviewerLensModels` entries take precedence over `--reviewer-model` for their lens.
+
 ### Budget Circuit Breaker
 `ai-ship` tracks `input`, `output`, `cache_read` tokens and USD cost across all stages and retries, and aborts cleanly before launching the next stage/retry if thresholds are reached. Defaults are `maxTaskCostUsd: 5` and `maxTaskTokens: 2000000` (set to `null` or `0` to disable).
 

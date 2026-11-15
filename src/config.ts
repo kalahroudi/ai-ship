@@ -49,6 +49,10 @@ export interface RepoConfig {
   reviewerFallbackModel?: ModelRef;
   bughunterFallbackModel?: ModelRef;
   reviewerLensModels?: Record<string, ModelRef>;
+  /** Per-role models for the claude-code runner (aliases like "opus"/"sonnet"/"haiku" or full ids). */
+  claudeModels?: Partial<Record<"implementer" | "tester" | "reviewer" | "bughunter", string>>;
+  /** Fail when tester/reviewer/bughunter share the implementer's model (default true). */
+  strictIndependence?: boolean;
   reviewConcurrency?: number;
   reviewStaggerMs?: number;
   providers?: Record<string, ProviderConfig>;
@@ -297,6 +301,9 @@ export interface ParsedCliArgs {
   notyDir?: string;
   rawProvider?: string;
   model?: string;
+  testerModel?: string;
+  reviewerModel?: string;
+  bughunterModel?: string;
   serverUrl?: string;
   contextLens?: boolean | string;
   cfArgs?: { accountId: string; gatewayId: string; provider?: string };
@@ -347,6 +354,18 @@ export function parseCliArgs(args: string[], cwd = process.cwd()): ParsedCliArgs
       result.model = args[++i];
     } else if (arg.startsWith("--model=")) {
       result.model = arg.slice("--model=".length);
+    } else if (arg === "--tester-model" && args[i + 1]) {
+      result.testerModel = args[++i];
+    } else if (arg.startsWith("--tester-model=")) {
+      result.testerModel = arg.slice("--tester-model=".length);
+    } else if (arg === "--reviewer-model" && args[i + 1]) {
+      result.reviewerModel = args[++i];
+    } else if (arg.startsWith("--reviewer-model=")) {
+      result.reviewerModel = arg.slice("--reviewer-model=".length);
+    } else if (arg === "--bughunter-model" && args[i + 1]) {
+      result.bughunterModel = args[++i];
+    } else if (arg.startsWith("--bughunter-model=")) {
+      result.bughunterModel = arg.slice("--bughunter-model=".length);
     } else if (arg === "--server" && args[i + 1]) {
       result.serverUrl = args[++i];
     } else if (arg.startsWith("--server=")) {

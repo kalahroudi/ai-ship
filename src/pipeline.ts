@@ -31,7 +31,9 @@ import {
   DEFAULT_CLAUDE_MODEL,
   parseUsageSummary,
   type OpencodeClient,
+  type AgentRole,
   type PipelineRunner,
+  type PromptOptions,
   type PromptResult,
   type PromptUsage,
   type ProviderName,
@@ -586,8 +588,20 @@ export async function runReviewLenses(opts: {
         buildReviewerLensPrompt(item.lens),
         item.modelOverride ? { modelOverride: item.modelOverride } : undefined
       );
-      recordUsage(opts.usageLog, `Stage 4: ${item.lens.name} Lens`, r, opts.budget, "Stage 4: Review");
-      results[idx] = { lens: item.lens.name, text: r.text, verdict: parseVerdict(r.text) };
+      const label = `Stage 4: ${item.lens.name} Lens`;
+      recordUsage(opts.usageLog, label, r, opts.budget, "Stage 4: Review");
+      const resolved = await resolveVerdictWithReask({
+        runner: opts.runner,
+        sessionId: sid,
+        role: "reviewer",
+        label,
+        text: r.text,
+        usageLog: opts.usageLog,
+        budget: opts.budget,
+        stageKey: "Stage 4: Review",
+        promptOptions: item.modelOverride ? { modelOverride: item.modelOverride } : undefined,
+      });
+      results[idx] = { lens: item.lens.name, text: resolved.text, verdict: resolved.verdict };
     }
   };
 
@@ -638,12 +652,65 @@ async function runDeterministicVerify(
   return { ok: true, output: logs.join("\n\n") };
 }
 
-function parseVerdict(text: string): "CLEAN" | "OPEN" {
-  const match = text.match(/VERDICT:\s*(CLEAN|OPEN)/i);
-  if (match) return match[1].toUpperCase() as "CLEAN" | "OPEN";
-  return text.toLowerCase().includes("critical") || text.toLowerCase().includes("vulnerability")
-    ? "OPEN"
-    : "CLEAN";
+export type ParsedVerdict = "CLEAN" | "OPEN" | "MISSING";
+
+// The whole line must be the verdict: only markdown emphasis/punctuation may follow the token, so
+// "VERDICT: CLEAN or VERDICT: OPEN" or "VERDICT: CLEAN if X is fixed" are MISSING (and get re-asked).
+const VERDICT_LINE_RE = /^[\s>*_`#-]*VERDICT[*_`]*\s*:\s*[*_`]*\s*(CLEAN|OPEN)[\s*_`.!]*$/gim;
+
+/**
+ * Returns the verdict from the LAST line that consists only of `VERDICT: CLEAN|OPEN` (markdown emphasis allowed).
+ * Never guesses: text without such a line is "MISSING", so callers can re-ask and fail closed.
+ */
+export function parseVerdict(text: string): ParsedVerdict {
+  let last: string | undefined;
+  for (const m of text.matchAll(VERDICT_LINE_RE)) last = m[1];
+  return last ? (last.toUpperCase() as "CLEAN" | "OPEN") : "MISSING";
+}
+
+export const VERDICT_REASK_PROMPT =
+  "Your previous reply did not end with a verdict line. Reply with your findings (or 'No findings') and a final line that is exactly `VERDICT: CLEAN` or `VERDICT: OPEN`.";
+
+/**
+ * Ensures a reviewer reply carries an explicit verdict: re-asks once in the same session when it is missing,
+ * and fails closed (OPEN) if the verdict is still missing after the re-ask.
+ */
+export async function resolveVerdictWithReask(opts: {
+  runner: PipelineRunner;
+  sessionId: string;
+  role: AgentRole;
+  label: string;
+  text: string;
+  usageLog: string[];
+  budget?: BudgetTracker;
+  stageKey: string;
+  promptOptions?: PromptOptions;
+  parse?: (text: string) => ParsedVerdict;
+  reaskPrompt?: string;
+}): Promise<{ verdict: "CLEAN" | "OPEN"; text: string; missing: boolean }> {
+  const parse = opts.parse ?? parseVerdict;
+  const first = parse(opts.text);
+  if (first !== "MISSING") return { verdict: first, text: opts.text, missing: false };
+
+  opts.usageLog.push(`  [${opts.label}] verdict missing; re-asking once`);
+  opts.budget?.assertWithinBudget(`${opts.label} (verdict re-ask)`);
+  const retry = await opts.runner.prompt(
+    opts.sessionId,
+    opts.role,
+    opts.reaskPrompt ?? VERDICT_REASK_PROMPT,
+    opts.promptOptions
+  );
+  recordUsage(opts.usageLog, `${opts.label} (re-ask)`, retry, opts.budget, opts.stageKey);
+  const second = parse(retry.text);
+  const combined = [opts.text, retry.text].filter((t) => t.trim()).join("\n\n");
+  if (second !== "MISSING") return { verdict: second, text: combined, missing: false };
+
+  opts.usageLog.push(`  [${opts.label}] verdict still missing after re-ask; failing closed (OPEN: no verdict)`);
+  return {
+    verdict: "OPEN",
+    text: `${combined}\n\n(ai-ship: no verdict returned after re-ask; treated as OPEN)`.trim(),
+    missing: true,
+  };
 }
 
 const BUGHUNTER_FINDING_RE =
@@ -669,19 +736,31 @@ export function parseBughunterVerdict(text: string): {
     });
   }
 
-  const explicitMatch = text.match(/VERDICT:\s*(CLEAN|OPEN)/i);
   const hasConfirmed = findings.some((f) => f.status === "CONFIRMED");
   if (hasConfirmed) {
     return { verdict: "OPEN", findings };
   }
-  if (explicitMatch) {
-    return { verdict: explicitMatch[1].toUpperCase() as "CLEAN" | "OPEN", findings };
-  }
-  if (findings.length > 0) {
-    return { verdict: "CLEAN", findings };
-  }
-  return { verdict: parseVerdict(text), findings };
+  const explicit = parseVerdict(text);
+  // Fail closed: without an explicit final verdict line the Referee result is OPEN.
+  return { verdict: explicit === "CLEAN" ? "CLEAN" : "OPEN", findings };
 }
+
+/** Referee verdict for re-ask purposes: a CONFIRMED finding counts as OPEN, otherwise the explicit verdict line. */
+function parseRefereeVerdict(text: string): ParsedVerdict {
+  const parsed = parseBughunterVerdict(text);
+  if (parsed.findings.some((f) => f.status === "CONFIRMED")) return "OPEN";
+  return parseVerdict(text);
+}
+
+/** Classifies Hunter output: hypotheses to verify, an explicit NO_HYPOTHESES, or unparseable. */
+export function classifyHunterOutput(text: string): "HYPOTHESES" | "NONE" | "MISSING" {
+  if (/\bBUG-\d+\b/i.test(text)) return "HYPOTHESES";
+  if (/^[\s>*_`-]*NO_HYPOTHESES[\s*_`.]*$/m.test(text)) return "NONE";
+  return "MISSING";
+}
+
+export const HUNTER_REASK_PROMPT =
+  "Your previous reply contained neither BUG-N hypothesis blocks nor NO_HYPOTHESES. Reply again using exactly the BUG-N block format, or output `NO_HYPOTHESES` and `VERDICT: CLEAN` if there are no credible cross-boundary bugs.";
 
 /** Formats confirmed Bughunter findings (or fallback Referee text) into markdown for implementer fixes or errors. */
 export function formatBughunterFindings(
@@ -734,14 +813,33 @@ export async function runBughunterPass(opts: {
     "Stage 4b: Bughunter"
   );
 
-  const hasHypotheses = /\bBUG-\d+\b/i.test(hunterRes.text);
-  const noHypotheses = /\bNO_HYPOTHESES\b/i.test(hunterRes.text);
-  if (noHypotheses || (!hasHypotheses && parseVerdict(hunterRes.text) === "CLEAN")) {
+  let hunterText = hunterRes.text;
+  let hunterKind = classifyHunterOutput(hunterText);
+  if (hunterKind === "MISSING") {
+    opts.usageLog.push("  [Stage 4b: Bughunter (Hunter)] no BUG-N or NO_HYPOTHESES; re-asking once");
+    opts.budget?.assertWithinBudget("Stage 4b: Bughunter (Hunter re-ask)");
+    const retry = await opts.runner.prompt(hunterSessionId, "bughunter", HUNTER_REASK_PROMPT);
+    recordUsage(opts.usageLog, "Stage 4b: Bughunter (Hunter re-ask)", retry, opts.budget, "Stage 4b: Bughunter");
+    hunterText = [hunterText, retry.text].filter((t) => t.trim()).join("\n\n");
+    hunterKind = classifyHunterOutput(retry.text);
+  }
+  if (hunterKind === "NONE") {
     return {
-      hunterText: hunterRes.text,
+      hunterText,
       skepticText: "",
       refereeText: "VERDICT: CLEAN",
       verdict: "CLEAN",
+      findings: [],
+    };
+  }
+  if (hunterKind === "MISSING") {
+    opts.usageLog.push("  [Stage 4b: Bughunter (Hunter)] still unparseable after re-ask; failing closed (OPEN)");
+    return {
+      hunterText,
+      skepticText: "",
+      refereeText:
+        "VERDICT: OPEN\n(ai-ship: the Hunter returned neither BUG-N hypotheses nor NO_HYPOTHESES after a re-ask; treated as OPEN)",
+      verdict: "OPEN",
       findings: [],
     };
   }
@@ -752,7 +850,7 @@ export async function runBughunterPass(opts: {
     skepticSessionId,
     "bughunter",
     buildBughunterSkepticPrompt({
-      hunterFindings: hunterRes.text,
+      hunterFindings: hunterText,
       diff: opts.diff,
     })
   );
@@ -770,7 +868,7 @@ export async function runBughunterPass(opts: {
     refereeSessionId,
     "bughunter",
     buildBughunterRefereePrompt({
-      hunterFindings: hunterRes.text,
+      hunterFindings: hunterText,
       skepticChallenges: skepticRes.text,
     })
   );
@@ -782,12 +880,23 @@ export async function runBughunterPass(opts: {
     "Stage 4b: Bughunter"
   );
 
-  const parsed = parseBughunterVerdict(refereeRes.text);
+  const referee = await resolveVerdictWithReask({
+    runner: opts.runner,
+    sessionId: refereeSessionId,
+    role: "bughunter",
+    label: "Stage 4b: Bughunter (Referee)",
+    text: refereeRes.text,
+    usageLog: opts.usageLog,
+    budget: opts.budget,
+    stageKey: "Stage 4b: Bughunter",
+    parse: parseRefereeVerdict,
+  });
+  const parsed = parseBughunterVerdict(referee.text);
   return {
-    hunterText: hunterRes.text,
+    hunterText,
     skepticText: skepticRes.text,
-    refereeText: refereeRes.text,
-    verdict: parsed.verdict,
+    refereeText: referee.text,
+    verdict: referee.missing ? "OPEN" : parsed.verdict,
     findings: parsed.findings,
   };
 }

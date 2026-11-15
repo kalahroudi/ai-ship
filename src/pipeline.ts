@@ -1439,7 +1439,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
   const subscriptionBilled = isSubscriptionBilled(provider) && !budgetConfig.countSubscription;
   // On a subscription, the default $ cap (a guard against metered spend) does not apply either; a cap the user
   // set explicitly does, and maxTaskTokens still bounds runaway work.
-  const baseTaskCapUsd = subscriptionBilled && !config.maxTaskCostUsdExplicit ? undefined : config.maxTaskCostUsd;
+  const baseTaskCapUsd = subscriptionBilled && config.maxTaskCostUsdExplicit === false ? undefined : config.maxTaskCostUsd;
   const effectiveMaxTaskCostUsd =
     governorTaskCapUsd === undefined || subscriptionBilled
       ? baseTaskCapUsd

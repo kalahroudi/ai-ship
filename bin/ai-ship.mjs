@@ -14,6 +14,7 @@ import { spawnSync } from "node:child_process";
 import { createLazyRunner, createOc2Runner } from "../src/oc2/runner.ts";
 import { formatProgressEvent, throttleSink } from "../src/progress.ts";
 import { formatSafetyFindings, scanWorktreeSafety } from "../src/safety.ts";
+import { buildGatewayProvider, formatCatalog, loadCatalog, syncCatalog } from "../src/catalog.ts";
 import { formatDoctor, initRepo as initRepoFiles, installPlugin, runDoctor, uninstallPlugin } from "../src/doctor.ts";
 
 function printHelp() {
@@ -50,6 +51,9 @@ Options:
   --skip-bughunter   Skip Stage 4b adversarial Hunter -> Skeptic -> Referee pass
   --allow-config-change  Let agents change protected verify/config files (.ai-ship.json, package.json scripts, CI, test config)
   --init             Copy starter AGENTS.md and .ai-ship.json into target repo
+  --models           List the model catalog (~/.config/ai-ship/models.json) and gateway settings
+  --models-sync      Send a 1-token request per enabled catalog model through the Cloudflare AI Gateway
+  --models-opencode-config  Print an OpenCode "provider" entry for the gateway (paste into opencode.json for Desktop)
   --doctor [--fix]   Check the OpenCode 2.x native-plugin setup (--fix removes a duplicate ai-ship MCP entry, with backup)
   --plugin-install   Install the native OpenCode 2.x plugin (~/.config/opencode/plugins/ai-ship.ts)
   --plugin-uninstall Remove the native plugin file created by --plugin-install
@@ -245,6 +249,26 @@ const {
 
 if (doInit) {
   initRepo(repoDir);
+  process.exit(0);
+}
+
+if (parsed.modelsAction) {
+  const { catalog, problems } = loadCatalog();
+  for (const p of problems) console.log(`[ai-ship] models.json: ${p}`);
+  if (parsed.modelsAction === "list") {
+    for (const line of formatCatalog(catalog)) console.log(line);
+  } else if (parsed.modelsAction === "opencode-config") {
+    const aig = buildGatewayProvider(catalog);
+    if (!aig) {
+      console.error("No enabled gateway in models.json.");
+      process.exit(1);
+    }
+    console.log(JSON.stringify({ provider: { aig } }, null, 2));
+  } else {
+    const results = await syncCatalog(catalog);
+    for (const r of results) console.log(`${r.ok ? "✔" : "✖"} ${r.id} ${r.ms}ms ${r.detail}`);
+    process.exit(results.every((r) => r.ok) ? 0 : 1);
+  }
   process.exit(0);
 }
 

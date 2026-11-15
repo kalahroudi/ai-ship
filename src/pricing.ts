@@ -64,8 +64,17 @@ export function loadPricingTable(repoPricing?: unknown, filePath = getModelsFile
   let fromFile: PricingTable = {};
   try {
     if (fs.existsSync(filePath)) {
-      const parsed = JSON.parse(fs.readFileSync(filePath, "utf8")) as { pricing?: unknown };
-      fromFile = normalizePricing(parsed?.pricing);
+      const parsed = JSON.parse(fs.readFileSync(filePath, "utf8")) as { pricing?: unknown; models?: unknown };
+      // Catalog models (`models[].pricing`) also price their gateway alias `aig/<provider>/<model>`.
+      const fromCatalog: Record<string, unknown> = {};
+      for (const m of Array.isArray(parsed?.models) ? parsed.models : []) {
+        const r = (m ?? {}) as { id?: unknown; pricing?: unknown };
+        if (typeof r.id === "string" && r.pricing) {
+          fromCatalog[r.id] = r.pricing;
+          fromCatalog[`aig/${r.id}`] = r.pricing;
+        }
+      }
+      fromFile = { ...normalizePricing(fromCatalog), ...normalizePricing(parsed?.pricing) };
     }
   } catch (err) {
     console.error(`[ai-ship] Warning: could not read pricing from ${filePath}: ${(err as Error).message}`);

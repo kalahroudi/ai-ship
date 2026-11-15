@@ -3,6 +3,8 @@ import fs from "node:fs";
 import { createOpencode, createOpencodeClient } from "@opencode-ai/sdk";
 import type { ModelRef, RepoConfig } from "./config.ts";
 import { loadPricingTable, resolveCost, toOpencodeCost, findPricing, type CostSource, type PricingTable } from "./pricing.ts";
+import { buildGatewayProvider, GATEWAY_PROVIDER_ID, gatewayCompatUrl, loadCatalog } from "./catalog.ts";
+import { startEgressProxy, type EgressUsage } from "./egress.ts";
 
 export type OpencodeClient = ReturnType<typeof createOpencodeClient>;
 
@@ -1162,6 +1164,8 @@ async function createOpencodeRunner(opts: {
   model?: string;
   roleModels?: RoleModelOverrides;
   serverUrl?: string;
+  onGatewayUsage?: (u: EgressUsage) => void;
+  gatewayMetadata?: Record<string, string>;
 }): Promise<PipelineRunner> {
   if (opts.serverUrl) {
     const client = createOpencodeClient({ baseUrl: opts.serverUrl });
@@ -1185,14 +1189,53 @@ async function createOpencodeRunner(opts: {
     undefined,
     implementerProvider
   );
+
+  // Model catalog + Cloudflare AI Gateway: expose every enabled catalog model as `aig/<provider>/<model>`,
+  // routed through the local egress proxy (adds gateway auth + metadata, reports usage).
+  const { catalog, problems } = loadCatalog();
+  for (const p of problems) console.log(`[ai-ship] models.json: ${p}`);
+  let closeProxy: (() => Promise<void>) | undefined;
+  if (catalog.gateway?.enabled) {
+    const token = process.env[catalog.gateway.tokenEnv];
+    if (!token) console.log(`[ai-ship] Warning: ${catalog.gateway.tokenEnv} is not set; gateway requests will be unauthenticated.`);
+    const proxy = await startEgressProxy({
+      upstreamBase: gatewayCompatUrl(catalog.gateway),
+      token,
+      metadata: () => ({ app: "ai-ship", ...(opts.gatewayMetadata ?? {}) }),
+      onUsage: opts.onGatewayUsage,
+    });
+    closeProxy = proxy.close;
+    const aig = buildGatewayProvider(catalog, { proxyUrl: proxy.url });
+    if (aig) {
+      const merged = providerConfig ?? {};
+      merged[GATEWAY_PROVIDER_ID] = aig;
+      console.log(`[ai-ship] Cloudflare AI Gateway: ${Object.keys((aig.models as object) ?? {}).length} catalog model(s) via ${GATEWAY_PROVIDER_ID}/<provider>/<model>`);
+      return finishOpencodeRunner(opts, merged, closeProxy);
+    }
+  }
+  return finishOpencodeRunner(opts, providerConfig, closeProxy);
+}
+
+async function finishOpencodeRunner(
+  opts: { worktreeDir: string; config: RepoConfig; model?: string; roleModels?: RoleModelOverrides },
+  providerConfig: Record<string, Record<string, unknown>> | undefined,
+  closeProxy?: () => Promise<void>
+): Promise<PipelineRunner> {
   const agentConfig = buildOpencodeAgentConfig();
-  const { client, server } = await createOpencode({
-    port: 0,
-    config: {
-      ...(providerConfig ? { provider: providerConfig as never } : {}),
-      agent: agentConfig as never,
-    },
-  });
+  let started: Awaited<ReturnType<typeof createOpencode>>;
+  try {
+    started = await createOpencode({
+      port: 0,
+      config: {
+        ...(providerConfig ? { provider: providerConfig as never } : {}),
+        agent: agentConfig as never,
+      },
+    });
+  } catch (err) {
+    await closeProxy?.(); // do not leave the egress proxy listening
+    throw err;
+  }
+  const { client, server } = started;
 
   return createOpencodeClientRunner({
     client,
@@ -1200,7 +1243,10 @@ async function createOpencodeRunner(opts: {
     config: opts.config,
     model: opts.model,
     roleModels: opts.roleModels,
-    onClose: () => server.close(),
+    onClose: () => {
+      server.close();
+      void closeProxy?.();
+    },
   });
 }
 
@@ -1265,6 +1311,8 @@ export async function createRunner(opts: {
   model?: string;
   roleModels?: RoleModelOverrides;
   serverUrl?: string;
+  onGatewayUsage?: (u: EgressUsage) => void;
+  gatewayMetadata?: Record<string, string>;
 }): Promise<PipelineRunner> {
   if (opts.provider === "claude-code") {
     return createClaudeCodeRunner({
@@ -1282,5 +1330,7 @@ export async function createRunner(opts: {
     model: opts.model,
     roleModels: opts.roleModels,
     serverUrl: opts.serverUrl,
+    onGatewayUsage: opts.onGatewayUsage,
+    gatewayMetadata: opts.gatewayMetadata,
   });
 }

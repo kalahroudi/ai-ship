@@ -1,8 +1,13 @@
 {
-  "_comment": "Copy to ~/.config/ai-ship/models.json. Prices are USD per million tokens; fill them from each provider's pricing page (or the Cloudflare AI Gateway dashboard) and set 'checked' to the date you verified them. Entries without numeric 'in' and 'out' are ignored.",
-  "pricing": {
-    "deepseek/deepseek-chat": { "in": null, "out": null, "cacheRead": null, "checked": null },
-    "deepseek/deepseek-reasoner": { "in": null, "out": null, "cacheRead": null, "checked": null },
-    "parasail/Qwen/Qwen2.5-Coder-32B-Instruct": { "in": null, "out": null, "checked": null }
-  }
+  "_comment": "Copy to ~/.config/ai-ship/models.json. Prices are USD per million tokens; fill them from each provider's pricing page (or the Cloudflare AI Gateway dashboard) and set 'checked' to the date you verified them. Entries without numeric 'in' and 'out' are ignored. Catalog model ids use Cloudflare AI Gateway /compat names (<provider>/<model>) and are addressed in OpenCode as aig/<provider>/<model>.",
+  "gateway": { "accountId": "<your-cloudflare-account-id>", "gatewayId": "<your-gateway-id>", "tokenEnv": "CF_AIG_TOKEN", "enabled": false },
+  "fx": { "GBPUSD": 1.27 },
+  "models": [
+    { "id": "deepseek/deepseek-chat", "family": "deepseek", "tier": 1, "context": 128000, "pricing": { "in": null, "out": null, "checked": null }, "strengths": { "implement": 0.6, "test": 0.6, "review": 0.5, "reason": 0.5 }, "enabled": true },
+    { "id": "deepseek/deepseek-reasoner", "family": "deepseek", "tier": 2, "context": 128000, "pricing": { "in": null, "out": null, "checked": null }, "strengths": { "implement": 0.6, "test": 0.6, "review": 0.7, "reason": 0.8 }, "enabled": true },
+    { "id": "google-ai-studio/gemini-2.5-flash", "family": "gemini", "tier": 1, "context": 1000000, "pricing": { "in": null, "out": null, "checked": null }, "strengths": { "implement": 0.5, "test": 0.6, "review": 0.6, "reason": 0.5 }, "enabled": true },
+    { "id": "google-ai-studio/gemini-2.5-pro", "family": "gemini", "tier": 2, "context": 1000000, "pricing": { "in": null, "out": null, "checked": null }, "strengths": { "implement": 0.7, "test": 0.7, "review": 0.8, "reason": 0.8 }, "enabled": true },
+    { "id": "anthropic/claude-sonnet-4-5", "family": "claude", "tier": 3, "context": 200000, "pricing": { "in": null, "out": null, "checked": null }, "strengths": { "implement": 0.9, "test": 0.8, "review": 0.85, "reason": 0.85 }, "enabled": true }
+  ],
+  "pricing": {}
 }

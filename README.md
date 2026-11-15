@@ -70,6 +70,14 @@ The tester, reviewers and bughunter must run on models different from the implem
 - At start (before any worktree or model call), ai-ship prints the role → model table and fails if any reviewing role — or its fallback model, or a `reviewerLensModels` entry — shares the implementer's model or the implementer's fallback. The same model name via a different provider prefix is a warning. Set `"strictIndependence": false` to downgrade failures to warnings.
 - `reviewerLensModels` entries take precedence over `--reviewer-model` for their lens.
 
+### Model catalog & Cloudflare AI Gateway
+`~/.config/ai-ship/models.json` (template: [`templates/models.json`](./templates/models.json)) lists the models ai-ship may use, with tier (1 cheap → 3 frontier), family, context size, price and per-role strengths, plus your Cloudflare AI Gateway (`accountId`, `gatewayId`, token env var).
+
+- With `"gateway": { …, "enabled": true }` every enabled model is exposed to OpenCode as `aig/<provider>/<model>`, routed through a local egress proxy to the gateway's `/compat` endpoint. The proxy adds `cf-aig-authorization: Bearer $CF_AIG_TOKEN` and `cf-aig-metadata` tags; provider keys stay in Cloudflare (BYOK).
+- In direct (Desktop) mode the snippet uses a placeholder API key (`gateway`); with BYOK stored in Cloudflare the gateway authenticates the provider call itself — run `ai-ship --models-sync` once to confirm your gateway accepts it.
+- `ai-ship --models` lists the catalog; `--models-sync` sends a 1-token request per model through the gateway; `--models-opencode-config` prints the provider entry to paste into `opencode.json` for OpenCode Desktop (OpenCode never discovers gateway models on its own).
+- Catalog prices also feed cost accounting (also for the `aig/…` alias).
+
 ### Budget Circuit Breaker
 `ai-ship` tracks `input`, `output`, `cache_read` tokens and USD cost across all stages and retries, and aborts cleanly before launching the next stage/retry if thresholds are reached. Defaults are `maxTaskCostUsd: 5` and `maxTaskTokens: 2000000` (set to `null` or `0` to disable).
 

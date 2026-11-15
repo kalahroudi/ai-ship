@@ -1,40 +1,40 @@
-# ai-ship OpenCode Plugin
+# ai-ship OpenCode plugin
 
-`ai-ship` can be used as an OpenCode plugin (with TUI + `opencode serve` mobile support) while keeping the standalone `ai-ship` CLI intact.
+## OpenCode 2.x (Desktop 2.3+) — native plugin
 
-## Setup
+OpenCode 2.x loads plugins from `~/.config/opencode/plugins/` but requires a **default export `{ id, setup(ctx) }`**; the 1.x `Plugin` function format below is rejected by 2.x ("Plugin must export a default definition with an id and an effect or setup function").
 
-Add `~/.config/opencode/plugins/ai-ship.ts`:
+Install (until `ai-ship plugin install` lands):
+
+```sh
+echo 'export { default } from "/Users/<you>/ai-ship/plugin/v2/index.ts";' > ~/.config/opencode/plugins/ai-ship.ts
+```
+
+Restart OpenCode Desktop. Commands:
+
+| Command | What it does |
+|---|---|
+| `/ship <task or noty://item/…> [--pr] [--draft] [--skip-tests] [--skip-review] [--skip-bughunter] [--model p/m] [--tester-model p/m] [--reviewer-model p/m]` | Starts the pipeline in the background and returns immediately |
+| `/ship-status [job]` | Job status and the latest per-agent progress lines |
+| `/remember <fact>` · `/forget <text>` | Repo memory |
+| `/cleanup [--yes] [--force]` | Leftover worktrees / `ai/*` branches (dry run without `--yes`) |
+| `/safety-check` | Secret / deployment-ID scan |
+| `/pr <title> [--draft]` | Rebase, push and open a PR for an ai-ship worktree |
+
+**Live progress:** each run creates a `ship: <task>` session at the worktree, and every agent (Implement, Adversarial Tests, Review (Security|Performance|Correctness), Bughunter Hunter/Skeptic/Referee, test disputes) is a **child subagent session** of it, so Desktop shows each agent's tool calls, edits and reasoning live, and the ship session receives a `<subagent>` report after every round.
+
+Reviewers are read-only even though 2.x prompts have no per-prompt tool switches: ai-ship checkpoints before each review round and reverts any file a reviewer wrote. Read-only roles use the built-in `plan` agent when the server has it (override per role with `"oc2Agents"` in `.ai-ship.json`).
+
+From a terminal you can drive the same Desktop service: `ai-ship "<task>" --attach` (agents show up in Desktop; progress lines print in the terminal).
+
+Known limits: model fallback on 429/5xx is not applied on the 2.x path yet; the start/finish note posted into the invoking session uses `session.synthetic` and may not be displayed by every client — `/ship-status` always works.
+
+## OpenCode 1.x — legacy plugin
+
+`plugin/index.ts` targets the 1.x plugin API (`@opencode-ai/plugin` 1.19.x) and does not load on OpenCode 2.x:
 
 ```ts
 import { tool, type Plugin } from "@opencode-ai/plugin";
-import { createAiShipPlugin } from "/Users/mohammadramezanian/ai-ship/plugin/index.ts";
-
+import { createAiShipPlugin } from "/Users/<you>/ai-ship/plugin/index.ts";
 export const AiShipPlugin: Plugin = createAiShipPlugin(tool);
 ```
-
-## Features
-- `/ship` (`ship_task` tool): Runs the 4-stage worktree pipeline using OpenCode's live client with stage progress updates.
-- `/pr <title>` (`open_pr` tool): Rebases, pushes, and opens a GitHub PR for an existing `ai-ship` worktree/branch using the summary from your previous response.
-- `/remember <text>`: Immediately saves a highlighted/copied note to repo memory (`~/.local/share/opencode/memory/`) across Desktop, Web, Mobile, and TUI.
-- `/dream` (`dream_consolidate` tool): Consolidates repo-scoped memory against recent session transcripts.
-- `/cleanup` (`cleanup_worktrees` tool): Lists or removes leftover `.ai-ship-worktrees/*` and `ai/*` branches.
-- `memory_save` / `memory_forget` tools + automatic system prompt injection.
-
-## Command Cheatsheet (Desktop, Web, Mobile & TUI)
-
-*(Restart OpenCode Desktop/TUI after installing the plugin so the commands appear.)*
-
-| Command | Example |
-|---|---|
-| `/ship <task>` | `/ship Add rate limiting to /api/login --pr` |
-| `/ship noty://item/<id> --pr` | `/ship noty://item/D282FF5A-FCE0-4034-8DFF-5694B8A29F99 --pr` |
-| `/pr <title>` | `/pr M2: Restrict and audit break-glass tenant owner access` |
-| `/remember <note>` | `/remember Always pin target.pathname in gateway.ts` |
-| `/dream` | `/dream` |
-| `/cleanup` | `/cleanup` (lists worktrees/branches; ask to confirm deletion to remove them) |
-
-### Natural-language tool examples
-- **Save memory:** `Remember in repo memory (security): always pin target.pathname in gateway.ts.`
-- **Forget memory:** `Forget the repo memory note about gateway.ts.`
-- **Ship with options:** `Use ship_task to implement "Fix H1" with openPr=true.`

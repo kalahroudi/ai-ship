@@ -1,4 +1,4 @@
-import { execSync, spawnSync } from "node:child_process";
+import { execSync, spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { detectDefaultBaseBranch, detectPackageManager, loadRepoConfig } from "./config.ts";
@@ -309,6 +309,29 @@ export function getDiffStat(worktreeDir: string, baseBranch: string): string {
     encoding: "utf8",
   });
   return res.status === 0 ? (res.stdout || "").trim() : "";
+}
+
+/**
+ * Async variant of runShell. Used by the verify gate so long test/build commands do not block the event loop
+ * (the native plugin runs inside the OpenCode server process).
+ */
+export function runShellAsync(command: string, cwd: string, maxBytes = 10 * 1024 * 1024): Promise<{ ok: boolean; output: string }> {
+  return new Promise((resolve) => {
+    const child = spawn(command, { cwd, shell: true });
+    const chunks: Buffer[] = [];
+    let size = 0;
+    const onData = (c: Buffer) => {
+      size += c.length;
+      if (size <= maxBytes) chunks.push(c);
+    };
+    child.stdout?.on("data", onData);
+    child.stderr?.on("data", onData);
+    child.on("error", (err) => resolve({ ok: false, output: `${err.message}` }));
+    child.on("close", (code) => {
+      const text = Buffer.concat(chunks).toString("utf8").trim();
+      resolve({ ok: code === 0, output: size > maxBytes ? `${text}\n…(output truncated at ${maxBytes} bytes)` : text });
+    });
+  });
 }
 
 export function runShell(command: string, cwd: string): { ok: boolean; output: string } {

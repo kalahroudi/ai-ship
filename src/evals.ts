@@ -6,7 +6,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { appendLedger } from "./budget.ts";
 import { parseVerdict } from "./pipeline.ts";
-import type { AgentRole, PipelineRunner, PromptResult } from "./runner.ts";
+import { addUsage, EmptyModelResponseError, type AgentRole, type PipelineRunner, type PromptResult } from "./runner.ts";
 
 /**
  * Model eval harness (task 17). Implementer evals: the model gets a small fixture repo + task; HIDDEN
@@ -118,11 +118,14 @@ export function prepareWorkspace(c: ImplementerCase, parent = os.tmpdir()): stri
 /** Copies the hidden tests in AFTER the agent finished (overwriting any agent file at those paths) and runs them. */
 export function runHiddenTests(c: ImplementerCase, ws: string, timeoutMs = 120_000): { pass: boolean; output: string } {
   // Tamper check: the agent may only change src/ and test/ (no package.json, loaders, node_modules shims…).
-  const st = spawnSync("git", ["status", "--porcelain", "--untracked-files=all"], { cwd: ws, encoding: "utf8" });
-  const outside = (st.stdout ?? "")
+  // Compare against the fixture commit (the agent may have committed its own changes), plus untracked files.
+  const base = spawnSync("git", ["rev-list", "--max-parents=0", "HEAD"], { cwd: ws, encoding: "utf8" }).stdout?.trim().split("\n")[0] ?? "";
+  const changed = spawnSync("git", ["diff", "--name-only", "--no-renames", base || "HEAD"], { cwd: ws, encoding: "utf8" }).stdout ?? "";
+  const untracked = spawnSync("git", ["ls-files", "--others"], { cwd: ws, encoding: "utf8" }).stdout ?? "";
+  const outside = `${changed}\n${untracked}`
     .split("\n")
-    .map((l) => l.slice(3).trim().replace(/^"|"$/g, ""))
-    .filter((f) => f && !/^(src|test)\//.test(f.split(" -> ").pop() ?? f));
+    .map((f) => f.trim())
+    .filter((f) => f && !/^(src|test)\//.test(f));
   if (outside.length) return { pass: false, output: `agent changed files outside src/ and test/: ${outside.slice(0, 10).join(", ")}` };
   const hiddenDest = path.join(ws, "hidden");
   fs.rmSync(hiddenDest, { recursive: true, force: true });
@@ -151,8 +154,14 @@ function costOf(res: PromptResult | undefined): number {
 /** Usage a failed prompt still spent (empty replies carry `usage`, retried transient failures `wastedUsage`). */
 function usageOfFailure(err: unknown): PromptResult | undefined {
   const e = err as { usage?: PromptResult["usage"]; wastedUsage?: PromptResult["usage"] } | undefined;
-  const u = e?.usage ?? e?.wastedUsage;
-  return u && typeof u.input === "number" ? { text: "", usageSummary: "", usage: u } : undefined;
+  const valid = (u: unknown): u is NonNullable<PromptResult["usage"]> => Boolean(u) && typeof (u as { input?: unknown }).input === "number";
+  const u = valid(e?.usage) && valid(e?.wastedUsage) ? addUsage(e.usage, e.wastedUsage) : valid(e?.usage) ? e.usage : valid(e?.wastedUsage) ? e.wastedUsage : undefined;
+  return u ? { text: "", usageSummary: "", usage: u } : undefined;
+}
+
+/** A model-caused failure (empty reply) is a scored FAIL; only infrastructure/setup errors are "errored". */
+function isModelFailure(err: unknown): boolean {
+  return err instanceof EmptyModelResponseError;
 }
 
 export interface RunEvalOptions {
@@ -214,7 +223,7 @@ export async function runEval(opts: RunEvalOptions): Promise<EvalReport> {
           r = { name: c.name, attempt, pass: t.pass, costUsd: costOf(res), latencyMs: now() - t0, ...(t.pass ? {} : { error: t.output.slice(-500) }) };
         } catch (err) {
           res ??= usageOfFailure(err);
-          r = { name: c.name, attempt, pass: false, errored: true, costUsd: costOf(res), latencyMs: now() - t0, error: (err as Error).message.slice(0, 500) };
+          r = { name: c.name, attempt, pass: false, ...(isModelFailure(err) ? {} : { errored: true }), costUsd: costOf(res), latencyMs: now() - t0, error: (err as Error).message.slice(0, 500) };
         } finally {
           runner?.close();
           if (ws) fs.rmSync(ws, { recursive: true, force: true });
@@ -230,7 +239,16 @@ export async function runEval(opts: RunEvalOptions): Promise<EvalReport> {
           r = { name: c.name, attempt, pass: verdict === c.expected, verdict, expected: c.expected, costUsd: costOf(res), latencyMs: now() - t0 };
         } catch (err) {
           res ??= usageOfFailure(err);
-          r = { name: c.name, attempt, pass: false, errored: true, expected: c.expected, costUsd: costOf(res), latencyMs: now() - t0, error: (err as Error).message.slice(0, 500) };
+          r = {
+            name: c.name,
+            attempt,
+            pass: false,
+            ...(isModelFailure(err) ? { verdict: "MISSING" } : { errored: true }),
+            expected: c.expected,
+            costUsd: costOf(res),
+            latencyMs: now() - t0,
+            error: (err as Error).message.slice(0, 500),
+          };
         } finally {
           runner?.close();
           fs.rmSync(ws, { recursive: true, force: true });

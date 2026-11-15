@@ -75,6 +75,8 @@ export interface RepoConfig {
   protectedPaths?: string[];
   bughunter?: boolean;
   contextLens?: boolean | string;
+  /** Provider whose requests go through Context Lens (default: the implementer's provider). */
+  contextLensProvider?: string;
 }
 
 export const DEFAULT_PROVIDERS: Record<string, ProviderConfig> = {
@@ -318,6 +320,30 @@ export interface ParsedCliArgs {
   unknownOption?: string;
 }
 
+/** Provider path segments Cloudflare AI Gateway understands (plus the OpenAI-compatible `compat` endpoint). */
+export const KNOWN_CF_PROVIDERS = new Set([
+  "deepseek",
+  "openrouter",
+  "openai",
+  "anthropic",
+  "groq",
+  "mistral",
+  "perplexity-ai",
+  "google-ai-studio",
+  "google-vertex-ai",
+  "workers-ai",
+  "azure-openai",
+  "aws-bedrock",
+  "huggingface",
+  "cohere",
+  "replicate",
+  "grok",
+  "cerebras",
+  "compat",
+  "parasail",
+  "telnyx",
+]);
+
 /** Parses `ai-ship` CLI arguments into a structured options object. */
 export function parseCliArgs(args: string[], cwd = process.cwd()): ParsedCliArgs {
   const result: ParsedCliArgs = {
@@ -419,7 +445,8 @@ export function parseCliArgs(args: string[], cwd = process.cwd()): ParsedCliArgs
     } else if ((arg === "--cf" || arg === "-cf") && args[i + 1] && args[i + 2]) {
       const accountId = args[++i];
       const gatewayId = args[++i];
-      const cfProvider = args[i + 1] && !args[i + 1].startsWith("-") ? args[++i] : undefined;
+      // Only consume a third argument when it names a known gateway provider, so a task text is never eaten.
+      const cfProvider = args[i + 1] && KNOWN_CF_PROVIDERS.has(args[i + 1].toLowerCase()) ? args[++i] : undefined;
       result.cfArgs = { accountId, gatewayId, provider: cfProvider };
     } else if (arg.startsWith("-")) {
       result.unknownOption = arg;

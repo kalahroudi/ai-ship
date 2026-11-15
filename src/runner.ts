@@ -15,6 +15,7 @@ export const READ_ONLY_OPENCODE_TOOLS: Readonly<Record<string, boolean>> = {
   patch: false,
   multiedit: false,
   bash: false,
+  webfetch: false,
 };
 
 /** Returns true when the given role must be restricted to read-only file inspection tools. */
@@ -1012,12 +1013,64 @@ const CF_NATIVE_GATEWAY_PROVIDERS = new Set([
 
 const CF_BARE_GATEWAY_RE = /^https:\/\/gateway\.ai\.cloudflare\.com\/v1\/[^/]+\/[^/]+$/i;
 
+/** Provider routed through Context Lens: `contextLensProvider`, else the implementer's/default provider. */
+export function resolveContextLensProvider(
+  config: RepoConfig,
+  available: readonly string[],
+  implementerProvider?: string
+): string | undefined {
+  // An explicit choice (or the implementer's provider) wins even if it is an OpenCode built-in that is not
+  // declared in `providers`; the caller then adds a provider entry carrying only the proxy baseURL.
+  const preferred = config.contextLensProvider || implementerProvider || config.implementerModel?.providerID;
+  if (preferred) return preferred;
+  return (config.defaultProvider && available.includes(config.defaultProvider) ? config.defaultProvider : undefined) ?? available[0];
+}
+
+/** Settings that are ignored when ai-ship attaches to an existing OpenCode server or plugin client. */
+export function describeIgnoredForAttachedServer(opts: {
+  cfGatewayUrl?: string;
+  contextLensUrl?: string;
+  config: RepoConfig;
+}): string[] {
+  const ignored: string[] = [];
+  if (opts.cfGatewayUrl) ignored.push("Cloudflare AI Gateway URL");
+  if (opts.contextLensUrl) ignored.push("Context Lens proxy");
+  if (opts.config.providers && Object.keys(opts.config.providers).length > 0) ignored.push(".ai-ship.json providers");
+  ignored.push("read-only agent config for reviewer/bughunter (per-prompt tool restrictions still apply)");
+  return ignored;
+}
+
+/**
+ * Checks an attached server's agent config: reviewer/bughunter should deny edit and bash. Returns warnings.
+ * ai-ship also disables write/edit/patch/bash per prompt, so this is defence in depth.
+ */
+export async function checkAttachedReadOnlyAgents(client: OpencodeClient): Promise<string[]> {
+  try {
+    const res = await (client as unknown as { config?: { get?: () => Promise<{ data?: unknown }> } }).config?.get?.();
+    const agents = ((res?.data as { agent?: Record<string, { permission?: Record<string, unknown> }> } | undefined)
+      ?.agent ?? {}) as Record<string, { permission?: Record<string, unknown> }>;
+    const warnings: string[] = [];
+    for (const role of ["reviewer", "bughunter"]) {
+      const perm = agents[role]?.permission ?? {};
+      const missing = (["edit", "bash", "webfetch"] as const).filter((k) => perm[k] !== "deny");
+      if (!agents[role]) warnings.push(`attached server has no "${role}" agent; relying on per-prompt tool restrictions`);
+      else if (missing.length > 0) {
+        warnings.push(`attached server's "${role}" agent does not deny ${missing.join(", ")}; relying on per-prompt tool restrictions`);
+      }
+    }
+    return warnings;
+  } catch (err) {
+    return [`could not read the attached server's agent config (${(err as Error).message})`];
+  }
+}
+
 /** Builds OpenCode `config.provider` entries from `.ai-ship.json`, optional Cloudflare AI Gateway URL, and optional Context Lens proxy URL. */
 export function buildOpencodeProviderConfig(
   config: RepoConfig,
   cfGatewayUrl?: string,
   contextLensUrl?: string,
-  pricing: PricingTable = loadPricingTable(config.pricing)
+  pricing: PricingTable = loadPricingTable(config.pricing),
+  implementerProvider?: string
 ): Record<string, Record<string, unknown>> | undefined {
   const providers: Record<string, Record<string, unknown>> = {};
   const withCost = (providerId: string, models: Record<string, unknown>): Record<string, unknown> => {
@@ -1078,13 +1131,23 @@ export function buildOpencodeProviderConfig(
   }
 
   if (contextLensUrl) {
+    // A Context Lens proxy forwards to ONE upstream. Pointing every provider at it would send all providers'
+    // requests to the same upstream (and drop the Cloudflare gateway URLs), so only route the chosen provider.
     const trimmed = contextLensUrl.replace(/\/+$/, "");
-    for (const id of Object.keys(providers)) {
-      const existingOpts = (providers[id].options as Record<string, unknown> | undefined) ?? {};
-      providers[id].options = {
-        ...existingOpts,
-        baseURL: trimmed,
-      };
+    const target = resolveContextLensProvider(config, Object.keys(providers), implementerProvider);
+    if (target) {
+      if (!providers[target]) {
+        console.log(
+          `[ai-ship] Context Lens provider "${target}" is not declared in providers; adding a proxy-only entry (check for a typo in "contextLensProvider" if unexpected).`
+        );
+      }
+      const prev = providers[target] ?? {};
+      const existingOpts = (prev.options as Record<string, unknown> | undefined) ?? {};
+      providers[target] = { ...prev, options: { ...existingOpts, baseURL: trimmed } };
+      const bypassed = Object.keys(providers).filter((id) => id !== target);
+      console.log(
+        `[ai-ship] Context Lens proxies provider "${target}"${bypassed.length ? `; not proxied: ${bypassed.join(", ")}` : ""} (set "contextLensProvider" to choose).`
+      );
     }
   }
 
@@ -1111,7 +1174,17 @@ async function createOpencodeRunner(opts: {
     });
   }
 
-  const providerConfig = buildOpencodeProviderConfig(opts.config, opts.cfGatewayUrl, opts.contextLensUrl);
+  const implementerProvider = parseOpencodeModel(
+    opts.roleModels?.implementer ?? opts.model,
+    opts.config.defaultProvider ?? opts.config.implementerModel?.providerID ?? "deepseek"
+  )?.providerID;
+  const providerConfig = buildOpencodeProviderConfig(
+    opts.config,
+    opts.cfGatewayUrl,
+    opts.contextLensUrl,
+    undefined,
+    implementerProvider
+  );
   const agentConfig = buildOpencodeAgentConfig();
   const { client, server } = await createOpencode({
     port: 0,

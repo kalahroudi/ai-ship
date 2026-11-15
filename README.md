@@ -132,6 +132,10 @@ CONTEXT_LENS_URL=http://localhost:4040 ai-ship "Add rate limiter" --repo ~/rose
 ai-ship "Add rate limiter" --repo ~/rose --context-lens
 ```
 
+Context Lens forwards to a single upstream, so ai-ship routes only one provider through it: `"contextLensProvider"` in `.ai-ship.json`, or the implementer's provider by default. Other providers keep their direct or Cloudflare AI Gateway URLs, and the run log says which ones were not proxied.
+
+When attached to an existing server (`--server`, or the plugin/MCP client), ai-ship cannot change that server's provider or agent config. It logs which settings are ignored (gateway URL, Context Lens, `.ai-ship.json` providers) and warns if the server's `reviewer`/`bughunter` agents do not deny edit and bash. Per-prompt tool restrictions still apply.
+
 Every run also logs per-stage and task-total token/cache telemetry (`in`, `out`, `cache_read`, `cache_hit` ratio, and USD cost) in `usageLog` and `formatPipelineResult()`:
 ```text
 [ai-ship] Per-Stage & Task Totals:

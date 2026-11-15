@@ -306,6 +306,7 @@ export interface ParsedCliArgs {
   allowConfigChange: boolean;
   doInit: boolean;
   doDoctor: boolean;
+  modelsAction?: "list" | "sync" | "opencode-config";
   doFix: boolean;
   pluginAction?: "install" | "uninstall";
   doCleanup: boolean;
@@ -445,6 +446,12 @@ export function parseCliArgs(args: string[], cwd = process.cwd()): ParsedCliArgs
       result.skipBughunter = true;
     } else if (arg === "--allow-config-change") {
       result.allowConfigChange = true;
+    } else if (arg === "--models") {
+      result.modelsAction = "list";
+    } else if (arg === "--models-sync") {
+      result.modelsAction = "sync";
+    } else if (arg === "--models-opencode-config") {
+      result.modelsAction = "opencode-config";
     } else if (arg === "--doctor") {
       result.doDoctor = true;
     } else if (arg === "--fix") {

@@ -17,6 +17,7 @@ import { formatSafetyFindings, scanWorktreeSafety } from "../src/safety.ts";
 import { buildGatewayProvider, formatCatalog, loadCatalog, syncCatalog } from "../src/catalog.ts";
 import { computeBudgetStatus, formatBudgetReport, loadBudgetConfig, monthStart, readLedger } from "../src/budget.ts";
 import { getModelsFilePath } from "../src/pricing.ts";
+import { planRouting } from "../src/pipeline.ts";
 import { formatDoctor, initRepo as initRepoFiles, installPlugin, runDoctor, uninstallPlugin } from "../src/doctor.ts";
 
 function printHelp() {
@@ -53,6 +54,8 @@ Options:
   --skip-bughunter   Skip Stage 4b adversarial Hunter -> Skeptic -> Referee pass
   --allow-config-change  Let agents change protected verify/config files (.ai-ship.json, package.json scripts, CI, test config)
   --init             Copy starter AGENTS.md and .ai-ship.json into target repo
+  --route            Dry run: classify the task and print the role → model routing plan (no changes)
+  --tag <tag>        Task tag such as size:L or risk:high (overrides the classifier; repeatable)
   --budget           Show month-to-date spend vs the £ budget, forecast and breakdowns (ledger: ~/.local/share/ai-ship/ledger.jsonl)
   --override-budget  Run a task even when the monthly budget governor is in STOP state
   --models           List the model catalog (~/.config/ai-ship/models.json) and gateway settings
@@ -256,6 +259,20 @@ if (doInit) {
   process.exit(0);
 }
 
+if (parsed.routeOnly) {
+  const taskText = parsed.positional.join(" ").trim();
+  if (!taskText) {
+    console.error("Error: --route needs a task description.");
+    process.exit(1);
+  }
+  const r = planRouting({ config: { ...loadRepoConfig(repoDir), router: true }, task: taskText, repoDir, tags: parsed.tags });
+  console.log(`Task: ${r.classification.size}/${r.classification.risk} ${r.classification.kind} — ${r.classification.reasons.join("; ")}`);
+  console.log(`Budget: ${r.inputs.budget}`);
+  if (!r.plan) console.log("No enabled catalog models (see ~/.config/ai-ship/models.json).");
+  else for (const line of r.lines) console.log(line);
+  process.exit(0);
+}
+
 if (parsed.doBudget) {
   const { catalog } = loadCatalog();
   const gbpPerUsd = 1 / catalog.fx.GBPUSD;
@@ -356,5 +373,5 @@ if (attach) {
   lazy = createLazyRunner((dir) => createOc2Runner({ api, worktreeDir: dir, config: loadRepoConfig(repoDir), task, roleModels, onEvent }));
 }
 
-await runPipeline({ repoDir, worktreeDir, task, openPr, draft, skipTests, skipReview, skipBughunter, allowConfigChange, provider, model, testerModel, reviewerModel, bughunterModel, serverUrl: attach ? undefined : serverUrl, contextLens, onEvent, overrideBudget: parsed.overrideBudget, ...(lazy ? { runner: lazy.runner, onWorktree: lazy.onWorktree } : {}) });
+await runPipeline({ repoDir, worktreeDir, task, openPr, draft, skipTests, skipReview, skipBughunter, allowConfigChange, provider, model, testerModel, reviewerModel, bughunterModel, serverUrl: attach ? undefined : serverUrl, contextLens, onEvent, overrideBudget: parsed.overrideBudget, tags: parsed.tags, ...(lazy ? { runner: lazy.runner, onWorktree: lazy.onWorktree } : {}) });
 }

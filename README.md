@@ -78,6 +78,11 @@ The tester, reviewers and bughunter must run on models different from the implem
 - `ai-ship --models` lists the catalog; `--models-sync` sends a 1-token request per model through the gateway; `--models-opencode-config` prints the provider entry to paste into `opencode.json` for OpenCode Desktop (OpenCode never discovers gateway models on its own).
 - Catalog prices also feed cost accounting (also for the `aig/…` alias).
 
+### Task classifier & model router (opt-in: `"router": true`)
+Each task is classified with zero model calls — size S/M/L, risk low/med/high, kind and domains (auth, billing, migration, crypto, concurrency, ui, infra) from the task text, `--tag size:L` / `risk:high` overrides and `git grep` hits — and re-classified from the real diff after Stage 1.
+The router then picks catalog models per role: implementer S→tier 1, M→2, L or high risk→3; tester tier 2; reviewers tier 1–2; the Security lens tier 3 on high-risk tasks; bughunter 2–3. Tester and reviewers always come from a **different model family** than the implementer, fallbacks prefer other providers, budget AMBER drops one tier (never the high-risk Security lens), RED uses tier 1, and after two failed fixes the implementer escalates one tier once. Explicit `--model` / role-model flags always win.
+`ai-ship --route "<task>"` prints the plan without running anything.
+
 ### Monthly budget governor (£)
 Every model call is appended to `~/.local/share/ai-ship/ledger.jsonl`. Before each task ai-ship computes month-to-date spend (converted with `fx.GBPUSD` from models.json) against `budget` (models.json, overridable per repo): defaults `monthlyGBP: 90`, `reserveGBP: 8` (kept for evals), `perTaskMaxGBP: 3`, `softPct: 75`.
 - **GREEN** normal · **AMBER** spending ahead of pro-rata, past the soft %, or today's cap reached (router downgrades a tier, task 14) · **RED** ≥ 95% of spendable: bughunter skipped · **STOP** spendable used: new tasks refused (`--override-budget` to force).

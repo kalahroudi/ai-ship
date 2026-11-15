@@ -67,6 +67,8 @@ export interface RepoConfig {
   maxTaskTokens?: number;
   /** Per-model USD-per-million-token prices (`provider/model` keys), merged over ~/.config/ai-ship/models.json. */
   pricing?: Record<string, { in: number; out: number; cacheRead?: number; cacheWrite?: number; checked?: string }>;
+  /** Route role models from the catalog by task size/risk and budget state (opt-in). */
+  router?: boolean;
   /** Monthly budget governor (GBP); merged over `budget` in ~/.config/ai-ship/models.json. */
   budget?: { monthlyGBP?: number; reserveGBP?: number; perTaskMaxGBP?: number; softPct?: number };
   /** Fail before any model call if a role's model has no known price (default false: warn). */
@@ -309,6 +311,8 @@ export interface ParsedCliArgs {
   doInit: boolean;
   doDoctor: boolean;
   doBudget: boolean;
+  routeOnly: boolean;
+  tags: string[];
   overrideBudget: boolean;
   modelsAction?: "list" | "sync" | "opencode-config";
   doFix: boolean;
@@ -372,6 +376,8 @@ export function parseCliArgs(args: string[], cwd = process.cwd()): ParsedCliArgs
     doInit: false,
     doDoctor: false,
     doBudget: false,
+    routeOnly: false,
+    tags: [],
     overrideBudget: false,
     doFix: false,
     doCleanup: false,
@@ -458,6 +464,12 @@ export function parseCliArgs(args: string[], cwd = process.cwd()): ParsedCliArgs
       result.modelsAction = "sync";
     } else if (arg === "--models-opencode-config") {
       result.modelsAction = "opencode-config";
+    } else if (arg === "--route") {
+      result.routeOnly = true;
+    } else if (arg === "--tag" && args[i + 1]) {
+      result.tags.push(args[++i]);
+    } else if (arg.startsWith("--tag=")) {
+      result.tags.push(arg.slice("--tag=".length));
     } else if (arg === "--budget") {
       result.doBudget = true;
     } else if (arg === "--override-budget") {

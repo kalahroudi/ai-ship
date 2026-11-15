@@ -48,6 +48,11 @@ Options:
 `);
 }
 
+/**
+ * @param {string} accountId
+ * @param {string} gatewayId
+ * @param {string | undefined} targetProvider
+ */
 function configureCloudflareGateway(accountId, gatewayId, targetProvider) {
   const configPath = path.join(os.homedir(), ".config", "opencode", "opencode.json");
   fs.mkdirSync(path.dirname(configPath), { recursive: true });
@@ -74,6 +79,7 @@ function configureCloudflareGateway(accountId, gatewayId, targetProvider) {
   fs.writeFileSync(configPath, JSON.stringify(cfg, null, 2) + "\n", "utf8");
 }
 
+/** @param {string} repoDir */
 function initRepo(repoDir) {
   const templatesDir = path.resolve(import.meta.dirname, "..", "templates");
   for (const file of ["AGENTS.md", ".ai-ship.json"]) {
@@ -87,6 +93,7 @@ function initRepo(repoDir) {
   }
 }
 
+/** @param {string} question */
 async function confirmPrompt(question) {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   try {
@@ -98,6 +105,10 @@ async function confirmPrompt(question) {
   }
 }
 
+/**
+ * @param {string} repoDir
+ * @param {boolean} skipConfirm
+ */
 async function cleanupRepo(repoDir, skipConfirm) {
   const targets = listCleanupTargets(repoDir);
   const deletableBranches = targets.branches.filter((b) => !b.checkedOutInMain);
@@ -168,6 +179,7 @@ if (args.includes("--mcp")) {
   await runCli(args);
 }
 
+/** @param {string[]} args */
 async function runCli(args) {
 const parsed = parseCliArgs(args);
 if (parsed.unknownOption) {

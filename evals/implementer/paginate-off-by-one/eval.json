@@ -1,4 +1,4 @@
 {
-  "test": "node --test --test-reporter=tap hidden/",
+  "test": "node --test --test-reporter=tap 'hidden/**/*.test.mjs'",
   "tests": 4
 }

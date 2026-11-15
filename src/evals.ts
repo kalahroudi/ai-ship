@@ -85,7 +85,7 @@ export function loadSuite(role: EvalRole, suiteDir = defaultSuiteDir(), only?: s
       if (only?.length && !only.includes(entry)) continue;
       const meta = JSON.parse(fs.readFileSync(path.join(full, "eval.json"), "utf8")) as { test?: string; tests?: number };
       if (!fs.existsSync(path.join(full, "repo")) || !fs.existsSync(path.join(full, "hidden"))) continue;
-      out.push({ kind: "implementer", name: entry, dir: full, task: fs.readFileSync(path.join(full, "task.md"), "utf8").trim(), test: meta.test ?? "node --test --test-reporter=tap hidden/", ...(typeof meta.tests === "number" ? { tests: meta.tests } : {}) });
+      out.push({ kind: "implementer", name: entry, dir: full, task: fs.readFileSync(path.join(full, "task.md"), "utf8").trim(), test: meta.test ?? "node --test --test-reporter=tap 'hidden/**/*.test.mjs'", ...(typeof meta.tests === "number" ? { tests: meta.tests } : {}) });
     } else {
       if (!entry.endsWith(".json")) continue;
       const name = entry.slice(0, -5);

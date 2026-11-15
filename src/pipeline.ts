@@ -104,7 +104,8 @@ export interface PipelineOptions {
   /** Returns true when the run was cancelled; checked between stages and before commit/PR. */
   isCancelled?: () => boolean;
   /** Called once the worktree exists (lets lazily-built runners learn its path). */
-  onWorktree?: (worktreeDir: string) => void;
+  /** Called once the worktree exists; `config` is the effective config (incl. router-chosen models/fallbacks). */
+  onWorktree?: (worktreeDir: string, config: RepoConfig) => void;
   /** Allow agents to change protected verify/config files (see DEFAULT_PROTECTED_PATHS). */
   allowConfigChange?: boolean;
   client?: OpencodeClient;
@@ -1382,7 +1383,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
     ? openExistingWorktree(repoDir, config.baseBranch, opts.worktreeDir)
     : createWorktree(repoDir, config.baseBranch, opts.task);
   console.log(`[ai-ship] Worktree: ${worktree.worktreeDir} (branch: ${worktree.branch})`);
-  opts.onWorktree?.(worktree.worktreeDir);
+  opts.onWorktree?.(worktree.worktreeDir, config);
 
   if (provider === "opencode" && !opts.runner && (opts.client || opts.serverUrl)) {
     const ignored = describeIgnoredForAttachedServer({ cfGatewayUrl, contextLensUrl, config });

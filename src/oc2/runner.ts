@@ -6,6 +6,7 @@ import {
   applyPricing,
   assertNonEmptyReadOnlyReply,
   classifyProviderError,
+  EmptyModelResponseError,
   formatUsageSummary,
   isReadOnlyRole,
   resolveRoleModelLabels,
@@ -17,6 +18,26 @@ import {
   type RoleModelOverrides,
 } from "../runner.ts";
 import type { Oc2Api, Oc2Message, Oc2ModelRef } from "./api.ts";
+
+/** A turn the server finished with a non-success outcome (the only kind of failure that triggers failover). */
+export class Oc2TurnError extends Error {
+  readonly status?: number;
+  readonly usage?: PromptUsage;
+  constructor(message: string, opts: { status?: number; usage?: PromptUsage }) {
+    super(message);
+    this.name = "Oc2TurnError";
+    if (opts.status !== undefined) this.status = opts.status;
+    if (opts.usage) this.usage = opts.usage;
+  }
+}
+
+/** Numeric HTTP status from a 2.x message error object (`status`, `statusCode`, or nested under `data`). */
+function errorStatus(e: unknown): number | undefined {
+  if (!e || typeof e !== "object") return undefined;
+  const o = e as Record<string, unknown>;
+  for (const k of ["statusCode", "status"]) if (typeof o[k] === "number") return o[k] as number;
+  return o.data && typeof o.data === "object" ? errorStatus(o.data) : undefined;
+}
 
 /**
  * PipelineRunner on top of an OpenCode 2.x server (plugin context or REST).
@@ -47,7 +68,10 @@ export function createOc2Runner(opts: {
   let shipId = opts.parentSessionId;
   let shipCreating: Promise<string> | undefined;
   let agentNames: string[] | undefined;
-  const sessions = new Map<string, { title: string; realId?: string; creating?: Promise<string>; turns: number }>();
+  const sessions = new Map<
+    string,
+    { title: string; realId?: string; creating?: Promise<string>; turns: number; failedOver?: boolean }
+  >();
   let nextLocal = 1;
   const emit = opts.onEvent ?? (() => undefined);
   let cancelled = false;
@@ -135,18 +159,17 @@ export function createOc2Runner(opts: {
     if (usage) usage.costSource = anyCost ? "provider" : "unknown";
     const model = [...assistants].reverse().find((m) => m.model)?.model;
     const outcome = after.find((m) => m.type === "idle")?.outcome;
-    const errMsg = after
-      .map((m) => m.error)
-      .filter((e) => e !== undefined && e !== null)
-      .map((e) => (typeof e === "string" ? e : JSON.stringify(e)))
-      .join("; ")
-      .slice(0, 500);
+    // Only the LAST error counts: an earlier 429 the server retried must not make a later failure look transient.
+    const lastErr = [...after].reverse().find((m) => m.error !== undefined && m.error !== null)?.error;
+    const errMsg = lastErr === undefined ? "" : (typeof lastErr === "string" ? lastErr : JSON.stringify(lastErr)).slice(0, 500);
+    const errStatus = errorStatus(lastErr);
     return {
       text: last ? textOf(last).trim() : "",
       usage,
       model: model ? `${model.providerID}/${model.id}` : undefined,
       outcome,
       ...(errMsg ? { error: errMsg } : {}),
+      ...(errStatus !== undefined ? { errorStatus: errStatus } : {}),
       assistants,
     };
   };
@@ -214,7 +237,10 @@ export function createOc2Runner(opts: {
       if (res.outcome && res.outcome !== "succeeded") {
         // Include the provider error so 429/5xx failures can be classified as transient.
         const detail = res.error ? `: ${res.error}` : "";
-        throw new Error(`OpenCode ${role} session ${sessionID} ended with outcome "${res.outcome}"${detail}`);
+        throw new Oc2TurnError(`OpenCode ${role} session ${sessionID} ended with outcome "${res.outcome}"${detail}`, {
+          status: res.errorStatus,
+          usage: res.usage,
+        });
       }
       const base: PromptResult = {
         text: res.text,
@@ -262,23 +288,47 @@ export function createOc2Runner(opts: {
         return await runTurn(sessionID, role, title, text, model);
       } catch (err) {
         // 2.x sessions have a fixed model, so failover = a fresh child session on the role's fallback model.
+        // Only model failures qualify (a failed turn outcome or an empty reply), never transport errors to the
+        // OpenCode server: the original turn may still be running there.
+        const modelFailure = err instanceof Oc2TurnError || err instanceof EmptyModelResponseError;
         const info = classifyProviderError(err);
         const fb = fallbackFor(role);
         const same = fb && model && fb.providerID === model.providerID && fb.id === model.id;
-        if (cancelled || override || !info.transient || !fb || same || !entry) throw err;
+        if (cancelled || override || !modelFailure || !info.transient || !fb || same || !entry || entry.failedOver) throw err;
         const from = model ? `${model.providerID}/${model.id}` : "(default)";
         const to = `${fb.providerID}/${fb.id}`;
         emit({ ts: Date.now(), kind: "error", role, sessionId: sessionID, agent: title, text: `${info.reason} on ${from}; failing over to ${to}` });
-        entry.realId = undefined;
+        try {
+          await opts.api.interrupt?.(sessionID, opts.worktreeDir);
+        } catch {
+          // best effort: the turn already ended
+        }
+        const fbTitle = `${title} (fallback)`;
+        const parentID = await ensureShip();
+        const agent = await agentFor(role);
+        const created = await opts.api.createSession({ title: fbTitle, parentID, agent, model: fb, directory: opts.worktreeDir });
+        if (cancelled) throw err;
+        // Switch the local session only once the fallback session exists.
+        entry.realId = created.id;
         entry.creating = undefined;
-        entry.title = `${title} (fallback)`;
-        const fbSession = await realSession(localId, role, fb);
-        // The fallback session has no history: point a mid-conversation handover at the current worktree state.
-        const handover = firstTurn
-          ? text
-          : `You are taking over from another agent whose model failed. Inspect the current worktree state (git status / git diff) before acting.\n\n${text}`;
-        const res = await runTurn(fbSession, role, entry.title, handover, fb);
-        return { ...res, fallback: { role, from, to, reason: info.reason } };
+        entry.title = fbTitle;
+        entry.failedOver = true;
+        emit({ ts: Date.now(), kind: "session", role, sessionId: created.id, agent: fbTitle, model: to, text: `started (${role}, fallback)` });
+        // The fallback session has no history and the failed turn may have edited files: hand over explicitly
+        // (read-only roles on their first turn have nothing to hand over).
+        const handover =
+          firstTurn && isReadOnlyRole(role)
+            ? text
+            : `You are taking over from another agent whose model failed mid-task. Inspect the current worktree state (git status / git diff) before acting.\n\n${text}`;
+        const res = await runTurn(created.id, role, fbTitle, handover, fb);
+        // Count the failed attempt's tokens/cost too (budget + ledger).
+        const usage = addUsage(res.usage, (err as { usage?: PromptUsage }).usage);
+        return {
+          ...res,
+          ...(usage ? { usage, usageSummary: formatUsageSummary(usage) } : {}),
+          wastedAttempts: 1,
+          fallback: { role, from, to, reason: info.reason },
+        };
       }
     },
     async compact(localId: string): Promise<boolean> {
@@ -299,20 +349,22 @@ export function createOc2Runner(opts: {
  * A PipelineRunner whose real runner is built once the pipeline has created the worktree (pass the returned
  * `onWorktree` to runPipeline). Used by `--attach` and the native plugin.
  */
-export function createLazyRunner(build: (worktreeDir: string) => PipelineRunner): {
+export function createLazyRunner(build: (worktreeDir: string, config?: RepoConfig) => PipelineRunner): {
   runner: PipelineRunner;
-  onWorktree: (worktreeDir: string) => void;
+  onWorktree: (worktreeDir: string, config?: RepoConfig) => void;
 } {
   let worktree: string | undefined;
+  let effective: RepoConfig | undefined;
   let inner: PipelineRunner | undefined;
   const get = () => {
     if (!worktree) throw new Error("ai-ship: runner used before the worktree was created");
-    inner ??= build(worktree);
+    inner ??= build(worktree, effective);
     return inner;
   };
   return {
-    onWorktree: (dir) => {
+    onWorktree: (dir, config) => {
       worktree = dir;
+      effective = config;
     },
     runner: {
       createSession: (title) => get().createSession(title),

@@ -61,6 +61,10 @@ export interface RepoConfig {
   maxReviewRounds: number;
   maxTaskCostUsd?: number;
   maxTaskTokens?: number;
+  /** Per-model USD-per-million-token prices (`provider/model` keys), merged over ~/.config/ai-ship/models.json. */
+  pricing?: Record<string, { in: number; out: number; cacheRead?: number; cacheWrite?: number; checked?: string }>;
+  /** Fail before any model call if a role's model has no known price (default false: warn). */
+  requirePricing?: boolean;
   contextLimits?: Partial<ContextLimits>;
   securityScan: boolean;
   safetyCheck: boolean;

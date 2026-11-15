@@ -12,6 +12,15 @@ import {
 } from "../src/mcp.ts";
 import { buildPrBody } from "../src/pipeline.ts";
 
+// Hermetic pricing: never read the developer's real ~/.config/ai-ship/models.json.
+const prevModelsFile = process.env.AI_SHIP_MODELS_FILE;
+process.env.AI_SHIP_MODELS_FILE = path.join(os.tmpdir(), `ai-ship-no-models-${process.pid}.json`);
+process.on("exit", () => {
+  if (prevModelsFile === undefined) delete process.env.AI_SHIP_MODELS_FILE;
+  else process.env.AI_SHIP_MODELS_FILE = prevModelsFile;
+});
+
+
 test("handleMcpRequest handles initialize, notifications, ping, and tools/list", async () => {
   const initResp = await handleMcpRequest({
     jsonrpc: "2.0",

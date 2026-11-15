@@ -24,6 +24,7 @@ import {
 } from "./git.ts";
 import { buildDreamPrompt, getMemoryPath, readMemory, writeConsolidatedMemory } from "./memory.ts";
 import { assertWorktreeSafe, formatSafetyFindings, scanWorktreeSafety } from "./safety.ts";
+import { findUnpricedModels, getModelsFilePath, loadPricingTable } from "./pricing.ts";
 import {
   assertProtectedPathsUnchanged,
   CHECKPOINT_PREFIX,
@@ -115,6 +116,8 @@ export interface UsageTotals {
   totalTokens: number;
   costUsd: number;
   cacheHitRatio: number;
+  /** Calls whose cost could not be determined (tokens used, no provider cost, no pricing entry). */
+  unknownCostCalls?: number;
 }
 
 export interface StageUsageSummary extends UsageTotals {
@@ -143,8 +146,9 @@ function formatStageTelemetryLines(
     for (const s of stages) {
       const callLabel = s.calls === 1 ? "1 call" : `${s.calls} calls`;
       const ratio = s.cacheHitRatio ?? computeCacheHitRatio(s.input, s.cacheRead);
+      const unknownNote = s.unknownCostCalls ? `, ${s.unknownCostCalls} with UNKNOWN cost` : "";
       lines.push(
-        `    ${s.stage}: in=${s.input} out=${s.output} cache_read=${s.cacheRead} cache_hit=${formatCacheHitPercent(ratio)} total=${s.totalTokens} | $${s.costUsd.toFixed(4)} (${callLabel})`
+        `    ${s.stage}: in=${s.input} out=${s.output} cache_read=${s.cacheRead} cache_hit=${formatCacheHitPercent(ratio)} total=${s.totalTokens} | $${s.costUsd.toFixed(4)} (${callLabel}${unknownNote})`
       );
     }
   }
@@ -153,6 +157,11 @@ function formatStageTelemetryLines(
     lines.push(
       `  [Task Total] in=${totals.input} out=${totals.output} cache_read=${totals.cacheRead} total=${totals.totalTokens} | $${totals.costUsd.toFixed(4)} (cache_hit=${formatCacheHitPercent(ratio)})`
     );
+    if (totals.unknownCostCalls) {
+      lines.push(
+        `  [WARNING] ${totals.unknownCostCalls} call(s) had no provider cost and no pricing entry: the $ total and maxTaskCostUsd are understated. Add prices to ~/.config/ai-ship/models.json ("pricing") or .ai-ship.json.`
+      );
+    }
   }
   return lines;
 }
@@ -192,7 +201,10 @@ export class BudgetTracker {
   };
   private readonly stages = new Map<string, StageUsageSummary>();
 
-  constructor(limits: { maxTaskCostUsd?: number; maxTaskTokens?: number }) {
+  private readonly failOnUnknownCost: boolean;
+
+  constructor(limits: { maxTaskCostUsd?: number; maxTaskTokens?: number; failOnUnknownCost?: boolean }) {
+    this.failOnUnknownCost = Boolean(limits.failOnUnknownCost);
     this.maxTaskCostUsd =
       typeof limits.maxTaskCostUsd === "number" && limits.maxTaskCostUsd > 0
         ? limits.maxTaskCostUsd
@@ -211,7 +223,14 @@ export class BudgetTracker {
         cacheRead: 0,
         costUsd: 0,
       };
-    const tokens = u.input + u.output + u.cacheRead;
+    const tokens = u.input + u.output + u.cacheRead + (u.reasoning ?? 0) + (u.cacheWrite ?? 0);
+    const unknown = u.costSource === "unknown" ? 1 : 0;
+    if (unknown && this.failOnUnknownCost) {
+      throw new Error(
+        `[ai-ship] ${stage}: call${res.model ? ` to ${res.model}` : ""} used tokens but its cost is unknown and requirePricing is set.`
+      );
+    }
+    this.totals.unknownCostCalls = (this.totals.unknownCostCalls ?? 0) + unknown;
 
     this.totals.input += u.input;
     this.totals.output += u.output;
@@ -228,6 +247,7 @@ export class BudgetTracker {
       existing.totalTokens += tokens;
       existing.costUsd += u.costUsd;
       existing.calls += 1;
+      existing.unknownCostCalls = (existing.unknownCostCalls ?? 0) + unknown;
       existing.cacheHitRatio = computeCacheHitRatio(existing.input, existing.cacheRead);
     } else {
       this.stages.set(stage, {
@@ -239,6 +259,7 @@ export class BudgetTracker {
         costUsd: u.costUsd,
         cacheHitRatio: computeCacheHitRatio(u.input, u.cacheRead),
         calls: 1,
+        unknownCostCalls: unknown,
       });
     }
   }
@@ -1011,6 +1032,31 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
     provider,
   });
   for (const w of independenceWarnings) console.log(`[ai-ship] Warning: ${w}`);
+
+  // Cost accounting preflight: OpenCode reports $0 for models it has no price for, which would make the
+  // budget breaker blind. claude-code reports its own cost.
+  if (provider !== "claude-code") {
+    const pricing = loadPricingTable(config.pricing);
+    const fallbackLabels = resolveRoleFallbackLabels(provider, config);
+    const lensLabels = Object.values(config.reviewerLensModels ?? {}).map((r) => `${r.providerID}/${r.id}`);
+    const unpriced = findUnpricedModels(pricing, [
+      ...Object.values(roleLabels),
+      ...Object.values(fallbackLabels),
+      ...lensLabels,
+    ]);
+    const unresolved = (Object.entries(roleLabels) as Array<[string, string | undefined]>)
+      .filter(([, label]) => !label)
+      .map(([role]) => role);
+    if (unpriced.length > 0 || (config.requirePricing && unresolved.length > 0)) {
+      const parts = [
+        unpriced.length ? `No pricing for ${unpriced.join(", ")}` : "",
+        unresolved.length ? `roles without a configured model (OpenCode agent default, price unknown): ${unresolved.join(", ")}` : "",
+      ].filter(Boolean);
+      const msg = `${parts.join("; ")}. If the provider does not report cost, the budget breaker cannot see it. Add entries under "pricing" in ${getModelsFilePath()} or .ai-ship.json (use { "in": 0, "out": 0 } for free/local models).`;
+      if (config.requirePricing) throw new Error(`[ai-ship] ${msg} (requirePricing is set)`);
+      console.log(`[ai-ship] Warning: ${msg}`);
+    }
+  }
   if (provider === "opencode" && cfGatewayUrl) console.log(`[ai-ship] Cloudflare AI Gateway: ${cfGatewayUrl}`);
   if (provider === "opencode" && contextLensUrl) console.log(`[ai-ship] Context Lens Proxy: ${contextLensUrl}`);
   console.log(`[ai-ship] Verify pipeline: ${config.verify.length ? config.verify.join(" && ") : "(none detected)"}`);
@@ -1041,6 +1087,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
   const budget = new BudgetTracker({
     maxTaskCostUsd: config.maxTaskCostUsd,
     maxTaskTokens: config.maxTaskTokens,
+    failOnUnknownCost: config.requirePricing === true,
   });
   const testDiffMaxChars =
     config.contextLimits?.testDiffMaxChars ?? DEFAULT_CONTEXT_LIMITS.testDiffMaxChars;

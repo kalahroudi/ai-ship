@@ -68,6 +68,12 @@ The tester, reviewers and bughunter must run on models different from the implem
 ### Budget Circuit Breaker
 `ai-ship` tracks `input`, `output`, `cache_read` tokens and USD cost across all stages and retries, and aborts cleanly before launching the next stage/retry if thresholds are reached. Defaults are `maxTaskCostUsd: 5` and `maxTaskTokens: 2000000` (set to `null` or `0` to disable).
 
+**Cost accuracy:** OpenCode reports `$0` for models it has no price for (custom openai-compatible providers, Cloudflare AI Gateway `/compat` models), which would make `maxTaskCostUsd` blind. ai-ship therefore computes cost from token usage (input, output + reasoning, cache read/write) using a pricing table:
+- `~/.config/ai-ship/models.json` → `"pricing": { "provider/model": { "in": <USD/Mtok>, "out": <USD/Mtok>, "cacheRead": …, "cacheWrite": …, "checked": "YYYY-MM-DD" } }` (template: [`templates/models.json`](./templates/models.json)), overridable per repo with `"pricing"` in `.ai-ship.json`. Keys match exactly, case-insensitively, or as a suffix (`cloudflare-ai-gateway/deepseek/deepseek-chat` uses a `deepseek/deepseek-chat` entry).
+- At start ai-ship warns about role models without a price (including models OpenCode prices itself, such as the defaults — add them to silence the warning; use `{ "in": 0, "out": 0 }` for free/local models). `"requirePricing": true` turns that into an error before any model call (also for roles left to the OpenCode agent default) and aborts on any call whose cost is still unknown. Otherwise unknown-cost calls are flagged in the stage summary.
+- Usage is summed over every step of an agent turn (OpenCode returns only the last step's tokens).
+- Tokens spent on retried attempts (e.g. empty reviewer replies) are counted too.
+
 Example `.ai-ship.json`:
 ```json
 {

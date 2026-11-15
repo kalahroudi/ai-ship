@@ -1,0 +1,1 @@
+Fix `paginate(items, page, size)` in src/paginate.mjs: pages are 1-based, but page 1 currently skips the first `size` items and the last page can be missing. Keep the signature. Return [] for page < 1 or size < 1.

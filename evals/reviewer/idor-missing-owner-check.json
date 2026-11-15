@@ -1,0 +1,5 @@
+{
+  "expected": "OPEN",
+  "note": "IDOR: invoice lookup no longer scoped to the caller",
+  "diff": "--- a/src/routes/invoices.js\n+++ b/src/routes/invoices.js\n@@ -10,9 +10,8 @@ router.get(\"/invoices/:id\", requireAuth, async (req, res) => {\n-  const invoice = await db.invoice.findFirst({\n-    where: { id: req.params.id, ownerId: req.user.id },\n-  });\n+  // simplify lookup\n+  const invoice = await db.invoice.findUnique({ where: { id: req.params.id } });\n   if (!invoice) return res.status(404).end();\n   res.json(invoice);\n });\n"
+}

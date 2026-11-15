@@ -1,0 +1,1 @@
+Implement `parseDuration(s)` in src/duration.mjs returning milliseconds for strings like "250ms", "3s", "1.5m", "2h", "1h30m", "1d 2h". Units: ms, s, m, h, d; whitespace between parts allowed. Throw an Error for empty, unknown units, or garbage like "5x" or "h".

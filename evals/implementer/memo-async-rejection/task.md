@@ -1,0 +1,1 @@
+Bug: `memoAsync(fn)` in src/memo.mjs caches rejected promises forever, so one transient failure poisons the key. Fix it so concurrent callers for the same key still share ONE in-flight call, successful results stay cached, but a rejected call is evicted so the next call retries.

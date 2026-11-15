@@ -1,0 +1,5 @@
+{
+  "expected": "CLEAN",
+  "note": "pure rename plus an added null guard",
+  "diff": "--- a/src/format.js\n+++ b/src/format.js\n@@ -1,7 +1,8 @@\n-export function fmt(amount, currency) {\n+export function formatMoney(amount, currency) {\n+  if (amount == null) return \"\";\n   return new Intl.NumberFormat(\"en-GB\", { style: \"currency\", currency }).format(amount);\n }\n--- a/src/invoice.js\n+++ b/src/invoice.js\n@@ -1,4 +1,4 @@\n-import { fmt } from \"./format.js\";\n-export const total = (inv) => fmt(inv.total, inv.currency);\n+import { formatMoney } from \"./format.js\";\n+export const total = (inv) => formatMoney(inv.total, inv.currency);\n"
+}

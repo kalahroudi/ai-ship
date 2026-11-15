@@ -1,0 +1,10 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import path from "node:path";
+import { safeJoin } from "../src/files.mjs";
+const root = path.resolve("/srv/app");
+test("normal", () => assert.equal(safeJoin(root, "a/b.txt"), path.join(root, "a/b.txt")));
+test("dotdot", () => assert.throws(() => safeJoin(root, "../etc/passwd")));
+test("nested dotdot", () => assert.throws(() => safeJoin(root, "a/../../x")));
+test("absolute", () => assert.throws(() => safeJoin(root, "/etc/passwd")));
+test("prefix sibling", () => assert.throws(() => safeJoin(root, "../app2/x")));

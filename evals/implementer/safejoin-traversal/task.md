@@ -1,0 +1,1 @@
+Security fix: `safeJoin(root, userPath)` in src/files.mjs must never return a path outside `root`. Reject (throw an Error) on "..", absolute user paths, and paths that only share a prefix with root (e.g. root "/srv/app" vs "/srv/app2/x"). Normal relative paths still resolve inside root.

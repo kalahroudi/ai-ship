@@ -1,0 +1,5 @@
+{
+  "expected": "OPEN",
+  "note": "user input concatenated into SQL",
+  "diff": "--- a/src/search.js\n+++ b/src/search.js\n@@ -1,6 +1,6 @@\n export function searchUsers(db, term) {\n-  return db.query(\"SELECT id, name FROM users WHERE name LIKE $1\", [`%${term}%`]);\n+  return db.query(`SELECT id, name FROM users WHERE name LIKE '%${term}%'`);\n }\n"
+}

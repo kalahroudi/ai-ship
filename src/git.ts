@@ -23,6 +23,45 @@ function inheritStdio(): "inherit" | ["ignore", number, number] {
   return process.env.AI_SHIP_MCP === "1" ? ["ignore", 2, 2] : "inherit";
 }
 
+/** Paths ai-ship always creates inside worktrees that must never be diffed or committed. */
+export const WORKTREE_EXCLUDES = ["/.ai-ship/", "/.ai-ship-shared-context.txt"];
+
+function isPathTracked(worktreeDir: string, relPath: string): boolean {
+  const res = spawnSync("git", ["ls-files", "--", relPath], { cwd: worktreeDir, encoding: "utf8" });
+  return res.status === 0 && res.stdout.trim().length > 0;
+}
+
+/**
+ * Adds ai-ship worktree artefacts to the repository's shared `info/exclude`.
+ * `/node_modules` is only added when the repo does not track anything under node_modules: a
+ * `node_modules/` .gitignore entry does not match the node_modules *symlink* ai-ship creates in
+ * npm/yarn worktrees, so without this it would show up as untracked and be committed.
+ * Throws if the exclude file cannot be located, because continuing would let `git add -A` commit artefacts.
+ */
+export function ensureWorktreeExcludes(worktreeDir: string, entries: string[] = WORKTREE_EXCLUDES): void {
+  const res = spawnSync("git", ["rev-parse", "--git-path", "info/exclude"], {
+    cwd: worktreeDir,
+    encoding: "utf8",
+  });
+  if (res.status !== 0 || !res.stdout.trim()) {
+    throw new Error(
+      `Could not locate git info/exclude for ${worktreeDir}: ${(res.stderr || "").trim() || `exit ${res.status}`}`
+    );
+  }
+  const wanted = [...entries];
+  if (!wanted.includes("/node_modules") && !isPathTracked(worktreeDir, "node_modules")) {
+    wanted.push("/node_modules");
+  }
+  const excludePath = path.resolve(worktreeDir, res.stdout.trim());
+  const existing = fs.existsSync(excludePath) ? fs.readFileSync(excludePath, "utf8") : "";
+  const lines = new Set(existing.split(/\r?\n/).map((l) => l.trim()));
+  const missing = wanted.filter((e) => !lines.has(e));
+  if (missing.length === 0) return;
+  fs.mkdirSync(path.dirname(excludePath), { recursive: true });
+  const prefix = existing && !existing.endsWith("\n") ? "\n" : "";
+  fs.appendFileSync(excludePath, `${prefix}# ai-ship worktree artefacts\n${missing.join("\n")}\n`, "utf8");
+}
+
 export type PnpmRunner = (args: string[], cwd: string, quiet: boolean) => number | null;
 
 function defaultPnpmRunner(args: string[], cwd: string, quiet: boolean): number | null {
@@ -85,6 +124,7 @@ export function createWorktree(repoDir: string, baseBranch: string, task: string
     stdio: inheritStdio(),
   });
 
+  ensureWorktreeExcludes(worktreeDir);
   setupWorktreeDependencies(repoDir, worktreeDir);
 
   return { repoDir, worktreeDir, branch, baseBranch };
@@ -111,6 +151,7 @@ export function openExistingWorktree(
   if (!branch || branch === "HEAD") {
     throw new Error(`Worktree ${resolved} is in detached HEAD state; expected a feature branch.`);
   }
+  ensureWorktreeExcludes(resolved);
   setupWorktreeDependencies(repoDir, resolved);
   return { repoDir, worktreeDir: resolved, branch, baseBranch };
 }
@@ -122,39 +163,115 @@ function resolveDiffBaseRef(worktreeDir: string, baseBranch: string): string {
   return hasRemoteRef ? remoteRef : baseBranch;
 }
 
-export function getDiff(worktreeDir: string, baseBranch: string): string {
-  try {
-    const diffBase = resolveDiffBaseRef(worktreeDir, baseBranch);
-    const committed = execSync(`git diff "${diffBase}...HEAD"`, {
-      cwd: worktreeDir,
-      encoding: "utf8",
-      maxBuffer: 10 * 1024 * 1024,
-    });
-    const unstaged = execSync("git diff", {
-      cwd: worktreeDir,
-      encoding: "utf8",
-      maxBuffer: 10 * 1024 * 1024,
-    });
-    const untrackedList = execSync("git ls-files --others --exclude-standard", {
-      cwd: worktreeDir,
-      encoding: "utf8",
-    })
-      .trim()
-      .split("\n")
-      .filter(Boolean);
-
-    let untracked = "";
-    for (const file of untrackedList.slice(0, 20)) {
-      if (file.includes("shared-diff-context.txt")) continue;
-      const full = path.join(worktreeDir, file);
-      if (fs.statSync(full).size > 64 * 1024) continue;
-      untracked += `\n--- /dev/null\n+++ b/${file}\n${fs.readFileSync(full, "utf8")}\n`;
-    }
-
-    return [committed, unstaged, untracked].filter(Boolean).join("\n");
-  } catch {
-    return "";
+export class DiffError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "DiffError";
   }
+}
+
+export const UNTRACKED_FILE_MAX_BYTES = 64 * 1024;
+export const UNTRACKED_FILE_MAX_COUNT = 20;
+
+function gitText(args: string[], cwd: string): string {
+  const res = spawnSync("git", args, { cwd, encoding: "utf8", maxBuffer: 20 * 1024 * 1024 });
+  if (res.error) {
+    throw new DiffError(`git ${args.join(" ")} failed in ${cwd}: ${res.error.message}`, { cause: res.error });
+  }
+  if (res.status !== 0) {
+    throw new DiffError(`git ${args.join(" ")} failed in ${cwd} (exit ${res.status}): ${(res.stderr || "").trim()}`);
+  }
+  return res.stdout || "";
+}
+
+function isBinaryBuffer(buf: Buffer): boolean {
+  return buf.subarray(0, 8192).includes(0);
+}
+
+function describeUntrackedFile(worktreeDir: string, file: string): string {
+  const full = path.join(worktreeDir, file);
+  let stat: fs.Stats;
+  try {
+    stat = fs.lstatSync(full);
+  } catch (err) {
+    return `\n--- /dev/null\n+++ b/${file}\n(unreadable: ${(err as Error).message})\n`;
+  }
+  if (stat.isSymbolicLink()) {
+    let target = "?";
+    try {
+      target = fs.readlinkSync(full);
+    } catch {
+      // keep "?"
+    }
+    return `\n--- /dev/null\n+++ b/${file}\n(symlink -> ${target})\n`;
+  }
+  if (!stat.isFile()) {
+    return `\n--- /dev/null\n+++ b/${file}\n(not a regular file; content omitted)\n`;
+  }
+  if (stat.size > UNTRACKED_FILE_MAX_BYTES) {
+    return `\n--- /dev/null\n+++ b/${file}\n(new file, ${stat.size} bytes; content omitted)\n`;
+  }
+  let buf: Buffer;
+  try {
+    buf = fs.readFileSync(full);
+  } catch (err) {
+    return `\n--- /dev/null\n+++ b/${file}\n(unreadable: ${(err as Error).message})\n`;
+  }
+  if (isBinaryBuffer(buf)) {
+    return `\nBinary file ${file} added (${stat.size} bytes)\n`;
+  }
+  return `\n--- /dev/null\n+++ b/${file}\n${buf.toString("utf8")}\n`;
+}
+
+/**
+ * `git diff base...HEAD` (changes since the merge base). Falls back to a two-dot diff with a note
+ * when there is no merge base (orphan base branch, shallow clone) rather than failing the run.
+ */
+function diffSinceBase(worktreeDir: string, diffBase: string): string {
+  try {
+    return gitText(["diff", `${diffBase}...HEAD`], worktreeDir);
+  } catch (err) {
+    if (!(err instanceof DiffError) || !/no merge base/i.test(err.message)) throw err;
+    const twoDot = gitText(["diff", diffBase, "HEAD"], worktreeDir);
+    return twoDot.trim()
+      ? `(no merge base with ${diffBase}; showing two-dot diff ${diffBase}..HEAD)\n${twoDot}`
+      : twoDot;
+  }
+}
+
+/**
+ * Returns the full task diff: committed changes since the merge base with the base branch,
+ * unstaged/staged changes, and untracked (non-ignored) files.
+ * Throws `DiffError` instead of returning "" when git fails or when the worktree has changes
+ * that could not be represented, so callers never mistake an error for "no changes".
+ */
+export function getDiff(worktreeDir: string, baseBranch: string): string {
+  const diffBase = resolveDiffBaseRef(worktreeDir, baseBranch);
+  const committed = diffSinceBase(worktreeDir, diffBase);
+  const uncommitted = gitText(["diff", "HEAD"], worktreeDir);
+  const untrackedList = gitText(["ls-files", "--others", "--exclude-standard", "-z"], worktreeDir)
+    .split("\0")
+    .filter(Boolean);
+
+  let untracked = "";
+  for (const file of untrackedList.slice(0, UNTRACKED_FILE_MAX_COUNT)) {
+    untracked += describeUntrackedFile(worktreeDir, file);
+  }
+  if (untrackedList.length > UNTRACKED_FILE_MAX_COUNT) {
+    const rest = untrackedList.slice(UNTRACKED_FILE_MAX_COUNT);
+    untracked += `\n(${rest.length} more untracked file(s) not shown: ${rest.join(", ")})\n`;
+  }
+
+  const diff = [committed, uncommitted, untracked].filter((p) => p.trim()).join("\n");
+  if (!diff.trim()) {
+    const status = gitText(["status", "--porcelain"], worktreeDir).trim();
+    if (status) {
+      throw new DiffError(
+        `Worktree ${worktreeDir} has changes but the computed diff is empty:\n${status.slice(0, 2000)}`
+      );
+    }
+  }
+  return diff;
 }
 
 /** Returns `git diff --stat` between `baseBranch` and `HEAD` for PR summaries. */

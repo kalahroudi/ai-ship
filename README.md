@@ -7,7 +7,7 @@ For any git repository, `ai-ship` runs 4 automated stages in an isolated git wor
 1. **Implement (`implementer` agent):** Writes the change in a fresh short session with safe local dev commands auto-approved.
 2. **Independent Adversarial Tests (`tester` agent):** Spins up a **separate session on a different model** that sees only the task intent + diff and writes hostile security, edge-case, and performance tests.
 3. **Deterministic Local Gate:** Runs your repo's `typecheck`, `lint`, `build`, `test`, and `semgrep` (if installed) locally—looping back to the implementer on failure before a commit is pushed.
-4. **Shared-Context Multi-Lens Review (`reviewer` agent):** Writes `.ai-ship-shared-context.txt` once and runs **3 parallel read-only reviewers** (Security, Performance, Correctness) returning `VERDICT: CLEAN` or `VERDICT: OPEN`.
+4. **Shared-Context Multi-Lens Review (`reviewer` agent):** Writes `.ai-ship/shared-context.txt` (git-excluded, removed after the round) once and runs **3 parallel read-only reviewers** (Security, Performance, Correctness) returning `VERDICT: CLEAN` or `VERDICT: OPEN`.
    - **Stage 4b — Adversarial Bughunter (`bughunter` agent):** Runs a read-only `Hunter -> Skeptic -> Referee` pass to hypothesize cross-boundary bugs, challenge false positives, and emit structured confirmed findings before committing.
 
 ## Quickstart

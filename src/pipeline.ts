@@ -350,6 +350,33 @@ function recordUsage(
   budget?.record(stageKey ?? label, res);
 }
 
+/** Worktree-relative path of the shared review context (excluded from git via info/exclude). */
+export const SHARED_CONTEXT_RELATIVE_PATH = ".ai-ship/shared-context.txt";
+
+/**
+ * Writes the shared reviewer context into the worktree for the duration of `fn` and always removes it,
+ * even when a reviewer throws, so it can never be committed.
+ */
+export async function withSharedContext<T>(
+  worktreeDir: string,
+  content: string,
+  fn: () => Promise<T>
+): Promise<T> {
+  const sharedContextPath = path.join(worktreeDir, SHARED_CONTEXT_RELATIVE_PATH);
+  fs.mkdirSync(path.dirname(sharedContextPath), { recursive: true });
+  fs.writeFileSync(sharedContextPath, `${content}\n`, "utf8");
+  try {
+    return await fn();
+  } finally {
+    fs.rmSync(sharedContextPath, { force: true });
+    try {
+      fs.rmdirSync(path.dirname(sharedContextPath));
+    } catch {
+      // directory not empty or already gone
+    }
+  }
+}
+
 export const IMPLEMENTER_STATIC_INSTRUCTIONS = [
   "Instructions:",
   "- Work inside the current repository.",
@@ -371,7 +398,7 @@ export const TESTER_STATIC_INSTRUCTIONS = [
 ].join("\n");
 
 export const REVIEWER_STATIC_INSTRUCTIONS = [
-  "Read .ai-ship-shared-context.txt in the repo root.",
+  `Read ${SHARED_CONTEXT_RELATIVE_PATH} in the repo root.`,
   "Report ONLY concrete, reproducible high/critical issues with exact file paths, line numbers, and how to reproduce.",
   "End with `VERDICT: CLEAN` or `VERDICT: OPEN`.",
 ].join("\n");
@@ -969,26 +996,24 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
           break;
         }
 
-        const sharedContextPath = path.join(worktree.worktreeDir, ".ai-ship-shared-context.txt");
         const sharedContextParts = [
           `Task: ${opts.task}`,
           ...(memory ? ["", `## Persistent Repository Memory\n${memory}`] : []),
           "",
           `Diff:\n${diff.slice(0, reviewDiffMaxChars)}`,
         ];
-        fs.writeFileSync(sharedContextPath, `${sharedContextParts.join("\n")}\n`, "utf8");
 
         opts.onProgress?.(`Stage 4/4: Parallel 3-lens review (round ${round}/${config.maxReviewRounds})`);
         budget.assertWithinBudget(`Stage 4: Review (round ${round})`);
-        const reviews = await runReviewLenses({
-          lenses,
-          config,
-          runner,
-          usageLog,
-          budget,
-        });
-
-        fs.rmSync(sharedContextPath, { force: true });
+        const reviews = await withSharedContext(worktree.worktreeDir, sharedContextParts.join("\n"), () =>
+          runReviewLenses({
+            lenses,
+            config,
+            runner,
+            usageLog,
+            budget,
+          })
+        );
 
         const openFindings = reviews.filter((r) => r.verdict === "OPEN");
         reviewVerdicts = reviews.map((r) => ({ lens: r.lens, verdict: r.verdict }));

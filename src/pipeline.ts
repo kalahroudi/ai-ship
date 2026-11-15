@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { createOpencode, createOpencodeClient } from "@opencode-ai/sdk";
@@ -28,6 +29,8 @@ import { findUnpricedModels, getModelsFilePath, loadPricingTable } from "./prici
 import type { ProgressSink } from "./progress.ts";
 import { appendLedger, BudgetStopError, computeBudgetStatus, loadBudgetConfig, monthStart, readLedger, type BudgetStatus } from "./budget.ts";
 import { loadCatalog } from "./catalog.ts";
+import { classifyTask, parseNumstat, reclassifyFromDiff, type Classification } from "./classify.ts";
+import { formatRoutePlan, routeModels, type RoutePlan } from "./router.ts";
 import {
   assertProtectedPathsUnchanged,
   CHECKPOINT_PREFIX,
@@ -93,6 +96,8 @@ export interface PipelineOptions {
   runner?: PipelineRunner;
   /** Fine-grained per-agent progress events (sessions, tool calls, usage). */
   onEvent?: ProgressSink;
+  /** Task tags (e.g. from a Noty item) such as `size:L` or `risk:high` that override the classifier. */
+  tags?: string[];
   /** Run even when the monthly budget governor is in STOP state. */
   overrideBudget?: boolean;
   /** Returns true when the run was cancelled; checked between stages and before commit/PR. */
@@ -129,6 +134,8 @@ export interface PipelineResult {
   prUrl?: string;
   usageLog: string[];
   budgetState?: BudgetStatus["state"];
+  classification?: Classification;
+  routing?: string[];
   stageUsage?: StageUsageSummary[];
   totalUsage?: UsageTotals;
 }
@@ -1180,6 +1187,50 @@ export function resolveContextLensUrl(
   return normalize(config?.contextLens);
 }
 
+/**
+ * Classifies the task and, when the router is enabled (`"router": true` in .ai-ship.json) and the catalog has
+ * models, plans role models. Returns the inputs so later re-routing (escalation) uses the same context.
+ */
+export function planRouting(opts: {
+  config: RepoConfig;
+  task: string;
+  repoDir: string;
+  tags?: string[];
+  now?: Date;
+  pinnedImplementer?: string;
+}): {
+  classification: Classification;
+  plan?: RoutePlan;
+  lines: string[];
+  inputs: Parameters<typeof routeModels>[0];
+} {
+  // Classify cheaply when the router is off (no git grep); full repo signals only when routing.
+  const classification = classifyTask({ task: opts.task, repoDir: opts.config.router ? opts.repoDir : undefined, tags: opts.tags });
+  if (!opts.config.router) {
+    return { classification, lines: [], inputs: { catalog: { fx: { GBPUSD: 1.27 }, models: [] }, classification, budget: "GREEN" } };
+  }
+  const { catalog } = loadCatalog();
+  const now = opts.now ?? new Date();
+  const status = computeBudgetStatus({
+    entries: readLedger(undefined, monthStart(now)),
+    budget: loadBudgetConfig(opts.config.budget, getModelsFilePath()),
+    gbpPerUsd: 1 / catalog.fx.GBPUSD,
+    now,
+  });
+  const inputs = {
+    catalog,
+    classification,
+    budget: status.state,
+    viaGateway: Boolean(catalog.gateway?.enabled),
+    ...(opts.pinnedImplementer ? { pinnedImplementer: opts.pinnedImplementer } : {}),
+  };
+  if (!opts.config.router || catalog.models.filter((m) => m.enabled).length === 0) {
+    return { classification, lines: [], inputs };
+  }
+  const plan = routeModels(inputs);
+  return { classification, plan, lines: formatRoutePlan(plan), inputs };
+}
+
 export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult> {
   if (opts.onEvent) {
     const stageSink = opts.onEvent;
@@ -1190,7 +1241,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
     } };
   }
   const repoDir = path.resolve(opts.repoDir);
-  const config = loadRepoConfig(repoDir);
+  let config = loadRepoConfig(repoDir);
 
   // Ensure local node_modules/.bin/opencode is on PATH for createOpencode()
   const localBin = path.resolve(import.meta.dirname, "..", "node_modules", ".bin");
@@ -1202,7 +1253,39 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
   const cfGatewayUrl = resolveCloudflareGatewayUrl();
   const contextLensUrl = resolveContextLensUrl(config, opts.contextLens);
   console.log(`\n[ai-ship] Repo: ${repoDir} (base: ${config.baseBranch})`);
+  // Router (opt-in): classify the task and pick role models from the catalog. CLI pins always win.
+  // Catalog refs only make sense for OpenCode providers; claude-code models are Claude aliases.
+  const routing = planRouting({
+    config: provider === "opencode" ? config : { ...config, router: false },
+    task: opts.task,
+    repoDir,
+    tags: opts.tags,
+    pinnedImplementer: opts.model,
+  });
+  const routed: RoleModelOverrides = {};
+  if (routing.plan) {
+    const d = routing.plan.decisions;
+    if (d.implementer) routed.implementer = d.implementer.model;
+    if (d.tester) routed.tester = d.tester.model;
+    if (d.reviewer) routed.reviewer = d.reviewer.model;
+    if (d.bughunter) routed.bughunter = d.bughunter.model;
+    const toRef = (m: string) => ({ providerID: m.slice(0, m.indexOf("/")), id: m.slice(m.indexOf("/") + 1) });
+    const lensModels = { ...(config.reviewerLensModels ?? {}) };
+    if (d.security && !lensModels.Security) lensModels.Security = toRef(d.security.model);
+    config = {
+      ...config,
+      reviewerLensModels: lensModels,
+      ...(d.implementer?.fallbacks[0] && !config.implementerFallbackModel ? { implementerFallbackModel: toRef(d.implementer.fallbacks[0]) } : {}),
+      ...(d.tester?.fallbacks[0] && !config.testerFallbackModel ? { testerFallbackModel: toRef(d.tester.fallbacks[0]) } : {}),
+      ...(d.reviewer?.fallbacks[0] && !config.reviewerFallbackModel ? { reviewerFallbackModel: toRef(d.reviewer.fallbacks[0]) } : {}),
+      ...(d.bughunter?.fallbacks[0] && !config.bughunterFallbackModel ? { bughunterFallbackModel: toRef(d.bughunter.fallbacks[0]) } : {}),
+    };
+    console.log(`[ai-ship] Task: ${routing.classification.size}/${routing.classification.risk} ${routing.classification.kind} — ${routing.classification.reasons.join("; ")}`);
+    console.log("[ai-ship] Routing:");
+    for (const line of routing.lines) console.log(line);
+  }
   const roleModels: RoleModelOverrides = {
+    ...routed,
     ...(opts.model ? { implementer: opts.model } : {}),
     ...(opts.testerModel ? { tester: opts.testerModel } : {}),
     ...(opts.reviewerModel ? { reviewer: opts.reviewerModel } : {}),
@@ -1419,6 +1502,15 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
     recordUsage(usageLog, "Stage 1: Implement", implRes, budget, "Stage 1: Implement");
     afterImplementerTurn("Stage 1: Implement");
     const stage1Ref = createCheckpoint(worktree.worktreeDir, `${CHECKPOINT_PREFIX} stage 1 (implementer)`);
+    if (routing.plan) {
+      const numstat = spawnSync("git", ["diff", "--numstat", startRef, stage1Ref], { cwd: worktree.worktreeDir, encoding: "utf8" }).stdout ?? "";
+      const re = reclassifyFromDiff(routing.classification, parseNumstat(numstat));
+      if (re.size !== routing.classification.size || re.risk !== routing.classification.risk) {
+        integrityLog(`  [router] Re-classified from the diff: ${routing.classification.size}/${routing.classification.risk} → ${re.size}/${re.risk} (${re.reasons.slice(-1)[0]})`);
+        routing.classification = re;
+        routing.inputs = { ...routing.inputs, classification: re };
+      }
+    }
     let testSessionId: string | undefined;
     let testerFiles: string[] = [];
     const disputedFiles = new Set<string>();
@@ -1429,6 +1521,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
     // Approximate context size by the last implementer turn's prompt tokens (input + cache read).
     let implInputSinceCompact = (implRes.usage?.input ?? 0) + (implRes.usage?.cacheRead ?? 0);
     let lastAgentText = implRes.text;
+    let implementerOverride: { providerID: string; modelID: string } | undefined;
     const implementerTurn = async (label: string, stageKey: string, promptText: string) => {
       budget.assertWithinBudget(label);
       let text = promptText;
@@ -1447,7 +1540,12 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
           ].join("\n");
         }
       }
-      const res = await runner.prompt(implSessionId, "implementer", text);
+      const res = await runner.prompt(
+        implSessionId,
+        "implementer",
+        text,
+        implementerOverride ? { modelOverride: implementerOverride } : undefined
+      );
       implInputSinceCompact = (res.usage?.input ?? 0) + (res.usage?.cacheRead ?? 0);
       lastAgentText = res.text;
       recordUsage(usageLog, label, res, budget, stageKey);
@@ -1569,6 +1667,40 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
           );
         }
         implementerAttempts += 1;
+        // Router escalation: after two failed implementer fixes, move the implementer up one tier (once).
+        if (
+          implementerAttempts >= 2 &&
+          implementerAttempts === Math.min(3, config.maxFixRetries) &&
+          routing.plan &&
+          !opts.model &&
+          !implementerOverride
+        ) {
+          // Keep independence: the escalated implementer must avoid every reviewing role's family.
+          const dec = routing.plan.decisions;
+          const families = new Set<string>();
+          for (const d of [dec.tester, dec.reviewer, dec.security, dec.bughunter]) {
+            if (!d) continue;
+            for (const r of [d.model, ...d.fallbacks]) {
+              const id = r.replace(/^aig\//, "");
+              families.add(routing.inputs.catalog.models.find((m) => m.id === id)?.family ?? id.split("/")[0]);
+            }
+          }
+          // Also the resolved (pinned / configured) tester, reviewer, bughunter, lens and fallback models.
+          const familyOfLabel = (label: string) => {
+            const id = label.replace(/^aig\//, "");
+            return routing.inputs.catalog.models.find((m) => m.id === id)?.family ?? id.split("/")[0];
+          };
+          for (const label of [roleLabels.tester, roleLabels.reviewer, roleLabels.bughunter]) if (label) families.add(familyOfLabel(label));
+          for (const ref of Object.values(config.reviewerLensModels ?? {})) families.add(familyOfLabel(`${ref.providerID}/${ref.id}`));
+          for (const ref of [config.testerFallbackModel, config.reviewerFallbackModel, config.bughunterFallbackModel]) {
+            if (ref) families.add(familyOfLabel(`${ref.providerID}/${ref.id}`));
+          }
+          const up = routeModels({ ...routing.inputs, escalate: true, implementerExcludeFamilies: families }).decisions.implementer;
+          if (up && up.model !== routing.plan.decisions.implementer?.model) {
+            implementerOverride = { providerID: up.model.slice(0, up.model.indexOf("/")), modelID: up.model.slice(up.model.indexOf("/") + 1) };
+            integrityLog(`  [router] Escalating implementer to ${up.model} after ${implementerAttempts - 1} failed fixes (${up.reason})`);
+          }
+        }
         console.log(
           `  -> Verify failed (${verify.failedCommand}). Sending failure back to implementer (attempt ${implementerAttempts}/${config.maxFixRetries})...`
         );
@@ -1819,6 +1951,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
       prUrl,
       usageLog,
       budgetState: budgetStatus.state,
+      ...(routing.plan ? { classification: routing.classification, routing: routing.lines } : {}),
       stageUsage,
       totalUsage,
     };

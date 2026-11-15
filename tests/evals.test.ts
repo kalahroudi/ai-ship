@@ -41,12 +41,15 @@ interface FakeOpts {
 }
 
 function fake(opts: FakeOpts = {}) {
-  const state = { dirs: [] as string[], closed: 0, prompts: 0, roles: [] as string[] };
+  const state = { titles: [] as string[], dirs: [] as string[], closed: 0, prompts: 0, roles: [] as string[] };
   const makeRunner = async (dir: string, role: AgentRole, _model: string): Promise<PipelineRunner> => {
     state.dirs.push(dir);
     state.roles.push(role);
     return {
-      createSession: async (title: string) => title.replace(/^eval: /, ""),
+      createSession: async (title: string) => {
+        state.titles.push(title);
+        return "eval";
+      },
       prompt: async (sid: string, _r: AgentRole, text: string): Promise<PromptResult> => {
         state.prompts++;
         await opts.onPrompt?.(dir, text, sid);
@@ -146,6 +149,7 @@ test("runner.close() called and workspace removed even when prompt throws", asyn
   const rep = await runEval({ role: "implementer", model: "a/b", only: ["paginate-off-by-one"], makeRunner: f.makeRunner, ledger: false });
   assert.equal(rep.cases[0].pass, false);
   assert.match(rep.cases[0].error ?? "", /boom/);
+  assert.equal(rep.cases[0].errored, true);
   assert.equal(f.state.closed, 1);
   assert.ok(f.state.dirs.every((d) => !fs.existsSync(d)));
 
@@ -169,7 +173,8 @@ test("reviewer: per-case pass, recall/precision with always-OPEN", async () => {
 });
 
 test("reviewer: perfect and always-CLEAN replies", async () => {
-  const perfect = fake({ reply: (sid) => `x\nVERDICT: ${sid.startsWith("clean-") ? "CLEAN" : "OPEN"}` });
+  const cleanDiffs = new Set((loadSuite("reviewer") as Array<{ diff: string; expected: string }>).filter((c) => c.expected === "CLEAN").map((c) => c.diff));
+  const perfect = fake({ reply: (_s, text) => `x\nVERDICT: ${cleanDiffs.has(text.split("```diff\n")[1]?.split("\n```")[0] ?? "") ? "CLEAN" : "OPEN"}` });
   const p = await runEval({ role: "reviewer", model: "a/b", makeRunner: perfect.makeRunner, ledger: false });
   assert.equal(p.passRate, 1);
   assert.equal(p.recall, 1);
@@ -177,7 +182,7 @@ test("reviewer: perfect and always-CLEAN replies", async () => {
   const clean = fake({ reply: () => "No findings\nVERDICT: CLEAN" });
   const c = await runEval({ role: "reviewer", model: "a/b", makeRunner: clean.makeRunner, ledger: false });
   assert.equal(c.recall, 0);
-  assert.equal(c.precision, 0);
+  assert.equal(c.precision, undefined);
   assert.equal(c.passRate, 2 / 5);
 });
 
@@ -282,4 +287,154 @@ test("parseCliArgs eval flag validation", () => {
   for (const bad of ["0", "11", "1.5", "abc", "-2"]) assert.match(parseCliArgs(["--eval-n", bad]).unknownOption ?? "", /--eval-n/, bad);
   for (const bad of ["0", "-1", "abc"]) assert.match(parseCliArgs(["--eval-max-cost", bad]).unknownOption ?? "", /--eval-max-cost/, bad);
   assert.equal(parseCliArgs(["--eval-n", "10"]).evalN, 10);
+});
+
+test("workspace dir name is random without case name; session title is 'eval'", async () => {
+  const f = fake({ onPrompt: () => {} });
+  await runEval({ role: "implementer", model: "a/b", only: ["paginate-off-by-one", "slugify-feature"], makeRunner: f.makeRunner, ledger: false });
+  assert.equal(f.state.dirs.length, 2);
+  for (const d of f.state.dirs) {
+    assert.match(path.basename(d), /^ai-ship-eval-[0-9a-f]{8}-/);
+    for (const name of IMPL_NAMES) assert.ok(!d.includes(name), `${d} leaks ${name}`);
+  }
+  assert.notEqual(f.state.dirs[0], f.state.dirs[1]);
+  assert.deepEqual(f.state.titles, ["eval", "eval"]);
+});
+
+async function implRun(onPrompt: (ws: string) => void, name = "paginate-off-by-one") {
+  const f = fake({ onPrompt });
+  const rep = await runEval({ role: "implementer", model: "a/b", only: [name], makeRunner: f.makeRunner, ledger: false });
+  return rep.cases[0];
+}
+
+test("tamper check: changes outside src/ and test/ fail even with a correct fix", async () => {
+  const fix = (ws: string) => fs.writeFileSync(path.join(ws, "src", "paginate.mjs"), PAGINATE_FIX);
+  assert.equal((await implRun(fix)).pass, true);
+  const pkg = await implRun((ws) => { fix(ws); fs.writeFileSync(path.join(ws, "package.json"), "{}"); });
+  assert.equal(pkg.pass, false);
+  assert.match(pkg.error ?? "", /outside src\/ and test\//);
+  assert.match(pkg.error ?? "", /package\.json/);
+  const shim = await implRun((ws) => { fix(ws); fs.mkdirSync(path.join(ws, "node_modules", "x"), { recursive: true }); fs.writeFileSync(path.join(ws, "node_modules", "x", "index.js"), ""); });
+  assert.equal(shim.pass, false);
+  assert.match(shim.error ?? "", /node_modules/);
+  const modified = await implRun((ws) => { fix(ws); fs.writeFileSync(path.join(ws, ".gitignore"), "x\n"); });
+  assert.equal(modified.pass, false);
+  const okTest = await implRun((ws) => { fix(ws); fs.mkdirSync(path.join(ws, "test")); fs.writeFileSync(path.join(ws, "test", "mine.test.mjs"), "// agent test\n"); });
+  assert.equal(okTest.pass, true, okTest.error);
+});
+
+test("forged success: process.exit(0) at top of src fails (TAP count required)", async () => {
+  const c = await implRun((ws) => fs.writeFileSync(path.join(ws, "src", "paginate.mjs"), `process.exit(0);\n${PAGINATE_FIX}`));
+  assert.equal(c.pass, false);
+  assert.equal(c.errored, undefined);
+});
+
+test("eval.json tests counts per fixture and default command uses tap reporter", () => {
+  const want: Record<string, number> = { "paginate-off-by-one": 4, "slugify-feature": 4, "safejoin-traversal": 5, "memo-async-rejection": 2, "parse-duration-feature": 3 };
+  for (const c of loadSuite("implementer") as Array<{ name: string; test: string; tests?: number }>) {
+    assert.equal(c.tests, want[c.name], c.name);
+    assert.match(c.test, /--test-reporter=tap/);
+  }
+  // default command when eval.json omits "test"
+  const suite = tmp("defaultcmd");
+  const cd = path.join(suite, "implementer", "x");
+  fs.mkdirSync(path.join(cd, "repo"), { recursive: true });
+  fs.mkdirSync(path.join(cd, "hidden"));
+  fs.writeFileSync(path.join(cd, "task.md"), "t");
+  fs.writeFileSync(path.join(cd, "eval.json"), "{}");
+  const [c] = loadSuite("implementer", suite) as Array<{ test: string }>;
+  assert.match(c.test, /--test-reporter=tap/);
+});
+
+test("errored: excluded from passRate and recall/precision; usage from err counted in cost and ledger", async () => {
+  const ledger = process.env.AI_SHIP_LEDGER_FILE!;
+  fs.rmSync(ledger, { force: true });
+  const mk = async (_d: string, _r: AgentRole): Promise<PipelineRunner> => ({
+    createSession: async () => "s",
+    prompt: async (_s, _role, text) => {
+      if (text.includes("sql") || /SELECT|query/i.test(text)) {
+        throw Object.assign(new Error("empty reply"), { usage: { input: 5, output: 0, cacheRead: 0, costUsd: 0.3 } });
+      }
+      if (/await/.test(text)) throw Object.assign(new Error("retry failed"), { wastedUsage: { input: 2, output: 0, cacheRead: 0, costUsd: 0.2 } });
+      return { text: "VERDICT: OPEN", usageSummary: "", usage: { input: 1, output: 1, cacheRead: 0, costUsd: 0.1 } };
+    },
+    close: () => {},
+  });
+  const rep = await runEval({ role: "reviewer", model: "a/b", makeRunner: mk });
+  const errored = rep.cases.filter((c) => c.errored);
+  assert.ok(errored.length >= 1);
+  assert.equal(rep.errored, errored.length);
+  const scored = rep.cases.filter((c) => !c.errored);
+  assert.equal(rep.passRate, scored.filter((c) => c.pass).length / scored.length);
+  assert.ok(errored.every((c) => c.pass === false && c.costUsd > 0));
+  assert.equal(Math.round(rep.costUsd * 1e6), Math.round(rep.cases.reduce((a, c) => a + c.costUsd, 0) * 1e6));
+  const rows = fs.readFileSync(ledger, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  assert.equal(rows.length, rep.cases.length);
+  assert.equal(Math.round(rows.reduce((a, r) => a + r.costUsd, 0) * 1e6), Math.round(rep.costUsd * 1e6));
+  const first = formatEvalReport(rep)[0];
+  assert.match(first, new RegExp(`\\(${scored.filter((c) => c.pass).length}/${scored.length}, ${errored.length} errored\\)`));
+});
+
+test("all cases errored: passRate 0, recall/precision undefined, no recall line", async () => {
+  const f = fake({ throwOnPrompt: true });
+  const rep = await runEval({ role: "reviewer", model: "a/b", makeRunner: f.makeRunner, ledger: false });
+  assert.equal(rep.errored, 5);
+  assert.equal(rep.passRate, 0);
+  assert.equal(rep.recall, undefined);
+  assert.equal(rep.precision, undefined);
+  const lines = formatEvalReport(rep);
+  assert.match(lines[0], /\(0\/0, 5 errored\)/);
+  // When both are undefined the recall/precision line is omitted entirely (n/a is printed only if one is defined).
+  assert.match(lines[1], /^  ERR /);
+});
+
+test("precision undefined when nothing predicted OPEN; recall undefined when no OPEN case ran", async () => {
+  const none = fake({ reply: () => "VERDICT: CLEAN" });
+  const a = await runEval({ role: "reviewer", model: "a/b", makeRunner: none.makeRunner, ledger: false });
+  assert.equal(a.precision, undefined);
+  assert.equal(a.recall, 0);
+  assert.equal(formatEvalReport(a)[1], "  OPEN recall 0%, precision n/a");
+  const onlyClean = fake({ reply: () => "VERDICT: CLEAN" });
+  const b = await runEval({ role: "reviewer", model: "a/b", only: ["clean-parameterized-query"], makeRunner: onlyClean.makeRunner, ledger: false });
+  assert.equal(b.recall, undefined);
+  assert.equal(b.precision, undefined);
+});
+
+test("prepareWorkspace failure is caught as errored and does not abort runEval", async () => {
+  const suite = tmp("badws");
+  for (const name of ["a-bad", "b-good"]) {
+    const cd = path.join(suite, "implementer", name);
+    fs.mkdirSync(path.join(cd, "repo", "src"), { recursive: true });
+    fs.mkdirSync(path.join(cd, "hidden"));
+    fs.writeFileSync(path.join(cd, "task.md"), "t");
+    fs.writeFileSync(path.join(cd, "eval.json"), "{}");
+    fs.writeFileSync(path.join(cd, "hidden", "x.test.mjs"), `import test from "node:test"; test("ok", () => {});\n`);
+    fs.writeFileSync(path.join(cd, "repo", "src", "a.mjs"), "");
+  }
+  // break the first: its repo dir becomes a dangling symlink so cpSync fails
+  const bad = path.join(suite, "implementer", "a-bad", "repo");
+  fs.rmSync(bad, { recursive: true });
+  fs.symlinkSync(path.join(suite, "nope"), bad);
+  // loadSuite requires repo to exist; existsSync follows symlinks, so make loadSuite accept it via a real dir then delete after load
+  fs.rmSync(bad);
+  fs.mkdirSync(bad);
+  const f = fake();
+  const origCp = fs.cpSync;
+  let calls = 0;
+  (fs as { cpSync: typeof fs.cpSync }).cpSync = ((...a: Parameters<typeof fs.cpSync>) => {
+    if (calls++ === 0) throw new Error("copy failed");
+    return origCp(...a);
+  }) as typeof fs.cpSync;
+  let rep: EvalReport;
+  try {
+    rep = await runEval({ role: "implementer", model: "a/b", suiteDir: suite, makeRunner: f.makeRunner, ledger: false });
+  } finally {
+    (fs as { cpSync: typeof fs.cpSync }).cpSync = origCp;
+  }
+  assert.equal(rep.cases.length, 2);
+  assert.equal(rep.cases[0].errored, true);
+  assert.match(rep.cases[0].error ?? "", /copy failed/);
+  assert.equal(rep.errored, 1);
+  assert.equal(f.state.dirs.length, 1, "runner only created for the second case");
+  assert.equal(f.state.closed, 1);
 });

@@ -19,7 +19,7 @@ import { buildGatewayProvider, formatCatalog, loadCatalog, syncCatalog } from ".
 import { computeBudgetStatus, formatBudgetReport, loadBudgetConfig, monthStart, readLedger } from "../src/budget.ts";
 import { computeModelScores, formatReport, readOutcomes } from "../src/outcomes.ts";
 import { getModelsFilePath } from "../src/pricing.ts";
-import { planRouting } from "../src/pipeline.ts";
+import { planRouting, resolveCloudflareGatewayUrl } from "../src/pipeline.ts";
 import { formatDoctor, initRepo as initRepoFiles, installPlugin, runDoctor, uninstallPlugin } from "../src/doctor.ts";
 
 function printHelp() {
@@ -319,23 +319,41 @@ if (parsed.evalRole) {
   }
   const evalProvider = normalizeProvider(parsed.rawProvider);
   const role = parsed.evalRole;
+  // The user's repo config (providers, pricing, gateway) — but no fallbacks: a failover would score another
+  // model under the evaluated model's name.
+  const evalConfig = {
+    ...loadRepoConfig(repoDir),
+    implementerFallbackModel: undefined,
+    testerFallbackModel: undefined,
+    reviewerFallbackModel: undefined,
+    bughunterFallbackModel: undefined,
+  };
+  const cfGatewayUrl = resolveCloudflareGatewayUrl();
+  // Without --eval-max-cost, cap spend at what is left of this month's budget.
+  const remainingUsd = status.state === "STOP" ? undefined : status.remainingGBP * catalog.fx.GBPUSD;
+  const maxCostUsd = parsed.evalMaxCostUsd ?? (remainingUsd !== undefined && Number.isFinite(remainingUsd) && remainingUsd > 0 ? remainingUsd : undefined);
   console.log(`[ai-ship] Eval: ${role} on ${evalModel} (provider ${evalProvider}, budget ${status.state})`);
   const report = await runEval({
     role,
     model: evalModel,
     n: parsed.evalN,
     only: parsed.evalOnly,
-    maxCostUsd: parsed.evalMaxCostUsd,
+    maxCostUsd,
     makeRunner: (dir, r, m) =>
       createRunner({
         provider: evalProvider,
         worktreeDir: dir,
-        config: loadRepoConfig(dir),
+        config: evalConfig,
+        cfGatewayUrl,
         ...(r === "implementer" ? { model: m } : { roleModels: { [r]: m } }),
       }),
     onCase: (c) => console.log(`  ${c.pass ? "PASS" : "FAIL"} ${c.name}#${c.attempt} (${(c.latencyMs / 1000).toFixed(1)}s, $${c.costUsd.toFixed(4)})`),
   });
   for (const line of formatEvalReport(report)) console.log(line);
+  if (report.cases.length > 0 && report.errored === report.cases.length) {
+    console.error("[ai-ship] Every case errored (model id, API key, gateway or rate limit?); no report saved.");
+    process.exit(1);
+  }
   console.log(`[ai-ship] Report: ${saveEvalReport(report)}`);
   process.exit(0);
 }

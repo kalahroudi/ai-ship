@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -22,6 +23,8 @@ export interface ImplementerCase {
   dir: string;
   task: string;
   test: string;
+  /** Number of hidden tests that must pass (guards against agent code that exits 0 before any assertion). */
+  tests?: number;
 }
 
 export interface ReviewerCase {
@@ -41,6 +44,8 @@ export interface CaseResult {
   verdict?: string;
   expected?: string;
   error?: string;
+  /** Infrastructure failure (prompt threw: rate limit, bad model id, missing key…): excluded from scores. */
+  errored?: boolean;
 }
 
 export interface EvalReport {
@@ -50,6 +55,8 @@ export interface EvalReport {
   n: number;
   cases: CaseResult[];
   passRate: number;
+  /** Cases that errored (not scored); absent in reports from older versions. */
+  errored?: number;
   costUsd: number;
   avgLatencyMs: number;
   /** Reviewer only: OPEN recall/precision over all attempts. */
@@ -76,9 +83,9 @@ export function loadSuite(role: EvalRole, suiteDir = defaultSuiteDir(), only?: s
     if (role === "implementer") {
       if (!fs.statSync(full).isDirectory()) continue;
       if (only?.length && !only.includes(entry)) continue;
-      const meta = JSON.parse(fs.readFileSync(path.join(full, "eval.json"), "utf8")) as { test?: string };
+      const meta = JSON.parse(fs.readFileSync(path.join(full, "eval.json"), "utf8")) as { test?: string; tests?: number };
       if (!fs.existsSync(path.join(full, "repo")) || !fs.existsSync(path.join(full, "hidden"))) continue;
-      out.push({ kind: "implementer", name: entry, dir: full, task: fs.readFileSync(path.join(full, "task.md"), "utf8").trim(), test: meta.test ?? "node --test hidden/" });
+      out.push({ kind: "implementer", name: entry, dir: full, task: fs.readFileSync(path.join(full, "task.md"), "utf8").trim(), test: meta.test ?? "node --test --test-reporter=tap hidden/", ...(typeof meta.tests === "number" ? { tests: meta.tests } : {}) });
     } else {
       if (!entry.endsWith(".json")) continue;
       const name = entry.slice(0, -5);
@@ -99,7 +106,8 @@ function git(cwd: string, args: string[]): void {
 
 /** Copies the fixture repo (without hidden tests) into a fresh git repo. */
 export function prepareWorkspace(c: ImplementerCase, parent = os.tmpdir()): string {
-  const ws = fs.mkdtempSync(path.join(parent, `ai-ship-eval-${c.name}-`));
+  // Random, case-free name: the agent must not learn which fixture it is (and look up its hidden tests).
+  const ws = fs.mkdtempSync(path.join(parent, `ai-ship-eval-${randomBytes(4).toString("hex")}-`));
   fs.cpSync(path.join(c.dir, "repo"), ws, { recursive: true });
   git(ws, ["init", "-q"]);
   git(ws, ["add", "-A"]);
@@ -109,13 +117,25 @@ export function prepareWorkspace(c: ImplementerCase, parent = os.tmpdir()): stri
 
 /** Copies the hidden tests in AFTER the agent finished (overwriting any agent file at those paths) and runs them. */
 export function runHiddenTests(c: ImplementerCase, ws: string, timeoutMs = 120_000): { pass: boolean; output: string } {
+  // Tamper check: the agent may only change src/ and test/ (no package.json, loaders, node_modules shims…).
+  const st = spawnSync("git", ["status", "--porcelain", "--untracked-files=all"], { cwd: ws, encoding: "utf8" });
+  const outside = (st.stdout ?? "")
+    .split("\n")
+    .map((l) => l.slice(3).trim().replace(/^"|"$/g, ""))
+    .filter((f) => f && !/^(src|test)\//.test(f.split(" -> ").pop() ?? f));
+  if (outside.length) return { pass: false, output: `agent changed files outside src/ and test/: ${outside.slice(0, 10).join(", ")}` };
   const hiddenDest = path.join(ws, "hidden");
   fs.rmSync(hiddenDest, { recursive: true, force: true });
   fs.cpSync(path.join(c.dir, "hidden"), hiddenDest, { recursive: true });
   // Never inherit NODE_TEST_CONTEXT: under it a child `node --test` reports success even when tests fail.
   const { NODE_TEST_CONTEXT: _ntc, ...env } = process.env;
   const r = spawnSync(c.test, { cwd: ws, shell: true, encoding: "utf8", timeout: timeoutMs, env });
-  return { pass: r.status === 0, output: `${r.stdout ?? ""}${r.stderr ?? ""}`.slice(-4000) };
+  const out = `${r.stdout ?? ""}${r.stderr ?? ""}`;
+  // Exit status alone can be forged (agent code calling process.exit(0) on import): require the TAP summary.
+  const passed = Number(out.match(/^# pass (\d+)$/m)?.[1] ?? NaN);
+  const failed = Number(out.match(/^# fail (\d+)$/m)?.[1] ?? NaN);
+  const countOk = c.tests !== undefined ? passed === c.tests : passed > 0;
+  return { pass: r.status === 0 && failed === 0 && countOk, output: out.slice(-4000) };
 }
 
 export const IMPLEMENTER_EVAL_PROMPT = (task: string) =>
@@ -126,6 +146,13 @@ export const REVIEWER_EVAL_PROMPT = (diff: string) =>
 
 function costOf(res: PromptResult | undefined): number {
   return res?.usage?.costUsd ?? 0;
+}
+
+/** Usage a failed prompt still spent (empty replies carry `usage`, retried transient failures `wastedUsage`). */
+function usageOfFailure(err: unknown): PromptResult | undefined {
+  const e = err as { usage?: PromptResult["usage"]; wastedUsage?: PromptResult["usage"] } | undefined;
+  const u = e?.usage ?? e?.wastedUsage;
+  return u && typeof u.input === "number" ? { text: "", usageSummary: "", usage: u } : undefined;
 }
 
 export interface RunEvalOptions {
@@ -176,31 +203,34 @@ export async function runEval(opts: RunEvalOptions): Promise<EvalReport> {
       let res: PromptResult | undefined;
       let r: CaseResult;
       if (c.kind === "implementer") {
-        const ws = prepareWorkspace(c);
+        let ws: string | undefined;
         let runner: PipelineRunner | undefined;
         try {
+          ws = prepareWorkspace(c);
           runner = await opts.makeRunner(ws, "implementer", opts.model);
-          const sid = await runner.createSession(`eval: ${c.name}`);
+          const sid = await runner.createSession("eval");
           res = await runner.prompt(sid, "implementer", IMPLEMENTER_EVAL_PROMPT(c.task));
           const t = runHiddenTests(c, ws);
           r = { name: c.name, attempt, pass: t.pass, costUsd: costOf(res), latencyMs: now() - t0, ...(t.pass ? {} : { error: t.output.slice(-500) }) };
         } catch (err) {
-          r = { name: c.name, attempt, pass: false, costUsd: costOf(res), latencyMs: now() - t0, error: (err as Error).message.slice(0, 500) };
+          res ??= usageOfFailure(err);
+          r = { name: c.name, attempt, pass: false, errored: true, costUsd: costOf(res), latencyMs: now() - t0, error: (err as Error).message.slice(0, 500) };
         } finally {
           runner?.close();
-          fs.rmSync(ws, { recursive: true, force: true });
+          if (ws) fs.rmSync(ws, { recursive: true, force: true });
         }
       } else {
         const ws = fs.mkdtempSync(path.join(os.tmpdir(), `ai-ship-eval-review-`));
         let runner: PipelineRunner | undefined;
         try {
           runner = await opts.makeRunner(ws, "reviewer", opts.model);
-          const sid = await runner.createSession(`eval: ${c.name}`);
+          const sid = await runner.createSession("eval");
           res = await runner.prompt(sid, "reviewer", REVIEWER_EVAL_PROMPT(c.diff));
           const verdict = parseVerdict(res.text);
           r = { name: c.name, attempt, pass: verdict === c.expected, verdict, expected: c.expected, costUsd: costOf(res), latencyMs: now() - t0 };
         } catch (err) {
-          r = { name: c.name, attempt, pass: false, expected: c.expected, costUsd: costOf(res), latencyMs: now() - t0, error: (err as Error).message.slice(0, 500) };
+          res ??= usageOfFailure(err);
+          r = { name: c.name, attempt, pass: false, errored: true, expected: c.expected, costUsd: costOf(res), latencyMs: now() - t0, error: (err as Error).message.slice(0, 500) };
         } finally {
           runner?.close();
           fs.rmSync(ws, { recursive: true, force: true });
@@ -212,22 +242,24 @@ export async function runEval(opts: RunEvalOptions): Promise<EvalReport> {
       opts.onCase?.(r);
     }
   }
+  const scored = results.filter((r) => !r.errored);
   const report: EvalReport = {
     ts: new Date(now()).toISOString(),
     model: opts.model,
     role: opts.role,
     n,
     cases: results,
-    passRate: results.length ? results.filter((r) => r.pass).length / results.length : 0,
+    passRate: scored.length ? scored.filter((r) => r.pass).length / scored.length : 0,
+    errored: results.length - scored.length,
     costUsd: results.reduce((a, r) => a + r.costUsd, 0),
     avgLatencyMs: results.length ? Math.round(results.reduce((a, r) => a + r.latencyMs, 0) / results.length) : 0,
   };
   if (opts.role === "reviewer") {
-    const tp = results.filter((r) => r.expected === "OPEN" && r.verdict === "OPEN").length;
-    const fn = results.filter((r) => r.expected === "OPEN" && r.verdict !== "OPEN").length;
-    const fp = results.filter((r) => r.expected === "CLEAN" && r.verdict === "OPEN").length;
-    report.recall = tp + fn ? tp / (tp + fn) : 0;
-    report.precision = tp + fp ? tp / (tp + fp) : 0;
+    const tp = scored.filter((r) => r.expected === "OPEN" && r.verdict === "OPEN").length;
+    const fn = scored.filter((r) => r.expected === "OPEN" && r.verdict !== "OPEN").length;
+    const fp = scored.filter((r) => r.expected === "CLEAN" && r.verdict === "OPEN").length;
+    if (tp + fn) report.recall = tp / (tp + fn);
+    if (tp + fp) report.precision = tp / (tp + fp);
   }
   return report;
 }
@@ -263,9 +295,12 @@ export function latestEvalReports(dir = getEvalsDir()): EvalReport[] {
 
 export function formatEvalReport(r: EvalReport): string[] {
   const lines = [
-    `Eval ${r.role} ${r.model}: ${Math.round(r.passRate * 100)}% pass (${r.cases.filter((c) => c.pass).length}/${r.cases.length}), $${r.costUsd.toFixed(4)}, avg ${(r.avgLatencyMs / 1000).toFixed(1)}s`,
+    `Eval ${r.role} ${r.model}: ${Math.round(r.passRate * 100)}% pass (${r.cases.filter((c) => c.pass).length}/${r.cases.length - (r.errored ?? 0)}${r.errored ? `, ${r.errored} errored` : ""}), $${r.costUsd.toFixed(4)}, avg ${(r.avgLatencyMs / 1000).toFixed(1)}s`,
   ];
-  if (r.recall !== undefined) lines.push(`  OPEN recall ${Math.round(r.recall * 100)}%, precision ${Math.round((r.precision ?? 0) * 100)}%`);
-  for (const c of r.cases) lines.push(`  ${c.pass ? "PASS" : "FAIL"} ${c.name}#${c.attempt}${c.verdict ? ` (${c.verdict}, expected ${c.expected})` : ""}${c.error ? ` — ${c.error.split("\n")[0].slice(0, 120)}` : ""}`);
+  if (r.recall !== undefined || r.precision !== undefined) {
+    const pct = (x?: number) => (x === undefined ? "n/a" : `${Math.round(x * 100)}%`);
+    lines.push(`  OPEN recall ${pct(r.recall)}, precision ${pct(r.precision)}`);
+  }
+  for (const c of r.cases) lines.push(`  ${c.errored ? "ERR " : c.pass ? "PASS" : "FAIL"} ${c.name}#${c.attempt}${c.verdict ? ` (${c.verdict}, expected ${c.expected})` : ""}${c.error ? ` — ${c.error.split("\n")[0].slice(0, 120)}` : ""}`);
   return lines;
 }

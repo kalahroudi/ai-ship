@@ -1,1 +1,4 @@
-{ "test": "node --test hidden/" }
+{
+  "test": "node --test --test-reporter=tap hidden/",
+  "tests": 2
+}

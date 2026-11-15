@@ -237,9 +237,16 @@ export function createOc2Runner(opts: {
       if (res.outcome && res.outcome !== "succeeded") {
         // Include the provider error so 429/5xx failures can be classified as transient.
         const detail = res.error ? `: ${res.error}` : "";
+        // Price the failed attempt so a later merge with the fallback turn isn't tainted as "cost unknown";
+        // a zero-token failure (typical 429) carries no usage at all.
+        const tokens = res.usage ? res.usage.input + res.usage.output + (res.usage.reasoning ?? 0) : 0;
+        const failedUsage =
+          res.usage && tokens > 0
+            ? applyPricing({ text: "", usageSummary: "", usage: res.usage }, res.model ?? (model ? `${model.providerID}/${model.id}` : undefined), pricing).usage
+            : undefined;
         throw new Oc2TurnError(`OpenCode ${role} session ${sessionID} ended with outcome "${res.outcome}"${detail}`, {
           status: res.errorStatus,
-          usage: res.usage,
+          usage: failedUsage,
         });
       }
       const base: PromptResult = {
@@ -349,22 +356,26 @@ export function createOc2Runner(opts: {
  * A PipelineRunner whose real runner is built once the pipeline has created the worktree (pass the returned
  * `onWorktree` to runPipeline). Used by `--attach` and the native plugin.
  */
-export function createLazyRunner(build: (worktreeDir: string, config?: RepoConfig) => PipelineRunner): {
+export function createLazyRunner(
+  build: (worktreeDir: string, config?: RepoConfig, roleModels?: RoleModelOverrides) => PipelineRunner
+): {
   runner: PipelineRunner;
-  onWorktree: (worktreeDir: string, config?: RepoConfig) => void;
+  onWorktree: (worktreeDir: string, config?: RepoConfig, roleModels?: RoleModelOverrides) => void;
 } {
   let worktree: string | undefined;
   let effective: RepoConfig | undefined;
+  let effectiveModels: RoleModelOverrides | undefined;
   let inner: PipelineRunner | undefined;
   const get = () => {
     if (!worktree) throw new Error("ai-ship: runner used before the worktree was created");
-    inner ??= build(worktree, effective);
+    inner ??= build(worktree, effective, effectiveModels);
     return inner;
   };
   return {
-    onWorktree: (dir, config) => {
+    onWorktree: (dir, config, roleModels) => {
       worktree = dir;
       effective = config;
+      effectiveModels = roleModels;
     },
     runner: {
       createSession: (title) => get().createSession(title),

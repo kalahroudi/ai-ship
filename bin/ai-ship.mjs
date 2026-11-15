@@ -385,7 +385,7 @@ if (attach) {
   console.log(`[ai-ship] Attaching to OpenCode 2.x service at ${svc.baseUrl}`);
   const api = createRestApi(svc);
   const roleModels = { implementer: model, tester: testerModel, reviewer: reviewerModel, bughunter: bughunterModel };
-  lazy = createLazyRunner((dir, effective) => createOc2Runner({ api, worktreeDir: dir, config: effective ?? loadRepoConfig(repoDir), task, roleModels, onEvent }));
+  lazy = createLazyRunner((dir, effective, effectiveModels) => createOc2Runner({ api, worktreeDir: dir, config: effective ?? loadRepoConfig(repoDir), task, roleModels: effectiveModels ?? roleModels, onEvent }));
 }
 
 await runPipeline({ repoDir, worktreeDir, task, openPr, draft, skipTests, skipReview, skipBughunter, allowConfigChange, provider, model, testerModel, reviewerModel, bughunterModel, serverUrl: attach ? undefined : serverUrl, contextLens, onEvent, overrideBudget: parsed.overrideBudget, tags: parsed.tags, ...(lazy ? { runner: lazy.runner, onWorktree: lazy.onWorktree } : {}) });

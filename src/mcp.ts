@@ -86,7 +86,10 @@ export const MCP_TOOLS = [
           description:
             "Runner provider (defaults to opencode when any OpenCode provider is configured, otherwise claude-code if available)",
         },
-        model: { type: "string", description: "Optional model override (provider/model)" },
+        model: { type: "string", description: "Optional implementer model override (provider/model)" },
+        testerModel: { type: "string", description: "Optional tester model override (must differ from the implementer)" },
+        reviewerModel: { type: "string", description: "Optional reviewer model override (must differ from the implementer)" },
+        bughunterModel: { type: "string", description: "Optional bughunter model override (must differ from the implementer)" },
         allowConfigChange: {
           type: "boolean",
           description:
@@ -335,6 +338,9 @@ async function executeTool(
         skipReview: resolved.skipReview,
         provider,
         model: typeof args.model === "string" ? args.model : undefined,
+        ...(typeof args.testerModel === "string" ? { testerModel: args.testerModel } : {}),
+        ...(typeof args.reviewerModel === "string" ? { reviewerModel: args.reviewerModel } : {}),
+        ...(typeof args.bughunterModel === "string" ? { bughunterModel: args.bughunterModel } : {}),
         ...(args.allowConfigChange === true ? { allowConfigChange: true } : {}),
         onProgress,
       });

@@ -177,7 +177,10 @@ export function createAiShipPlugin(tool: ToolHelper) {
             worktreeDir: z.string().optional().describe("Existing ai-ship worktree path to iterate on instead of creating a new one"),
             skipTests: z.boolean().optional().describe("Skip Stage 2 independent adversarial test generation"),
             skipReview: z.boolean().optional().describe("Skip Stage 4 parallel multi-lens review"),
-            model: z.string().optional().describe("Optional model override (provider/model)"),
+            model: z.string().optional().describe("Optional implementer model override (provider/model)"),
+            testerModel: z.string().optional().describe("Optional tester model override (must differ from the implementer)"),
+            reviewerModel: z.string().optional().describe("Optional reviewer model override (must differ from the implementer)"),
+            bughunterModel: z.string().optional().describe("Optional bughunter model override (must differ from the implementer)"),
           },
           async execute(args, toolCtx) {
             const targetRepo = toolCtx.worktree || toolCtx.directory || repoRoot;
@@ -201,6 +204,9 @@ export function createAiShipPlugin(tool: ToolHelper) {
               skipReview: resolved.skipReview,
               contextLens: resolved.contextLens,
               model: args.model,
+              testerModel: args.testerModel,
+              reviewerModel: args.reviewerModel,
+              bughunterModel: args.bughunterModel,
               client: ctx.client,
               onProgress: (stage) => notifyProgress(ctx.client, toolCtx, stage),
             });

@@ -40,6 +40,8 @@ export interface Oc2Message {
   cost?: number;
   tokens?: Oc2Tokens;
   outcome?: string;
+  /** Provider/agent error for a failed turn (shape varies by server version). */
+  error?: unknown;
   time?: { created?: number; completed?: number };
 }
 

@@ -45,13 +45,17 @@ function deferredDeps() {
   return { deps, calls, resolve: (v?: any) => resolve(v), reject: (e: Error) => reject(e) };
 }
 
-test("tools/list exposes ship_start/ship_status/ship_cancel; ship_start schema equals ship_task", async () => {
+test("tools/list exposes ship_start/ship_status/ship_cancel; ship_start accepts every ship_task argument", async () => {
   const resp = await handleMcpRequest({ jsonrpc: "2.0", id: 1, method: "tools/list" });
   const tools = resp?.result.tools as any[];
   for (const n of ["ship_start", "ship_status", "ship_cancel"]) assert.ok(tools.some((t) => t.name === n), n);
   const task = MCP_TOOLS.find((t) => t.name === "ship_task")!;
   const start = MCP_TOOLS.find((t) => t.name === "ship_start")!;
-  assert.deepEqual(start.inputSchema, task.inputSchema);
+  // ship_start = ship_task's arguments plus category-run options.
+  const { task: _st, ...startRest } = (start.inputSchema as any).properties;
+  const { task: _tt, ...taskRest } = (task.inputSchema as any).properties;
+  const { onlyTag: _o, continueOnFailure: _c, notyWriteBack: _w, ...shared } = startRest;
+  assert.deepEqual(shared, taskRest);
 });
 
 test("ship_start returns immediately; status shows running + events, then succeeded", async () => {

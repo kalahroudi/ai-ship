@@ -9,6 +9,8 @@ import { appendMemory, forgetMemory } from "./memory.ts";
 import { formatPipelineResult, runDreamConsolidation, runPipeline } from "./pipeline.ts";
 import { normalizeProvider, type ProviderName } from "./runner.ts";
 import { formatProgressEvent } from "./progress.ts";
+import { listNotyCategoryTasks, parseNotyCategoryAddress, writeNotyResult } from "./noty.ts";
+import { runQueue } from "./queue.ts";
 
 interface JsonRpcRequest {
   jsonrpc?: string;
@@ -34,6 +36,8 @@ export interface McpToolDeps {
   listCleanupTargets: typeof listCleanupTargets;
   removeCleanupTargets: typeof removeCleanupTargets;
   openPrFromWorktree: typeof openPrFromWorktree;
+  listNotyCategoryTasks?: typeof listNotyCategoryTasks;
+  writeNotyResult?: typeof writeNotyResult;
   notify?: (notification: { jsonrpc: "2.0"; method: string; params: Record<string, unknown> }) => void;
 }
 
@@ -105,11 +109,14 @@ export const MCP_TOOLS = [
   {
     name: "ship_start",
     description:
-      "Start the ai-ship pipeline in the background and return a job id immediately (use ship_status to follow progress and ship_cancel to stop). Same arguments as ship_task.",
+      "Start the ai-ship pipeline in the background and return a job id immediately (use ship_status to follow progress and ship_cancel to stop). Same arguments as ship_task; `task` may also be noty://category/<path> to run that category's open tasks in order.",
     inputSchema: {
       type: "object",
       properties: {
-        task: { type: "string", description: "Task description or noty://item/<id> URI" },
+        task: { type: "string", description: "Task description, noty://item/<id> or noty://category/<path> URI" },
+        onlyTag: { type: "string", description: "Category runs: only tasks with this tag" },
+        continueOnFailure: { type: "boolean", description: "Category runs: keep going after a failed task" },
+        notyWriteBack: { type: "boolean", description: "Append each result to its Noty note and mark it done on commit" },
         repoDir: {
           type: "string",
           description: "Target git repository directory (defaults to current working directory)",
@@ -390,7 +397,7 @@ const skippedNote = (r: { skippedWorktrees?: string[]; skippedBranches: string[]
 interface McpJob {
   id: string;
   label: string;
-  status: "running" | "succeeded" | "failed" | "cancelled";
+  status: "running" | "succeeded" | "failed" | "cancelled" | "interrupted";
   startedAt: number;
   worktreeDir?: string;
   events: string[];
@@ -421,6 +428,60 @@ export function cancelAllMcpJobs(): number {
 export function resetMcpJobs(): void {
   mcpJobs.clear();
   nextJobId = 1;
+}
+
+/** Job store file so ship_status survives an MCP server restart (override AI_SHIP_MCP_JOBS_FILE). */
+export function getMcpJobsPath(): string {
+  if (process.env.AI_SHIP_MCP_JOBS_FILE) return process.env.AI_SHIP_MCP_JOBS_FILE;
+  if (process.env.NODE_TEST_CONTEXT) return path.join(os.tmpdir(), `ai-ship-test-mcp-jobs-${process.pid}.json`);
+  return path.join(os.homedir(), ".local", "share", "ai-ship", "mcp-jobs.json");
+}
+
+/** Best-effort atomic save of finished + running jobs (last 20 events each). */
+export function persistMcpJobs(file = getMcpJobsPath()): void {
+  try {
+    const list = [...mcpJobs.values()].map(({ cancelled: _c, ...j }) => ({ ...j, events: j.events.slice(-20) }));
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const tmp = `${file}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(list), "utf8");
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    console.error(`[ai-ship] Warning: could not save MCP jobs: ${(e as Error).message}`);
+  }
+}
+
+/** Loads jobs saved by an earlier server; jobs that were running are marked "interrupted" (their process is gone). */
+export function loadPersistedMcpJobs(file = getMcpJobsPath()): number {
+  let list: unknown;
+  try {
+    list = JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    return 0;
+  }
+  if (!Array.isArray(list)) return 0;
+  let n = 0;
+  for (const raw of list.slice(-MAX_JOBS)) {
+    if (!raw || typeof raw !== "object") continue;
+    const j = raw as Partial<McpJob>;
+    if (typeof j.id !== "string" || typeof j.label !== "string" || mcpJobs.has(j.id)) continue;
+    const job: McpJob = {
+      id: j.id,
+      label: j.label,
+      status: j.status === "running" ? "interrupted" : (j.status ?? "failed"),
+      startedAt: typeof j.startedAt === "number" ? j.startedAt : 0,
+      events: Array.isArray(j.events) ? j.events.filter((e): e is string => typeof e === "string") : [],
+      cancelled: false,
+      ...(typeof j.worktreeDir === "string" ? { worktreeDir: j.worktreeDir } : {}),
+      ...(typeof j.result === "string" ? { result: j.result } : {}),
+      ...(typeof j.error === "string" ? { error: j.error } : {}),
+    };
+    if (j.status === "running") job.error = "interrupted: the MCP server restarted while this job was running (worktree kept).";
+    mcpJobs.set(job.id, job);
+    const num = Number(job.id.replace(/^job-/, ""));
+    if (Number.isFinite(num) && num >= nextJobId) nextJobId = num + 1;
+    n++;
+  }
+  return n;
 }
 
 /** Shared ship_task / ship_start option parsing so both tools accept exactly the same arguments. */
@@ -489,7 +550,13 @@ async function executeTool(
       return formatPipelineResult(result, label, openPr);
     }
     case "ship_start": {
-      const { options, label, openPr } = buildShipOptions(args, targetRepo, deps);
+      const category = typeof args.task === "string" ? parseNotyCategoryAddress(args.task) : null;
+      const notes = category ? (deps.listNotyCategoryTasks ?? listNotyCategoryTasks)(category, { onlyTag: typeof args.onlyTag === "string" ? args.onlyTag : undefined }) : [];
+      if (category && notes.length === 0) return `No open tasks in Noty category ${category}.`;
+      const { options, label, openPr } = category
+        ? { ...buildShipOptions({ ...args, task: notes[0].task }, targetRepo, deps), label: `noty://category/${category} (${notes.length} tasks)` }
+        : buildShipOptions(args, targetRepo, deps);
+      if (category && options.worktreeDir) throw new Error("worktreeDir cannot be combined with a Noty category run.");
       const running = [...mcpJobs.values()].filter((j) => j.status === "running");
       if (running.length >= MAX_RUNNING_JOBS) {
         throw new Error(`${running.length} ai-ship jobs are already running (max ${MAX_RUNNING_JOBS}); wait or ship_cancel one.`);
@@ -516,24 +583,58 @@ async function executeTool(
         job.events.push(`${new Date().toISOString().slice(11, 19)} ${text}`);
         if (job.events.length > 100) job.events.splice(0, job.events.length - 100);
       };
-      void deps
-        .runPipeline({
-          ...options,
-          onProgress: (stage) => push(stage),
-          onEvent: (e) => {
-            if (e.kind !== "stage") push(formatProgressEvent(e));
-          },
-          isCancelled: () => job.cancelled,
-        })
-        .then((result) => {
+      persistMcpJobs();
+      const runOne = (opts: typeof options, oneLabel: string) =>
+        deps
+          .runPipeline({
+            ...opts,
+            onProgress: (stage) => push(stage),
+            onEvent: (e) => {
+              if (e.kind !== "stage") push(formatProgressEvent(e));
+            },
+            isCancelled: () => job.cancelled,
+          })
+          .then((result) => ({
+            text: result ? formatPipelineResult(result, oneLabel, openPr) : `completed for "${oneLabel}"`,
+            committed: result ? result.committed : true,
+          }));
+      const work: Promise<string> = category
+        ? runQueue(
+            notes,
+            async (note, i) => {
+              push(`===== task ${i + 1}/${notes.length}: ${(note.title || note.id).slice(0, 80)}`);
+              const one = buildShipOptions({ ...args, task: note.task }, targetRepo, deps).options;
+              return runOne(one, note.title || note.id);
+            },
+            {
+              stopOnFailure: args.continueOnFailure !== true,
+              isCancelled: () => job.cancelled,
+              onDone: (r) => {
+                if (args.notyWriteBack !== true) return;
+                (deps.writeNotyResult ?? writeNotyResult)(r.item, {
+                  ok: r.status === "succeeded" && r.result?.committed === true,
+                  summary: r.status === "succeeded" ? (r.result?.text ?? "").split("\n")[0] : `failed: ${r.error}`,
+                });
+              },
+            }
+          ).then((rs) => {
+            const lines = rs.map((r) => `- ${r.status}: ${r.item.title || r.item.id}${r.error ? ` — ${r.error.slice(0, 200)}` : ""}`);
+            if (job.cancelled) throw new Error(`cancelled\n${lines.join("\n")}`);
+            if (rs.some((r) => r.status !== "succeeded")) throw new Error(lines.join("\n"));
+            return lines.join("\n");
+          })
+        : runOne(options, label).then((r) => r.text);
+      void work
+        .then((text) => {
           job.status = "succeeded";
-          job.result = result ? formatPipelineResult(result, label, openPr) : `completed for "${label}"`;
+          job.result = text;
         })
         .catch((err: unknown) => {
           job.status = job.cancelled ? "cancelled" : "failed";
           const msg = err instanceof Error ? err.message : String(err);
           job.error = msg.length > 4000 ? `…${msg.slice(-4000)}` : msg;
-        });
+        })
+        .finally(() => persistMcpJobs());
       return `Started ${job.id} for "${label.slice(0, 80)}". Poll with ship_status {"jobId":"${job.id}"}; stop with ship_cancel.`;
     }
     case "ship_status": {
@@ -720,6 +821,7 @@ export function startMcpServer(): void {
   console.info = (...args: unknown[]) => console.error(...args);
   console.warn = (...args: unknown[]) => console.error(...args);
 
+  loadPersistedMcpJobs();
   const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
   // Client gone: stop background jobs at their next stage boundary (no commits/PRs after disconnect).
   rl.on("close", () => {

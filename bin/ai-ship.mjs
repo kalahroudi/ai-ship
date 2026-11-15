@@ -9,6 +9,9 @@ import { startMcpServer } from "../src/mcp.ts";
 import { parseNotyAddress, resolveNotyTask } from "../src/noty.ts";
 import { runDreamConsolidation, runPipeline } from "../src/pipeline.ts";
 import { normalizeProvider } from "../src/runner.ts";
+import { createRestApi, discoverDesktopService } from "../src/oc2/api.ts";
+import { createLazyRunner, createOc2Runner } from "../src/oc2/runner.ts";
+import { formatProgressEvent, throttleSink } from "../src/progress.ts";
 import { formatSafetyFindings, scanWorktreeSafety } from "../src/safety.ts";
 
 function printHelp() {
@@ -35,6 +38,7 @@ Options:
   --bughunter-model <id>  Bughunter model override (must differ from the implementer)
   --server <url>     Attach to a running \`opencode serve\` URL (visible on mobile/web)
   --context-lens [url]  Route OpenCode provider requests through Context Lens proxy (default: http://localhost:4040)
+  --attach           Run agents on the OpenCode Desktop 2.x service: each agent is a live subagent session
   --dream            Consolidate repo memory from recent OpenCode transcripts
   --pr               Push branch and open GitHub PR after all 4 stages pass
   --draft            Open the PR as a GitHub Draft PR (implies --pr)
@@ -237,6 +241,7 @@ const {
   bughunterModel,
   serverUrl,
   contextLens,
+  attach,
   positional,
 } = parsed;
 
@@ -281,5 +286,20 @@ if (!task) {
   process.exit(1);
 }
 
-await runPipeline({ repoDir, worktreeDir, task, openPr, draft, skipTests, skipReview, skipBughunter, allowConfigChange, provider, model, testerModel, reviewerModel, bughunterModel, serverUrl, contextLens });
+const onEvent = throttleSink((e) => console.log(formatProgressEvent(e)), 1000);
+/** @type {ReturnType<typeof createLazyRunner> | undefined} */
+let lazy;
+if (attach) {
+  const svc = serverUrl ? { baseUrl: serverUrl, password: process.env.OPENCODE_SERVER_PASSWORD } : discoverDesktopService();
+  if (!svc) {
+    console.error("Error: --attach could not find the OpenCode Desktop service (set OPENCODE_SERVER_URL / OPENCODE_SERVER_PASSWORD).");
+    process.exit(1);
+  }
+  console.log(`[ai-ship] Attaching to OpenCode 2.x service at ${svc.baseUrl}`);
+  const api = createRestApi(svc);
+  const roleModels = { implementer: model, tester: testerModel, reviewer: reviewerModel, bughunter: bughunterModel };
+  lazy = createLazyRunner((dir) => createOc2Runner({ api, worktreeDir: dir, config: loadRepoConfig(repoDir), task, roleModels, onEvent }));
+}
+
+await runPipeline({ repoDir, worktreeDir, task, openPr, draft, skipTests, skipReview, skipBughunter, allowConfigChange, provider, model, testerModel, reviewerModel, bughunterModel, serverUrl: attach ? undefined : serverUrl, contextLens, onEvent, ...(lazy ? { runner: lazy.runner, onWorktree: lazy.onWorktree } : {}) });
 }

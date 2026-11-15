@@ -19,12 +19,13 @@ import {
   openExistingWorktree,
   pushAndOpenPR,
   rebaseOntoBase,
-  runShell,
+  runShellAsync,
   type WorktreeHandle,
 } from "./git.ts";
 import { buildDreamPrompt, getMemoryPath, readMemory, writeConsolidatedMemory } from "./memory.ts";
 import { assertWorktreeSafe, formatSafetyFindings, scanWorktreeSafety } from "./safety.ts";
 import { findUnpricedModels, getModelsFilePath, loadPricingTable } from "./pricing.ts";
+import type { ProgressSink } from "./progress.ts";
 import {
   assertProtectedPathsUnchanged,
   CHECKPOINT_PREFIX,
@@ -86,6 +87,12 @@ export interface PipelineOptions {
   bughunterModel?: string;
   serverUrl?: string;
   contextLens?: boolean | string;
+  /** Pre-built runner (e.g. an OpenCode 2.x runner from the native plugin or `--attach`). */
+  runner?: PipelineRunner;
+  /** Fine-grained per-agent progress events (sessions, tool calls, usage). */
+  onEvent?: ProgressSink;
+  /** Called once the worktree exists (lets lazily-built runners learn its path). */
+  onWorktree?: (worktreeDir: string) => void;
   /** Allow agents to change protected verify/config files (see DEFAULT_PROTECTED_PATHS). */
   allowConfigChange?: boolean;
   client?: OpencodeClient;
@@ -845,7 +852,7 @@ async function runDeterministicVerify(
   }
   for (const cmd of config.verify) {
     console.log(`  -> running: ${cmd}`);
-    const res = runShell(cmd, worktreeDir);
+    const res = await runShellAsync(cmd, worktreeDir);
     logs.push(`$ ${cmd}\n${res.output}`);
     if (!res.ok) {
       return {
@@ -1153,6 +1160,14 @@ export function resolveContextLensUrl(
 }
 
 export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult> {
+  if (opts.onEvent) {
+    const stageSink = opts.onEvent;
+    const original = opts.onProgress;
+    opts = { ...opts, onProgress: (stage: string) => {
+      original?.(stage);
+      stageSink({ ts: Date.now(), kind: "stage", stage, text: stage });
+    } };
+  }
   const repoDir = path.resolve(opts.repoDir);
   const config = loadRepoConfig(repoDir);
 
@@ -1226,15 +1241,18 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
     ? openExistingWorktree(repoDir, config.baseBranch, opts.worktreeDir)
     : createWorktree(repoDir, config.baseBranch, opts.task);
   console.log(`[ai-ship] Worktree: ${worktree.worktreeDir} (branch: ${worktree.branch})`);
+  opts.onWorktree?.(worktree.worktreeDir);
 
-  if (provider === "opencode" && (opts.client || opts.serverUrl)) {
+  if (provider === "opencode" && !opts.runner && (opts.client || opts.serverUrl)) {
     const ignored = describeIgnoredForAttachedServer({ cfGatewayUrl, contextLensUrl, config });
     console.log(`[ai-ship] Attached to an existing OpenCode ${opts.client ? "client" : "server"}; ignored settings: ${ignored.join("; ")}.`);
     const attached = opts.client ?? createOpencodeClient({ baseUrl: opts.serverUrl as string });
     for (const w of await checkAttachedReadOnlyAgents(attached)) console.log(`[ai-ship] Warning: ${w}`);
   }
 
-  const runner = opts.client
+  const runner = opts.runner
+    ? opts.runner
+    : opts.client
     ? createOpencodeClientRunner({
         client: opts.client,
         worktreeDir: worktree.worktreeDir,
@@ -1553,7 +1571,16 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
           "",
           `Diff:\n${reviewDiff}`,
         ].join("\n");
-        const [reviews, bh] = await withSharedContext(worktree.worktreeDir, sharedContext, async () => {
+        // Reviewers are read-only. OpenCode 2.x prompts have no per-prompt tool switches, so enforce it here for
+        // every backend: checkpoint before the round and revert anything a reviewer wrote.
+        const preReview = createCheckpoint(worktree.worktreeDir, `${CHECKPOINT_PREFIX} before review round ${round}`);
+        const revertReviewerEdits = () => {
+          const edits = revertAllChangesSince(worktree.worktreeDir, preReview);
+          if (edits.length > 0) integrityLog(`  [integrity] Read-only reviewers changed files (reverted): ${edits.join(", ")}`);
+        };
+        let roundResult;
+        try {
+          roundResult = await withSharedContext(worktree.worktreeDir, sharedContext, async () => {
           // allSettled: never leave one reviewer running in the background while another failed.
           const settled = await Promise.allSettled([
             pendingLenses.length
@@ -1570,6 +1597,11 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
             (settled[1] as PromiseFulfilledResult<BughunterResult | undefined>).value,
           ] as const;
         });
+
+        } finally {
+          revertReviewerEdits();
+        }
+        const [reviews, bh] = roundResult;
 
         const verdictMap = new Map(reviewVerdicts.map((r) => [r.lens, r.verdict] as const));
         for (const r of reviews) {

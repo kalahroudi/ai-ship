@@ -51,6 +51,10 @@ export interface RepoConfig {
   reviewerLensModels?: Record<string, ModelRef>;
   /** Per-role models for the claude-code runner (aliases like "opus"/"sonnet"/"haiku" or full ids). */
   claudeModels?: Partial<Record<"implementer" | "tester" | "reviewer" | "bughunter", string>>;
+  /** Max milliseconds one agent turn may run on a 2.x server before it is interrupted (default 30 min). */
+  agentTimeoutMs?: number;
+  /** OpenCode 2.x agent per role when running on a 2.x server (e.g. { "reviewer": "plan" }). */
+  oc2Agents?: Partial<Record<"implementer" | "tester" | "reviewer" | "bughunter", string>>;
   /** Fail when tester/reviewer/bughunter share the implementer's model (default true). */
   strictIndependence?: boolean;
   reviewConcurrency?: number;
@@ -315,6 +319,8 @@ export interface ParsedCliArgs {
   bughunterModel?: string;
   serverUrl?: string;
   contextLens?: boolean | string;
+  /** Attach to the OpenCode Desktop 2.x background service (agents show up as live subagent sessions). */
+  attach?: boolean;
   cfArgs?: { accountId: string; gatewayId: string; provider?: string };
   positional: string[];
   unknownOption?: string;
@@ -413,6 +419,8 @@ export function parseCliArgs(args: string[], cwd = process.cwd()): ParsedCliArgs
     } else if (arg.startsWith("--context-lens=")) {
       const val = arg.slice("--context-lens=".length).trim();
       result.contextLens = val || true;
+    } else if (arg === "--attach") {
+      result.attach = true;
     } else if (arg === "--dream") {
       result.doDream = true;
     } else if (arg === "--pr") {

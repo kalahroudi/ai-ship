@@ -24,7 +24,7 @@ function inheritStdio(): "inherit" | ["ignore", number, number] {
 }
 
 /** Paths ai-ship always creates inside worktrees that must never be diffed or committed. */
-export const WORKTREE_EXCLUDES = ["/.ai-ship/", "/.ai-ship-shared-context.txt"];
+export const WORKTREE_EXCLUDES = ["/.ai-ship/", "/.ai-ship-shared-context.txt", "/.ai-ship-worktrees/"];
 
 function isPathTracked(worktreeDir: string, relPath: string): boolean {
   const res = spawnSync("git", ["ls-files", "--", relPath], { cwd: worktreeDir, encoding: "utf8" });
@@ -371,17 +371,75 @@ function assertSafeToPush(worktree: WorktreeHandle): void {
   }
 }
 
+/** True when `origin/<branch>` exists on the remote. */
+export function remoteBranchExists(worktreeDir: string, branch: string): boolean {
+  const res = spawnSync("git", ["ls-remote", "--exit-code", "origin", `refs/heads/${branch}`], {
+    cwd: worktreeDir,
+    stdio: "ignore",
+  });
+  return res.status === 0;
+}
+
+/**
+ * Push arguments for an ai-ship branch. Re-pushing an existing `ai/*` branch after a rebase needs a
+ * lease-protected force push; `--force-if-includes` additionally refuses when the remote tip was fetched
+ * (e.g. by an IDE auto-fetch) but never integrated locally, so a collaborator's commit is not overwritten.
+ * Other branches are never force-pushed.
+ */
+export function buildPushArgs(branch: string, remoteExists: boolean): string[] {
+  const force = remoteExists && branch.startsWith("ai/");
+  return ["push", ...(force ? ["--force-with-lease", "--force-if-includes"] : []), "-u", "origin", branch];
+}
+
+export type GhRunner = (args: string[], cwd: string) => { status: number | null; stdout: string; stderr: string };
+
+const defaultGh: GhRunner = (args, cwd) => {
+  const res = spawnSync("gh", args, { cwd, encoding: "utf8" });
+  return { status: res.status, stdout: res.stdout || "", stderr: res.stderr || "" };
+};
+
+/** Returns the URL of an open PR for `branch`, or undefined when there is none. */
+export function findOpenPrUrl(branch: string, cwd: string, gh: GhRunner = defaultGh): string | undefined {
+  const res = gh(["pr", "view", branch, "--json", "url,state", "--jq", 'select(.state == "OPEN") | .url'], cwd);
+  if (res.status !== 0) return undefined;
+  const url = res.stdout.trim();
+  return url || undefined;
+}
+
 export function pushAndOpenPR(
   worktree: WorktreeHandle,
   title: string,
   body: string,
-  opts: { draft?: boolean } = {}
+  opts: {
+    draft?: boolean;
+    gh?: GhRunner;
+    git?: (args: string[], cwd: string) => void;
+    remoteExists?: (worktreeDir: string, branch: string) => boolean;
+  } = {}
 ): string | undefined {
   assertSafeToPush(worktree);
-  execSync(`git push -u origin "${worktree.branch}"`, {
-    cwd: worktree.worktreeDir,
-    stdio: inheritStdio(),
-  });
+  const gh = opts.gh ?? defaultGh;
+  const runGit =
+    opts.git ??
+    ((args: string[], cwd: string) => {
+      const res = spawnSync("git", args, { cwd, stdio: inheritStdio() });
+      if (res.status !== 0) throw new Error(`git ${args.join(" ")} failed (exit ${res.status ?? "unknown"})`);
+    });
+  const exists = (opts.remoteExists ?? remoteBranchExists)(worktree.worktreeDir, worktree.branch);
+  runGit(buildPushArgs(worktree.branch, exists), worktree.worktreeDir);
+
+  const existing = findOpenPrUrl(worktree.branch, worktree.worktreeDir, gh);
+  if (existing) {
+    // Update the body only, so a title a human edited on GitHub is kept.
+    const edit = gh(["pr", "edit", worktree.branch, "--body", body], worktree.worktreeDir);
+    if (edit.status !== 0) {
+      console.error(`[ai-ship] Could not update existing PR ${existing}: ${edit.stderr.trim() || edit.stdout.trim()}`);
+    } else {
+      console.log(`[ai-ship] Updated existing PR: ${existing}`);
+    }
+    return existing;
+  }
+
   const ghArgs = [
     "pr",
     "create",
@@ -395,9 +453,9 @@ export function pushAndOpenPR(
     body,
     ...(opts.draft ? ["--draft"] : []),
   ];
-  const res = spawnSync("gh", ghArgs, { cwd: worktree.worktreeDir, encoding: "utf8" });
-  const out = (res.stdout || "").trim();
-  const err = (res.stderr || "").trim();
+  const res = gh(ghArgs, worktree.worktreeDir);
+  const out = res.stdout.trim();
+  const err = res.stderr.trim();
   if (out) console.log(out);
   if (err) console.error(err);
   if (res.status !== 0) {
@@ -405,6 +463,29 @@ export function pushAndOpenPR(
   }
   const match = out.match(/https:\/\/github\.com\/\S+/);
   return match ? match[0] : out || undefined;
+}
+
+/** Conventional Commit type inferred from the task text (first matching keyword wins; default feat). */
+export function inferCommitType(task: string): "fix" | "feat" | "refactor" | "docs" | "test" | "chore" | "perf" {
+  const t = (task.split(/\r?\n/)[0] ?? "").toLowerCase();
+  const rules: Array<[RegExp, ReturnType<typeof inferCommitType>]> = [
+    [/^(fix|bug|hotfix|resolve|repair|patch)\b|\b(fix(es|ed)?|broken|crash(es|ing)?|regression|vulnerab\w*|cve-\d+|hotfix)\b/, "fix"],
+    [/\b(refactor|restructure|rename|cleanup|clean up|simplify|extract)\w*/, "refactor"],
+    [/\b(perf|performance|speed up|optimi[sz]e|faster|latency)\w*/, "perf"],
+    [/\b(docs?|documentation|readme|changelog)\b/, "docs"],
+    [/\b(tests?|coverage|spec)\b/, "test"],
+    [/\b(chore|bump|upgrade|dependency|dependencies|deps|ci)\b/, "chore"],
+  ];
+  for (const [re, type] of rules) if (re.test(t)) return type;
+  return "feat";
+}
+
+/** Conventional commit message for a task: `<type>: <first line, max 72 chars>`. */
+export function buildCommitMessage(task: string): string {
+  const firstLine = task.split(/\r?\n/)[0].trim().replace(/\s+/g, " ");
+  const type = inferCommitType(task);
+  const subject = `${type}: ${firstLine}`;
+  return subject.length > 72 ? `${subject.slice(0, 71).trimEnd()}…` : subject;
 }
 
 export interface OpenPrResult {
@@ -726,21 +807,47 @@ export function listCleanupTargets(repoDir: string, baseBranch?: string): Cleanu
   return { repoDir: resolvedRepoDir, worktreeRoot, worktrees, branches };
 }
 
-export function removeCleanupTargets(targets: CleanupTargets): {
+export interface CleanupResult {
   removedWorktrees: string[];
   removedBranches: string[];
   skippedBranches: string[];
-} {
+  /** Kept branches that `force` would remove (excludes branches checked out in the main repo). */
+  forceRemovableBranches: string[];
+  /** Worktrees kept because they have uncommitted changes or are unregistered orphan dirs (use force). */
+  skippedWorktrees: string[];
+}
+
+/**
+ * Removes ai-ship worktrees and `ai/*` branches. By default it keeps anything that may hold unsaved work:
+ * dirty worktrees, unregistered orphan directories, and unmerged branches. `force: true` removes them too.
+ */
+export function removeCleanupTargets(targets: CleanupTargets, opts: { force?: boolean } = {}): CleanupResult {
+  const force = Boolean(opts.force);
   const removedWorktrees: string[] = [];
   const removedBranches: string[] = [];
   const skippedBranches: string[] = [];
+  const skippedWorktrees: string[] = [];
+  const forceRemovableBranches: string[] = [];
+  const keptBranches = new Set<string>();
 
   for (const wt of targets.worktrees) {
+    if (!force && (wt.dirty || !wt.registered)) {
+      skippedWorktrees.push(wt.path);
+      if (wt.branch) keptBranches.add(wt.branch);
+      continue;
+    }
     if (wt.registered) {
-      spawnSync("git", ["worktree", "remove", "--force", wt.path], {
+      // Without force, let git refuse if the worktree became dirty after it was listed (e.g. while the
+      // confirmation prompt was waiting) instead of destroying that work.
+      const rm = spawnSync("git", ["worktree", "remove", ...(force ? ["--force"] : []), wt.path], {
         cwd: targets.repoDir,
         stdio: "ignore",
       });
+      if (rm.status !== 0 && !force) {
+        skippedWorktrees.push(wt.path);
+        if (wt.branch) keptBranches.add(wt.branch);
+        continue;
+      }
     }
     if (fs.existsSync(wt.path)) {
       fs.rmSync(wt.path, { recursive: true, force: true });
@@ -762,7 +869,12 @@ export function removeCleanupTargets(targets: CleanupTargets): {
       skippedBranches.push(br.name);
       continue;
     }
-    const res = spawnSync("git", ["branch", "-D", br.name], {
+    if (keptBranches.has(br.name) || (!force && !br.merged)) {
+      skippedBranches.push(br.name);
+      forceRemovableBranches.push(br.name);
+      continue;
+    }
+    const res = spawnSync("git", ["branch", force ? "-D" : "-d", br.name], {
       cwd: targets.repoDir,
       stdio: "ignore",
     });
@@ -773,5 +885,5 @@ export function removeCleanupTargets(targets: CleanupTargets): {
     }
   }
 
-  return { removedWorktrees, removedBranches, skippedBranches };
+  return { removedWorktrees, removedBranches, skippedBranches, skippedWorktrees, forceRemovableBranches };
 }

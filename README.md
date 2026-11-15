@@ -45,6 +45,15 @@ For any git repository, `ai-ship` runs 4 automated stages in an isolated git wor
 
 For OpenCode Desktop/TUI/Mobile plugin usage, see [plugin/README.md](./plugin/README.md).
 
+## Requirements
+- Node.js >= 22.18 (runs TypeScript directly).
+- git >= 2.30 (`--force-with-lease --force-if-includes` is used when re-pushing a rebased `ai/*` branch), and `gh` for PRs.
+
+## Git safety
+- Re-pushing an existing `ai/*` branch uses `--force-with-lease --force-if-includes`, so a collaborator's commit is never overwritten. Other branches are never force-pushed.
+- Re-running with an open PR updates its body; the title is left as is.
+- `--cleanup` keeps dirty worktrees, orphan directories and unmerged branches (squash-merged branches count as unmerged) unless you pass `--force`.
+
 ## Configuration
 - Global models & zero-friction permissions: `~/.config/opencode/opencode.json`
 - Per-repo verify commands & overrides: `<repo>/.ai-ship.json` (auto-detects `package.json`, `Package.swift`, `Cargo.toml`, `go.mod`, `pyproject.toml`, and `semgrep` when omitted).

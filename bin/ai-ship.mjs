@@ -47,6 +47,7 @@ Options:
   --cleanup          List and remove leftover ai-ship worktrees and ai/* branches (prompts for confirmation)
   --safety-check     Scan repo/worktree diff and untracked files for leaked deployment config, secrets, keys, emails, and IDs
   -y, --yes          Skip confirmation prompt when running --cleanup
+  --force            With --cleanup: also remove dirty worktrees, orphan dirs and unmerged ai/* branches
   --cf <acct> <gw> [provider]  Point ~/.config/opencode/opencode.json at Cloudflare AI Gateway
   -h, --help         Show this help
 `);
@@ -112,8 +113,9 @@ async function confirmPrompt(question) {
 /**
  * @param {string} repoDir
  * @param {boolean} skipConfirm
+ * @param {boolean} force
  */
-async function cleanupRepo(repoDir, skipConfirm) {
+async function cleanupRepo(repoDir, skipConfirm, force) {
   const targets = listCleanupTargets(repoDir);
   const deletableBranches = targets.branches.filter((b) => !b.checkedOutInMain);
   const checkedOutBranches = targets.branches.filter((b) => b.checkedOutInMain);
@@ -133,7 +135,8 @@ async function cleanupRepo(repoDir, skipConfirm) {
       const rel = path.relative(targets.repoDir, wt.path) || wt.path;
       const flags = [
         wt.branch ? `branch: ${wt.branch}` : "untracked/orphaned dir",
-        wt.dirty ? "uncommitted changes" : null,
+        wt.dirty ? (force ? "uncommitted changes" : "uncommitted changes, kept without --force") : null,
+        !wt.registered && !force ? "kept without --force" : null,
       ]
         .filter(Boolean)
         .join(", ");
@@ -145,7 +148,7 @@ async function cleanupRepo(repoDir, skipConfirm) {
   if (deletableBranches.length > 0) {
     console.log(`Branches (${deletableBranches.length}):`);
     for (const br of deletableBranches) {
-      console.log(`  - ${br.name} [${br.merged ? "merged" : "unmerged"}]`);
+      console.log(`  - ${br.name} [${br.merged ? "merged" : force ? "unmerged" : "unmerged, kept without --force"}]`);
     }
     console.log("");
   }
@@ -159,7 +162,9 @@ async function cleanupRepo(repoDir, skipConfirm) {
 
   if (!skipConfirm) {
     const confirmed = await confirmPrompt(
-      "Are you sure you want to permanently delete these worktrees and branches? [y/N] "
+      force
+        ? "Are you sure you want to permanently delete ALL listed worktrees and branches, including uncommitted changes and unmerged branches? [y/N] "
+        : "Are you sure you want to permanently delete the listed clean worktrees and merged branches (dirty/unmerged ones are kept)? [y/N] "
     );
     if (!confirmed) {
       console.log("[ai-ship] Cleanup cancelled.");
@@ -167,12 +172,20 @@ async function cleanupRepo(repoDir, skipConfirm) {
     }
   }
 
-  const result = removeCleanupTargets(targets);
+  const result = removeCleanupTargets(targets, { force });
   console.log(
     `[ai-ship] Removed ${result.removedWorktrees.length} worktree(s) and ${result.removedBranches.length} branch(es).`
   );
+  if (result.skippedWorktrees.length > 0) {
+    console.log(`[ai-ship] Kept worktree(s) with uncommitted changes or orphan dirs: ${result.skippedWorktrees.join(", ")}`);
+  }
   if (result.skippedBranches.length > 0) {
-    console.log(`[ai-ship] Skipped branch(es): ${result.skippedBranches.join(", ")}`);
+    console.log(`[ai-ship] Kept branch(es): ${result.skippedBranches.join(", ")}`);
+  }
+  if (!force && (result.skippedWorktrees.length > 0 || result.forceRemovableBranches.length > 0)) {
+    console.log(
+      "[ai-ship] Re-run with --force to remove the kept worktrees and unmerged branches too (squash-merged branches count as unmerged)."
+    );
   }
 }
 
@@ -214,6 +227,7 @@ const {
   doSafetyCheck,
   doDream,
   skipConfirm,
+  force,
   notyAddress,
   notyDir,
   rawProvider,
@@ -232,7 +246,7 @@ if (doInit) {
 }
 
 if (doCleanup) {
-  await cleanupRepo(repoDir, skipConfirm);
+  await cleanupRepo(repoDir, skipConfirm, force);
   process.exit(0);
 }
 

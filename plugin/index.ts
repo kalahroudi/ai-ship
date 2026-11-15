@@ -273,6 +273,10 @@ export function createAiShipPlugin(tool: ToolHelper) {
             "List or remove leftover ai-ship worktrees and ai/* branches. Defaults to dry-run unless confirm is true.",
           args: {
             confirm: z.boolean().optional().describe("Set true to delete listed worktrees and branches"),
+            force: z
+              .boolean()
+              .optional()
+              .describe("Also remove dirty worktrees, orphan dirs and unmerged branches (default: keep them)"),
           },
           async execute(args, toolCtx) {
             const targetRepo = toolCtx.worktree || toolCtx.directory || repoRoot;
@@ -288,14 +292,24 @@ export function createAiShipPlugin(tool: ToolHelper) {
             if (!args.confirm) {
               return `Dry run — pass confirm=true to remove:\n${summary}`;
             }
-            const removed = removeCleanupTargets(targets);
+            const removed = removeCleanupTargets(targets, { force: args.force === true });
             notifyProgress(
               ctx.client,
               toolCtx,
               `Cleaned ${removed.removedWorktrees.length} worktree(s), ${removed.removedBranches.length} branch(es)`,
               "success"
             );
-            return `Removed ${removed.removedWorktrees.length} worktree(s) and ${removed.removedBranches.length} branch(es).`;
+            const kept = [
+              removed.skippedWorktrees.length ? `Kept worktree(s) with uncommitted changes or orphan dirs: ${removed.skippedWorktrees.join(", ")}.` : "",
+              removed.skippedBranches.length ? `Kept branch(es): ${removed.skippedBranches.join(", ")}.` : "",
+            ].filter(Boolean);
+            return [
+              `Removed ${removed.removedWorktrees.length} worktree(s) and ${removed.removedBranches.length} branch(es).`,
+              ...kept,
+              ...(removed.skippedWorktrees.length || removed.forceRemovableBranches.length
+                ? ["Pass force=true to remove the kept worktrees and unmerged (incl. squash-merged) branches too."]
+                : []),
+            ].join("\n");
           },
         }),
 

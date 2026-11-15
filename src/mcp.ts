@@ -159,6 +159,10 @@ export const MCP_TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
+        force: {
+          type: "boolean",
+          description: "Also remove dirty worktrees, orphan dirs and unmerged branches (default: keep them)",
+        },
         confirm: {
           type: "boolean",
           description: "Set true to delete listed worktrees and branches",
@@ -301,6 +305,15 @@ export function resolveMcpProvider(
   return "opencode";
 }
 
+const skippedNote = (r: { skippedWorktrees?: string[]; skippedBranches: string[]; forceRemovableBranches?: string[] }) =>
+  [
+    r.skippedWorktrees?.length ? `Kept ${r.skippedWorktrees.length} worktree(s) with uncommitted changes or orphan dirs: ${r.skippedWorktrees.join(", ")}.` : "",
+    r.skippedBranches.length ? `Kept branch(es) (unmerged — including squash-merged — checked out, or attached to a kept worktree): ${r.skippedBranches.join(", ")}.` : "",
+    r.skippedWorktrees?.length || r.forceRemovableBranches?.length ? "Pass force=true to remove the kept worktrees and unmerged branches too." : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+
 async function executeTool(
   name: string,
   args: Record<string, unknown>,
@@ -389,8 +402,13 @@ async function executeTool(
       if (!args.confirm) {
         return `Dry run — pass confirm=true to remove:\n${summary}`;
       }
-      const removed = deps.removeCleanupTargets(targets);
-      return `Removed ${removed.removedWorktrees.length} worktree(s) and ${removed.removedBranches.length} branch(es).`;
+      const removed = deps.removeCleanupTargets(targets, { force: args.force === true });
+      return [
+        `Removed ${removed.removedWorktrees.length} worktree(s) and ${removed.removedBranches.length} branch(es).`,
+        skippedNote(removed),
+      ]
+        .filter(Boolean)
+        .join("\n");
     }
     case "open_pr": {
       if (typeof args.title !== "string" || !args.title.trim()) {

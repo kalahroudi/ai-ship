@@ -126,7 +126,21 @@ test("listCleanupTargets and removeCleanupTargets clean up worktrees and ai/* br
   );
   assert.equal(targets.branches[0].checkedOutInMain, false);
 
-  const res = removeCleanupTargets(targets);
+  // Without force: dirty worktree, orphan dir and the branch attached to the kept worktree survive.
+  const safe = removeCleanupTargets(targets);
+  assert.deepEqual(safe.removedWorktrees, []);
+  assert.deepEqual(safe.removedBranches, []);
+  assert.equal(safe.skippedWorktrees.length, 2);
+  assert.deepEqual(safe.skippedBranches, [handle.branch]);
+  assert.equal(fs.existsSync(handle.worktreeDir), true);
+  assert.equal(fs.existsSync(path.join(handle.worktreeDir, "dirty.txt")), true);
+  assert.equal(fs.existsSync(orphanDir), true);
+  assert.match(
+    execSync("git branch --format='%(refname:short)'", { cwd: dir, encoding: "utf8" }),
+    new RegExp(handle.branch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+  );
+
+  const res = removeCleanupTargets(listCleanupTargets(dir, "main"), { force: true });
   assert.equal(res.removedWorktrees.length, 2);
   assert.deepEqual(res.removedBranches, [handle.branch]);
   assert.equal(fs.existsSync(path.join(dir, ".ai-ship-worktrees")), false);
